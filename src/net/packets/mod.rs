@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod chunk;
 pub mod disconnect;
+pub mod entity;
 pub mod interaction;
 pub mod keepalive;
 pub mod login;
@@ -8,10 +9,16 @@ pub mod movement;
 pub mod sign;
 pub mod spawn;
 pub mod window;
+pub mod world;
 
 pub use chat::Chat;
 pub use chunk::{MapChunk, PreChunk};
 pub use disconnect::KickDisconnect;
+pub use entity::{
+    AttachEntity, Collect, DestroyEntity, Entity, EntityEquipment, EntityLook, EntityMetadata,
+    EntityPainting, EntityStatus, EntityTeleport, EntityVelocity, MobSpawn, NamedEntitySpawn,
+    PickupSpawn, RelEntityMove, RelEntityMoveLook, UpdateHealth, VehicleSpawn,
+};
 pub use interaction::{
     ArmAnimation, BlockChange, BlockDig, BlockItemSwitch, EntityAction, Place, Respawn, UseEntity,
 };
@@ -20,7 +27,13 @@ pub use login::{Handshake, Login};
 pub use movement::{Flying, PlayerLook, PlayerLookMove, PlayerPosition};
 pub use sign::UpdateSign;
 pub use spawn::{SpawnPosition, UpdateTime};
-pub use window::{CloseWindow, Transaction, WindowClick};
+pub use window::{
+    CloseWindow, CraftProgressBar, OpenWindow, SetSlot, SlotItem, Transaction, WindowClick,
+    WindowItems,
+};
+pub use world::{
+    Bed, Explosion, LevelSound, MapData, MultiBlockChange, PlayNoteBlock, Sleep, Statistic, Weather,
+};
 
 use crate::net::protocol::PacketId;
 use crate::util::bytes::{Reader, Writer};
@@ -111,18 +124,49 @@ pub enum Clientbound {
     Login(Login),
     Handshake(Handshake),
     Chat(Chat),
-    KickDisconnect(KickDisconnect),
-    SpawnPosition(SpawnPosition),
     UpdateTime(UpdateTime),
+    EntityEquipment(EntityEquipment),
+    SpawnPosition(SpawnPosition),
+    UpdateHealth(UpdateHealth),
     Respawn(Respawn),
+    Sleep(Sleep),
     ArmAnimation(ArmAnimation),
+    NamedEntitySpawn(NamedEntitySpawn),
+    PickupSpawn(PickupSpawn),
+    Collect(Collect),
+    VehicleSpawn(VehicleSpawn),
+    MobSpawn(MobSpawn),
+    EntityPainting(EntityPainting),
+    EntityVelocity(EntityVelocity),
+    DestroyEntity(DestroyEntity),
+    Entity(Entity),
+    RelEntityMove(RelEntityMove),
+    EntityLook(EntityLook),
+    RelEntityMoveLook(RelEntityMoveLook),
+    EntityTeleport(EntityTeleport),
+    EntityStatus(EntityStatus),
+    AttachEntity(AttachEntity),
+    EntityMetadata(EntityMetadata),
     PreChunk(PreChunk),
     MapChunk(MapChunk),
+    MultiBlockChange(MultiBlockChange),
     BlockChange(BlockChange),
-    PlayerLookMove(PlayerLookMove),
+    PlayNoteBlock(PlayNoteBlock),
+    Explosion(Explosion),
+    LevelSound(LevelSound),
+    Bed(Bed),
+    Weather(Weather),
+    OpenWindow(OpenWindow),
     CloseWindow(CloseWindow),
+    SetSlot(SetSlot),
+    WindowItems(WindowItems),
+    CraftProgressBar(CraftProgressBar),
     Transaction(Transaction),
     UpdateSign(UpdateSign),
+    MapData(MapData),
+    Statistic(Statistic),
+    KickDisconnect(KickDisconnect),
+    PlayerLookMove(PlayerLookMove),
 }
 
 impl Clientbound {
@@ -132,40 +176,102 @@ impl Clientbound {
             Self::Login(_) => PacketId::Login,
             Self::Handshake(_) => PacketId::Handshake,
             Self::Chat(_) => PacketId::Chat,
-            Self::KickDisconnect(_) => PacketId::KickDisconnect,
-            Self::SpawnPosition(_) => PacketId::SpawnPosition,
             Self::UpdateTime(_) => PacketId::UpdateTime,
+            Self::EntityEquipment(_) => PacketId::EntityEquipment,
+            Self::SpawnPosition(_) => PacketId::SpawnPosition,
+            Self::UpdateHealth(_) => PacketId::UpdateHealth,
             Self::Respawn(_) => PacketId::Respawn,
+            Self::Sleep(_) => PacketId::Packet17,
             Self::ArmAnimation(_) => PacketId::ArmAnimation,
+            Self::NamedEntitySpawn(_) => PacketId::NamedEntitySpawn,
+            Self::PickupSpawn(_) => PacketId::PickupSpawn,
+            Self::Collect(_) => PacketId::Collect,
+            Self::VehicleSpawn(_) => PacketId::VehicleSpawn,
+            Self::MobSpawn(_) => PacketId::MobSpawn,
+            Self::EntityPainting(_) => PacketId::EntityPainting,
+            Self::EntityVelocity(_) => PacketId::EntityVelocity,
+            Self::DestroyEntity(_) => PacketId::DestroyEntity,
+            Self::Entity(_) => PacketId::Entity,
+            Self::RelEntityMove(_) => PacketId::RelEntityMove,
+            Self::EntityLook(_) => PacketId::EntityLook,
+            Self::RelEntityMoveLook(_) => PacketId::RelEntityMoveLook,
+            Self::EntityTeleport(_) => PacketId::EntityTeleport,
+            Self::EntityStatus(_) => PacketId::EntityStatus,
+            Self::AttachEntity(_) => PacketId::AttachEntity,
+            Self::EntityMetadata(_) => PacketId::EntityMetadata,
             Self::PreChunk(_) => PacketId::PreChunk,
             Self::MapChunk(_) => PacketId::MapChunk,
+            Self::MultiBlockChange(_) => PacketId::MultiBlockChange,
             Self::BlockChange(_) => PacketId::BlockChange,
-            Self::PlayerLookMove(_) => PacketId::PlayerLookMove,
+            Self::PlayNoteBlock(_) => PacketId::PlayNoteBlock,
+            Self::Explosion(_) => PacketId::Explosion,
+            Self::LevelSound(_) => PacketId::Packet61,
+            Self::Bed(_) => PacketId::Bed,
+            Self::Weather(_) => PacketId::Weather,
+            Self::OpenWindow(_) => PacketId::OpenWindow,
             Self::CloseWindow(_) => PacketId::CloseWindow,
+            Self::SetSlot(_) => PacketId::SetSlot,
+            Self::WindowItems(_) => PacketId::WindowItems,
+            Self::CraftProgressBar(_) => PacketId::CraftProgressBar,
             Self::Transaction(_) => PacketId::Transaction,
             Self::UpdateSign(_) => PacketId::UpdateSign,
+            Self::MapData(_) => PacketId::Packet131,
+            Self::Statistic(_) => PacketId::Statistic,
+            Self::KickDisconnect(_) => PacketId::KickDisconnect,
+            Self::PlayerLookMove(_) => PacketId::PlayerLookMove,
         }
     }
 
     pub fn encode(&self, writer: &mut Writer) -> Result<()> {
         writer.write_u8(self.id().id());
         match self {
-            Self::KeepAlive(packet) => packet.encode(writer),
-            Self::Login(packet) => packet.encode(writer),
-            Self::Handshake(packet) => packet.encode(writer),
-            Self::Chat(packet) => packet.encode(writer),
-            Self::KickDisconnect(packet) => packet.encode(writer),
-            Self::SpawnPosition(packet) => packet.encode(writer),
-            Self::UpdateTime(packet) => packet.encode(writer),
-            Self::Respawn(packet) => packet.encode(writer),
-            Self::ArmAnimation(packet) => packet.encode(writer),
-            Self::PreChunk(packet) => packet.encode(writer),
-            Self::MapChunk(packet) => packet.encode(writer),
-            Self::BlockChange(packet) => packet.encode(writer),
-            Self::PlayerLookMove(packet) => packet.encode(writer),
-            Self::CloseWindow(packet) => packet.encode(writer),
-            Self::Transaction(packet) => packet.encode(writer),
-            Self::UpdateSign(packet) => packet.encode(writer),
+            Self::KeepAlive(p) => p.encode(writer),
+            Self::Login(p) => p.encode(writer),
+            Self::Handshake(p) => p.encode(writer),
+            Self::Chat(p) => p.encode(writer),
+            Self::UpdateTime(p) => p.encode(writer),
+            Self::EntityEquipment(p) => p.encode(writer),
+            Self::SpawnPosition(p) => p.encode(writer),
+            Self::UpdateHealth(p) => p.encode(writer),
+            Self::Respawn(p) => p.encode(writer),
+            Self::Sleep(p) => p.encode(writer),
+            Self::ArmAnimation(p) => p.encode(writer),
+            Self::NamedEntitySpawn(p) => p.encode(writer),
+            Self::PickupSpawn(p) => p.encode(writer),
+            Self::Collect(p) => p.encode(writer),
+            Self::VehicleSpawn(p) => p.encode(writer),
+            Self::MobSpawn(p) => p.encode(writer),
+            Self::EntityPainting(p) => p.encode(writer),
+            Self::EntityVelocity(p) => p.encode(writer),
+            Self::DestroyEntity(p) => p.encode(writer),
+            Self::Entity(p) => p.encode(writer),
+            Self::RelEntityMove(p) => p.encode(writer),
+            Self::EntityLook(p) => p.encode(writer),
+            Self::RelEntityMoveLook(p) => p.encode(writer),
+            Self::EntityTeleport(p) => p.encode(writer),
+            Self::EntityStatus(p) => p.encode(writer),
+            Self::AttachEntity(p) => p.encode(writer),
+            Self::EntityMetadata(p) => p.encode(writer),
+            Self::PreChunk(p) => p.encode(writer),
+            Self::MapChunk(p) => p.encode(writer),
+            Self::MultiBlockChange(p) => p.encode(writer),
+            Self::BlockChange(p) => p.encode(writer),
+            Self::PlayNoteBlock(p) => p.encode(writer),
+            Self::Explosion(p) => p.encode(writer),
+            Self::LevelSound(p) => p.encode(writer),
+            Self::Bed(p) => p.encode(writer),
+            Self::Weather(p) => p.encode(writer),
+            Self::OpenWindow(p) => p.encode(writer),
+            Self::CloseWindow(p) => p.encode(writer),
+            Self::SetSlot(p) => p.encode(writer),
+            Self::WindowItems(p) => p.encode(writer),
+            Self::CraftProgressBar(p) => p.encode(writer),
+            Self::Transaction(p) => p.encode(writer),
+            Self::UpdateSign(p) => p.encode(writer),
+            Self::MapData(p) => p.encode(writer),
+            Self::Statistic(p) => p.encode(writer),
+            Self::KickDisconnect(p) => p.encode(writer),
+            Self::PlayerLookMove(p) => p.encode(writer),
         }
     }
 }

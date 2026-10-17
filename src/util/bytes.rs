@@ -103,6 +103,18 @@ impl<'a> Reader<'a> {
             .map(|unit| unit.unwrap_or('\u{FFFD}'))
             .collect())
     }
+
+    pub fn read_utf8(&mut self, max_bytes: usize) -> Result<String> {
+        let length = self.read_u16()? as usize;
+        if length > max_bytes {
+            return Err(Error::StringTooLong {
+                max: max_bytes,
+                len: length,
+            });
+        }
+        let bytes = self.take(length)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| Error::Malformed("invalid utf-8"))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -201,6 +213,19 @@ impl Writer {
         for unit in units {
             self.write_u16(unit);
         }
+        Ok(())
+    }
+
+    pub fn write_utf8(&mut self, value: &str) -> Result<()> {
+        let bytes = value.as_bytes();
+        if bytes.len() > u16::MAX as usize {
+            return Err(Error::StringTooLong {
+                max: u16::MAX as usize,
+                len: bytes.len(),
+            });
+        }
+        self.write_u16(bytes.len() as u16);
+        self.write_bytes(bytes);
         Ok(())
     }
 }

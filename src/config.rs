@@ -72,6 +72,8 @@ pub struct ServerConfig {
     pub max_players: u32,
     pub motd: String,
     pub online_mode: bool,
+    pub join_message: String,
+    pub leave_message: String,
 }
 
 impl Default for ServerConfig {
@@ -82,6 +84,8 @@ impl Default for ServerConfig {
             max_players: 20,
             motd: "flintcore Beta 1.7.3".to_string(),
             online_mode: false,
+            join_message: "\u{00A7}e%player% joined the game.".to_string(),
+            leave_message: "\u{00A7}e%player% left the game.".to_string(),
         }
     }
 }
@@ -119,6 +123,7 @@ pub struct WorldConfig {
     pub spawn_x: i32,
     pub spawn_y: i32,
     pub spawn_z: i32,
+    pub spawn_radius: i32,
 }
 
 impl Default for WorldConfig {
@@ -132,6 +137,7 @@ impl Default for WorldConfig {
             spawn_x: 0,
             spawn_y: 64,
             spawn_z: 0,
+            spawn_radius: 16,
         }
     }
 }

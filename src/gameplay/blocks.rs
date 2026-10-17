@@ -271,4 +271,45 @@ mod tests {
         assert_eq!(light_emission(BROWN_MUSHROOM), 1);
         assert_eq!(light_emission(STONE), 0);
     }
+
+    #[test]
+    fn step_sounds_match_reference() {
+        assert_eq!(step_sound(STONE).name, "step.stone");
+        assert_eq!(step_sound(GRASS).name, "step.grass");
+        assert_eq!(step_sound(SAND).name, "step.sand");
+        assert_eq!(step_sound(WOOD_PLANKS).name, "step.wood");
+        assert_eq!(step_sound(GRAVEL).name, "step.gravel");
+        assert_eq!(step_sound(AIR).name, "step.stone");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepSound {
+    pub name: &'static str,
+    pub volume1: f32,
+    pub volume2: f32,
+}
+
+impl StepSound {
+    pub fn new(name: &'static str, volume1: f32, volume2: f32) -> Self {
+        Self {
+            name,
+            volume1,
+            volume2,
+        }
+    }
+}
+
+pub fn step_sound(block_id: u8) -> StepSound {
+    match block_id {
+        STONE | COBBLESTONE | MOSSY_COBBLESTONE | SANDSTONE | OBSIDIAN | GOLD_BLOCK
+        | IRON_BLOCK | LAPIS_BLOCK | DISPENSER | NOTE_BLOCK | DOUBLE_STEP | STEP | BRICK
+        | BOOKSHELF => StepSound::new("step.stone", 1.0, 1.0),
+        GRASS | FARMLAND => StepSound::new("step.grass", 1.0, 1.0),
+        SAND => StepSound::new("step.sand", 1.0, 1.0),
+        WOOD_PLANKS | LOG => StepSound::new("step.wood", 1.0, 1.0),
+        GRAVEL => StepSound::new("step.gravel", 1.0, 1.0),
+        WOOL => StepSound::new("step.cloth", 1.0, 1.0),
+        _ => StepSound::new("step.stone", 1.0, 1.0),
+    }
 }

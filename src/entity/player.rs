@@ -1,1 +1,203 @@
+use std::collections::HashSet;
 
+use crate::gameplay::inventory::InventoryPlayer;
+use crate::gameplay::items::ItemStack;
+use crate::net::ConnId;
+use crate::world::chunk::ChunkPos;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiggingState {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub face: u8,
+    pub start_tick: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Player {
+    pub entity_id: i32,
+    pub conn_id: ConnId,
+    pub username: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub prev_x: f64,
+    pub prev_y: f64,
+    pub prev_z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub prev_yaw: f32,
+    pub prev_pitch: f32,
+    pub stance: f64,
+    pub on_ground: bool,
+    pub mot_x: f64,
+    pub mot_y: f64,
+    pub mot_z: f64,
+    pub velocity_changed: bool,
+    pub health: i16,
+    pub last_health: i16,
+    pub air_ticks: i16,
+    pub fire_ticks: i16,
+    pub fall_distance: f32,
+    pub no_damage_ticks: u8,
+    pub sneaking: bool,
+    pub sleeping: bool,
+    pub inventory: InventoryPlayer,
+    pub equipment_cache: [Option<ItemStack>; 5],
+    pub sent_chunks: HashSet<ChunkPos>,
+    pub digging: Option<DiggingState>,
+    pub last_place_tick: u64,
+    pub dead: bool,
+}
+
+impl Player {
+    pub fn new(entity_id: i32, conn_id: ConnId, username: String, x: f64, y: f64, z: f64) -> Self {
+        Self {
+            entity_id,
+            conn_id,
+            username,
+            x,
+            y,
+            z,
+            prev_x: x,
+            prev_y: y,
+            prev_z: z,
+            yaw: 0.0,
+            pitch: 0.0,
+            prev_yaw: 0.0,
+            prev_pitch: 0.0,
+            stance: y,
+            on_ground: false,
+            mot_x: 0.0,
+            mot_y: 0.0,
+            mot_z: 0.0,
+            velocity_changed: false,
+            health: 20,
+            last_health: 20,
+            air_ticks: 300,
+            fire_ticks: 0,
+            fall_distance: 0.0,
+            no_damage_ticks: 0,
+            sneaking: false,
+            sleeping: false,
+            inventory: InventoryPlayer::new(),
+            equipment_cache: [None; 5],
+            sent_chunks: HashSet::new(),
+            digging: None,
+            last_place_tick: 0,
+            dead: false,
+        }
+    }
+
+    pub fn chunk_pos(&self) -> ChunkPos {
+        ChunkPos::new((self.x as i32) >> 4, (self.z as i32) >> 4)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_position(
+        &mut self,
+        x: f64,
+        y: f64,
+        stance: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    ) {
+        self.prev_x = self.x;
+        self.prev_y = self.y;
+        self.prev_z = self.z;
+        self.prev_yaw = self.yaw;
+        self.prev_pitch = self.pitch;
+
+        self.x = x;
+        self.y = y;
+        self.stance = stance;
+        self.z = z;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.on_ground = on_ground;
+    }
+
+    pub fn apply_knockback(&mut self, source_x: f64, source_z: f64) {
+        let mut dx = self.x - source_x;
+        let mut dz = self.z - source_z;
+        let dist = (dx * dx + dz * dz).sqrt();
+        if dist > 1e-4 {
+            dx /= dist;
+            dz /= dist;
+            self.mot_x /= 2.0;
+            self.mot_y /= 2.0;
+            self.mot_z /= 2.0;
+            self.mot_x += dx * 0.4;
+            self.mot_y += 0.4;
+            self.mot_z += dz * 0.4;
+            self.velocity_changed = true;
+        }
+    }
+
+    pub fn take_damage(&mut self, amount: i16) -> (i16, bool) {
+        if self.dead || self.no_damage_ticks > 10 {
+            return (0, false);
+        }
+
+        // Armor defense reduction: factor = 25 - armor_points
+        let armor_points = self.inventory.total_armor_points();
+        let factor = (25 - armor_points).max(0);
+        let actual_damage = (((amount as i32 * factor) + 12) / 25).max(1) as i16;
+
+        self.inventory.damage_armor(amount);
+        self.health = (self.health - actual_damage).max(0);
+        self.no_damage_ticks = 20;
+
+        let died = self.health == 0;
+        if died {
+            self.dead = true;
+        }
+        (actual_damage, died)
+    }
+
+    pub fn heal(&mut self, amount: i16) {
+        if !self.dead {
+            self.health = (self.health + amount).min(20);
+        }
+    }
+
+    pub fn respawn(&mut self, spawn_x: f64, spawn_y: f64, spawn_z: f64) {
+        self.health = 20;
+        self.last_health = 20;
+        self.dead = false;
+        self.x = spawn_x;
+        self.y = spawn_y;
+        self.stance = spawn_y;
+        self.z = spawn_z;
+        self.prev_x = spawn_x;
+        self.prev_y = spawn_y;
+        self.prev_z = spawn_z;
+        self.fall_distance = 0.0;
+        self.fire_ticks = 0;
+        self.air_ticks = 300;
+        self.mot_x = 0.0;
+        self.mot_y = 0.0;
+        self.mot_z = 0.0;
+        self.velocity_changed = false;
+    }
+
+    pub fn equipment_changed(&self) -> Vec<(i16, Option<ItemStack>)> {
+        let mut changes = Vec::new();
+        for slot in 0..5 {
+            let current = self.inventory.get_equipment(slot);
+            if current != self.equipment_cache[slot as usize] {
+                changes.push((slot, current));
+            }
+        }
+        changes
+    }
+
+    pub fn sync_equipment_cache(&mut self) {
+        for slot in 0..5 {
+            self.equipment_cache[slot as usize] = self.inventory.get_equipment(slot);
+        }
+    }
+}

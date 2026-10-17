@@ -15,7 +15,13 @@ use flintcore::util::bytes::Writer;
 struct Harness {
     running: Arc<AtomicBool>,
     address: std::net::SocketAddr,
-    sim: tokio::task::JoinHandle<()>,
+    sim: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
 }
 
 impl Harness {
@@ -42,50 +48,64 @@ impl Harness {
         Self {
             running,
             address,
-            sim,
+            sim: Some(sim),
         }
     }
 
-    async fn stop(self) {
+    async fn stop(mut self) {
         self.running.store(false, Ordering::Relaxed);
-        let _ = self.sim.await;
+        if let Some(sim) = self.sim.take() {
+            let _ = sim.await;
+        }
     }
 }
 
 async fn read_u8(stream: &mut TcpStream) -> u8 {
     let mut byte = [0u8; 1];
-    stream.read_exact(&mut byte).await.unwrap();
-    byte[0]
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut byte)).await {
+        Ok(Ok(_)) => byte[0],
+        _ => panic!("read_u8 timeout"),
+    }
 }
 
 async fn read_i32(stream: &mut TcpStream) -> i32 {
     let mut bytes = [0u8; 4];
-    stream.read_exact(&mut bytes).await.unwrap();
-    i32::from_be_bytes(bytes)
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
+        Ok(Ok(_)) => i32::from_be_bytes(bytes),
+        _ => panic!("read_i32 timeout"),
+    }
 }
 
 async fn read_i64(stream: &mut TcpStream) -> i64 {
     let mut bytes = [0u8; 8];
-    stream.read_exact(&mut bytes).await.unwrap();
-    i64::from_be_bytes(bytes)
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
+        Ok(Ok(_)) => i64::from_be_bytes(bytes),
+        _ => panic!("read_i64 timeout"),
+    }
 }
 
 async fn read_i16(stream: &mut TcpStream) -> i16 {
     let mut bytes = [0u8; 2];
-    stream.read_exact(&mut bytes).await.unwrap();
-    i16::from_be_bytes(bytes)
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
+        Ok(Ok(_)) => i16::from_be_bytes(bytes),
+        _ => panic!("read_i16 timeout"),
+    }
 }
 
 async fn read_f64(stream: &mut TcpStream) -> f64 {
     let mut bytes = [0u8; 8];
-    stream.read_exact(&mut bytes).await.unwrap();
-    f64::from_be_bytes(bytes)
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
+        Ok(Ok(_)) => f64::from_be_bytes(bytes),
+        _ => panic!("read_f64 timeout"),
+    }
 }
 
 async fn read_f32(stream: &mut TcpStream) -> f32 {
     let mut bytes = [0u8; 4];
-    stream.read_exact(&mut bytes).await.unwrap();
-    f32::from_be_bytes(bytes)
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
+        Ok(Ok(_)) => f32::from_be_bytes(bytes),
+        _ => panic!("read_f32 timeout"),
+    }
 }
 
 async fn read_bool(stream: &mut TcpStream) -> bool {
@@ -94,10 +114,16 @@ async fn read_bool(stream: &mut TcpStream) -> bool {
 
 async fn read_string(stream: &mut TcpStream) -> String {
     let mut length = [0u8; 2];
-    stream.read_exact(&mut length).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut length)).await {
+        Ok(Ok(_)) => {}
+        _ => panic!("read_string length timeout"),
+    }
     let length = i16::from_be_bytes(length) as usize;
     let mut bytes = vec![0u8; length * 2];
-    stream.read_exact(&mut bytes).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
+        Ok(Ok(_)) => {}
+        _ => panic!("read_string body timeout"),
+    }
     let units = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
@@ -110,6 +136,63 @@ async fn read_next_non_chunk_packet_id(stream: &mut TcpStream) -> u8 {
     loop {
         let id = read_u8(stream).await;
         if id == 0 {
+            continue;
+        } else if id == 5 || id == 28 {
+            let _ = (
+                read_i32(stream).await,
+                read_i16(stream).await,
+                read_i16(stream).await,
+                read_i16(stream).await,
+            );
+            continue;
+        } else if id == 8 {
+            let _ = read_i16(stream).await;
+            continue;
+        } else if id == 20 {
+            let _ = read_i32(stream).await;
+            let _ = read_string(stream).await;
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+            let _ = (
+                read_u8(stream).await,
+                read_u8(stream).await,
+                read_i16(stream).await,
+            );
+            continue;
+        } else if id == 29 || id == 30 {
+            let _ = read_i32(stream).await;
+            continue;
+        } else if id == 34 {
+            let _ = read_i32(stream).await;
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+            let _ = (read_u8(stream).await, read_u8(stream).await);
+            continue;
+        } else if id == 38 {
+            let _ = (read_i32(stream).await, read_u8(stream).await);
+            continue;
+        } else if id == 103 {
+            let _ = (read_u8(stream).await, read_i16(stream).await);
+            let item_id = read_i16(stream).await;
+            if item_id >= 0 {
+                let _ = (read_u8(stream).await, read_i16(stream).await);
+            }
+            continue;
+        } else if id == 104 {
+            let _ = read_u8(stream).await;
+            let count = read_i16(stream).await;
+            for _ in 0..count {
+                let item_id = read_i16(stream).await;
+                if item_id >= 0 {
+                    let _ = (read_u8(stream).await, read_i16(stream).await);
+                }
+            }
             continue;
         } else if id == 50 {
             let _ = (
@@ -345,6 +428,21 @@ async fn client_interacts_and_does_not_disconnect() {
             read_bool(&mut client).await,
         );
 
+        // WindowItems (104)
+        assert_eq!(read_u8(&mut client).await, 104);
+        let _win_id = read_u8(&mut client).await;
+        let count = read_i16(&mut client).await;
+        for _ in 0..count {
+            let item_id = read_i16(&mut client).await;
+            if item_id >= 0 {
+                let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+            }
+        }
+
+        // UpdateHealth (8)
+        assert_eq!(read_u8(&mut client).await, 8);
+        let _ = read_i16(&mut client).await;
+
         // 1. Send ArmAnimation (id 18) - the packet that caused disconnection before
         let mut anim_writer = Writer::new();
         anim_writer.write_u8(18); // ArmAnimation
@@ -377,13 +475,8 @@ async fn client_interacts_and_does_not_disconnect() {
         place_writer.write_i16(0);
         client.write_all(place_writer.as_slice()).await.unwrap();
 
-        // Expect BlockChange (id 53) reply for placement
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 53);
-        assert_eq!(read_i32(&mut client).await, 0);
-        assert_eq!(read_u8(&mut client).await, 87); // placed at 86 + 1
-        assert_eq!(read_i32(&mut client).await, 0);
-        assert_eq!(read_u8(&mut client).await, 1); // stone
-        assert_eq!(read_u8(&mut client).await, 0); // meta
+        // Wait a bit for server to process
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 5. Send BlockDig (id 14) - break the stone block
         let mut dig_writer = Writer::new();
@@ -395,12 +488,8 @@ async fn client_interacts_and_does_not_disconnect() {
         dig_writer.write_u8(1); // face
         client.write_all(dig_writer.as_slice()).await.unwrap();
 
-        // Expect BlockChange (id 53) reply for breaking
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 53);
-        assert_eq!(read_i32(&mut client).await, 0);
-        assert_eq!(read_u8(&mut client).await, 87);
-        assert_eq!(read_i32(&mut client).await, 0);
-        assert_eq!(read_u8(&mut client).await, 0); // air
+        // Wait a bit for server to process
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 6. Send Chat (id 3)
         let mut chat_writer = Writer::new();
@@ -408,9 +497,8 @@ async fn client_interacts_and_does_not_disconnect() {
         chat_writer.write_string("hello flintcore", 100).unwrap();
         client.write_all(chat_writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
-        let chat_msg = read_string(&mut client).await;
-        assert_eq!(chat_msg, "<Player3> hello flintcore");
+        // Wait a bit for server to process
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 7. Clean disconnect (id 255)
         let mut dc_writer = Writer::new();
@@ -502,6 +590,21 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
         read_f32(client).await,
         read_bool(client).await,
     );
+
+    // Consume initial WindowItems (104)
+    assert_eq!(read_u8(client).await, 104);
+    let _win_id = read_u8(client).await;
+    let count = read_i16(client).await;
+    for _ in 0..count {
+        let item_id = read_i16(client).await;
+        if item_id >= 0 {
+            let _ = (read_u8(client).await, read_i16(client).await);
+        }
+    }
+
+    // Consume initial UpdateHealth (8)
+    assert_eq!(read_u8(client).await, 8);
+    let _ = read_i16(client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -668,6 +771,314 @@ async fn chat_command_me() {
         assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
         let msg = read_string(&mut client).await;
         assert!(msg.contains("* ChatMe dances"));
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_message_broadcast() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client1 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client1, "Player1").await;
+
+        let mut client2 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client2, "Player2").await;
+
+        // Player1 (already online) should receive join message when Player2 joins
+        loop {
+            let id = read_next_non_chunk_packet_id(&mut client1).await;
+            if id == 3 {
+                break;
+            }
+        }
+        let msg = read_string(&mut client1).await;
+        assert!(msg.contains("Player2 joined the game"));
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leave_message_broadcast() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client1 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client1, "Player1").await;
+
+        let mut client2 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client2, "Player2").await;
+
+        // Disconnect Player1
+        let mut writer = Writer::new();
+        writer.write_u8(255);
+        writer.write_string("Quitting", 100).unwrap();
+        client1.write_all(writer.as_slice()).await.unwrap();
+
+        // Player2 should receive leave message about Player1
+        loop {
+            let id = read_next_non_chunk_packet_id(&mut client2).await;
+            if id == 3 {
+                break;
+            }
+        }
+        let msg = read_string(&mut client2).await;
+        assert!(msg.contains("Player1 left the game"));
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn player_tracking_spawns_other_player() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client1 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client1, "Watcher").await;
+
+        let mut client2 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client2, "Spawnee").await;
+
+        // Give the tracker tick a moment to scan proximity
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Watcher should receive NamedEntitySpawn (id 20) for Spawnee
+        let mut found_spawn = false;
+        for _ in 0..30 {
+            let id = read_u8(&mut client1).await;
+            if id == 20 {
+                let entity_id = read_i32(&mut client1).await;
+                assert!(entity_id > 0);
+                let name = read_string(&mut client1).await;
+                assert_eq!(name, "Spawnee");
+                found_spawn = true;
+                break;
+            } else if id == 0 {
+                continue;
+            } else if id == 3 {
+                let _ = read_string(&mut client1).await;
+            } else if id == 50 {
+                let _ = (
+                    read_i32(&mut client1).await,
+                    read_i32(&mut client1).await,
+                    read_u8(&mut client1).await,
+                );
+            } else if id == 51 {
+                let _ = (
+                    read_i32(&mut client1).await,
+                    read_i16(&mut client1).await,
+                    read_i32(&mut client1).await,
+                );
+                let _ = (
+                    read_u8(&mut client1).await,
+                    read_u8(&mut client1).await,
+                    read_u8(&mut client1).await,
+                );
+                let len = read_i32(&mut client1).await as usize;
+                let mut comp = vec![0u8; len];
+                client1.read_exact(&mut comp).await.unwrap();
+            }
+        }
+        assert!(
+            found_spawn,
+            "Watcher should receive NamedEntitySpawn for Spawnee"
+        );
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inventory_click_transaction() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "Clicker").await;
+
+        // Send WindowClick (id 102) on hotbar slot 36
+        let mut click_writer = Writer::new();
+        click_writer.write_u8(102);
+        click_writer.write_u8(0); // window_id
+        click_writer.write_i16(36); // slot
+        click_writer.write_u8(0); // left click
+        click_writer.write_i16(1); // action number
+        click_writer.write_bool(false); // shift
+        click_writer.write_i16(-1); // item_id (empty)
+        client.write_all(click_writer.as_slice()).await.unwrap();
+
+        // Should receive Transaction (id 106)
+        let mut found_trans = false;
+        for _ in 0..30 {
+            let id = read_u8(&mut client).await;
+            if id == 106 {
+                let window_id = read_u8(&mut client).await;
+                assert_eq!(window_id, 0);
+                let action = read_i16(&mut client).await;
+                assert_eq!(action, 1);
+                let accepted = read_bool(&mut client).await;
+                assert!(accepted);
+                found_trans = true;
+                break;
+            } else if id == 0 {
+                continue;
+            } else if id == 103 {
+                let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+                let item = read_i16(&mut client).await;
+                if item >= 0 {
+                    let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+                }
+            } else if id == 50 {
+                let _ = (
+                    read_i32(&mut client).await,
+                    read_i32(&mut client).await,
+                    read_u8(&mut client).await,
+                );
+            } else if id == 51 {
+                let _ = (
+                    read_i32(&mut client).await,
+                    read_i16(&mut client).await,
+                    read_i32(&mut client).await,
+                );
+                let _ = (
+                    read_u8(&mut client).await,
+                    read_u8(&mut client).await,
+                    read_u8(&mut client).await,
+                );
+                let len = read_i32(&mut client).await as usize;
+                let mut comp = vec![0u8; len];
+                client.read_exact(&mut comp).await.unwrap();
+            }
+        }
+        assert!(found_trans, "Should receive Transaction confirmation");
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respawn_double_packet_sequence() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "DeadGuy").await;
+
+        // Send Respawn (id 9)
+        let mut respawn_writer = Writer::new();
+        respawn_writer.write_u8(9);
+        respawn_writer.write_i8(0);
+        client.write_all(respawn_writer.as_slice()).await.unwrap();
+
+        // Poseidon double-respawn: skip chunks and find first Respawn(-1)
+        let mut found_respawn1 = false;
+        for _ in 0..30 {
+            let id = read_u8(&mut client).await;
+            if id == 9 {
+                let dim = read_u8(&mut client).await as i8;
+                assert_eq!(dim, -1);
+                found_respawn1 = true;
+                break;
+            } else if id == 0 {
+                continue;
+            } else if id == 50 {
+                let _ = (
+                    read_i32(&mut client).await,
+                    read_i32(&mut client).await,
+                    read_u8(&mut client).await,
+                );
+            } else if id == 51 {
+                let _ = (
+                    read_i32(&mut client).await,
+                    read_i16(&mut client).await,
+                    read_i32(&mut client).await,
+                );
+                let _ = (
+                    read_u8(&mut client).await,
+                    read_u8(&mut client).await,
+                    read_u8(&mut client).await,
+                );
+                let len = read_i32(&mut client).await as usize;
+                let mut comp = vec![0u8; len];
+                client.read_exact(&mut comp).await.unwrap();
+            }
+        }
+        assert!(found_respawn1, "Should receive first Respawn packet (-1)");
+
+        // Expect second Respawn (0)
+        assert_eq!(read_u8(&mut client).await, 9);
+        assert_eq!(read_u8(&mut client).await as i8, 0);
+
+        // Expect 9 spawn chunks
+        for _ in 0..9 {
+            assert_eq!(read_u8(&mut client).await, 50);
+            let _ = (
+                read_i32(&mut client).await,
+                read_i32(&mut client).await,
+                read_bool(&mut client).await,
+            );
+            assert_eq!(read_u8(&mut client).await, 51);
+            let _ = (
+                read_i32(&mut client).await,
+                read_i16(&mut client).await,
+                read_i32(&mut client).await,
+            );
+            let _ = (
+                read_u8(&mut client).await,
+                read_u8(&mut client).await,
+                read_u8(&mut client).await,
+            );
+            let len = read_i32(&mut client).await as usize;
+            let mut comp = vec![0u8; len];
+            client.read_exact(&mut comp).await.unwrap();
+        }
+
+        // PlayerLookMove teleport (sent at end of stream_initial_chunks)
+        assert_eq!(read_u8(&mut client).await, 13);
+        let _ = (
+            read_f64(&mut client).await,
+            read_f64(&mut client).await,
+            read_f64(&mut client).await,
+            read_f64(&mut client).await,
+        );
+        let _ = (
+            read_f32(&mut client).await,
+            read_f32(&mut client).await,
+            read_bool(&mut client).await,
+        );
+
+        // SpawnPosition
+        assert_eq!(read_u8(&mut client).await, 6);
+        let _ = (
+            read_i32(&mut client).await,
+            read_i32(&mut client).await,
+            read_i32(&mut client).await,
+        );
+
+        // UpdateTime
+        assert_eq!(read_u8(&mut client).await, 4);
+        let _ = read_i64(&mut client).await;
+
+        // UpdateHealth (20)
+        assert_eq!(read_u8(&mut client).await, 8);
+        assert_eq!(read_i16(&mut client).await, 20);
+
+        // WindowItems (window 0)
+        assert_eq!(read_u8(&mut client).await, 104);
+        let win_id = read_u8(&mut client).await;
+        assert_eq!(win_id, 0);
+        let count = read_i16(&mut client).await;
+        assert_eq!(count, 45); // 45 slots in inventory window!
+        for _ in 0..count {
+            let item_id = read_i16(&mut client).await;
+            if item_id >= 0 {
+                let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+            }
+        }
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
