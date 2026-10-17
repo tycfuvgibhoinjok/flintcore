@@ -7,13 +7,16 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::gameplay::blocks;
+use crate::gameplay::commands::CommandMap;
 use crate::net::connection::ConnectionState;
+use crate::net::packets::chat::{is_allowed_char, wrap_text};
 use crate::net::packets::{
     BlockChange, Chat, Clientbound, Handshake, KeepAlive, KickDisconnect, Login, PlayerLookMove,
     PreChunk, Respawn, Serverbound, SpawnPosition, UpdateTime,
 };
 use crate::net::protocol::PROTOCOL_VERSION;
 use crate::net::{ConnId, NetEvent, Outbound};
+use crate::plugin::events::{PlayerChatEvent, PluginManager};
 use crate::util::{log, Result};
 use crate::world::chunk::{ChunkPos, ChunkState};
 use crate::world::world::World;
@@ -45,6 +48,8 @@ pub struct Server {
     running: Arc<AtomicBool>,
     next_entity_id: i32,
     world: World,
+    commands: CommandMap,
+    plugin_manager: PluginManager,
 }
 
 impl Server {
@@ -61,6 +66,8 @@ impl Server {
             running,
             next_entity_id: 1,
             world,
+            commands: CommandMap::new(),
+            plugin_manager: PluginManager::new(),
         }
     }
 
@@ -513,12 +520,120 @@ impl Server {
             .get(&id)
             .and_then(|connection| connection.username.clone())
             .unwrap_or_else(|| "unknown".to_string());
+
+        // Poseidon: PacketReceivedEvent (NetServerHandler.java:799-802)
+        // Stub: no plugin system yet, event is never cancelled.
+
+        let message = chat.message.trim().to_string();
+
+        // Poseidon: length > 100 -> disconnect "Chat message too long" (NetServerHandler.java:806)
+        if message.len() > 100 {
+            self.kick(id, "Chat message too long");
+            return;
+        }
+
+        // Poseidon: illegal characters -> disconnect "Illegal characters in chat" (NetServerHandler.java:812)
+        if !message.chars().all(is_allowed_char) {
+            self.kick(id, "Illegal characters in chat");
+            return;
+        }
+
+        // Empty after trim -> nothing to broadcast
+        if message.is_empty() {
+            return;
+        }
+
+        // Poseidon: commands start with "/" (NetServerHandler.java:825)
+        if message.starts_with('/') {
+            self.handle_command(id, &message);
+            return;
+        }
+
+        // Poseidon: PlayerChatEvent (NetServerHandler.java:830-835)
+        let all_players: Vec<String> = self
+            .connections
+            .values()
+            .filter_map(|c| c.username.clone())
+            .collect();
+        let mut event = PlayerChatEvent::new(username.clone(), message.clone(), &all_players);
+        self.plugin_manager.call_chat_event(&mut event);
+        if event.is_cancelled() {
+            return;
+        }
+
+        // Poseidon: format message (NetServerHandler.java:837)
+        let formatted = event
+            .get_format()
+            .replacen("%1$s", &username, 1)
+            .replacen("%2$s", &event.message, 1);
+
+        // Poseidon: console logging (NetServerHandler.java:838)
+        // minecraftServer.console.sendMessage(s) -> ColouredConsoleSender -> System.out.println
+        log::info(&formatted);
+
+        // Poseidon: broadcast to all recipients (NetServerHandler.java:839-841)
+        // Each recipient gets the message via sendPacket -> TextWrapper.wrapText
         for connection in self.connections.values() {
-            let _ = connection
-                .sender
-                .try_send(Outbound::Packet(Clientbound::Chat(Chat {
-                    message: format!("<{username}> {}", chat.message),
-                })));
+            if connection.state != ConnectionState::Playing {
+                continue;
+            }
+            for line in wrap_text(&formatted) {
+                let _ = connection
+                    .sender
+                    .try_send(Outbound::Packet(Clientbound::Chat(Chat { message: line })));
+            }
+        }
+    }
+
+    fn handle_command(&mut self, id: ConnId, command: &str) {
+        let username = self
+            .connections
+            .get(&id)
+            .and_then(|connection| connection.username.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Poseidon: PlayerCommandPreprocessEvent (NetServerHandler.java:855-860)
+        // Stub: no plugin system yet, event is never cancelled.
+
+        // Poseidon: dispatch command (NetServerHandler.java:862)
+        let result = self.commands.dispatch(&username, &command[1..]);
+
+        if !result.handled {
+            // Poseidon: unknown command (CraftServer.java:449-451)
+            self.send(
+                id,
+                Clientbound::Chat(Chat {
+                    message: "Unknown command. Type \"help\" for help.".to_string(),
+                }),
+            );
+            return;
+        }
+
+        // Poseidon: log command to console (NetServerHandler.java:864-870)
+        log::info(&format!("{username} issued server command: {command}"));
+
+        // Send sender messages
+        for msg in &result.sender_messages {
+            self.send(
+                id,
+                Clientbound::Chat(Chat {
+                    message: msg.clone(),
+                }),
+            );
+        }
+
+        // Broadcast messages to all players
+        for msg in &result.broadcast_messages {
+            for connection in self.connections.values() {
+                if connection.state != ConnectionState::Playing {
+                    continue;
+                }
+                for line in wrap_text(msg) {
+                    let _ = connection
+                        .sender
+                        .try_send(Outbound::Packet(Clientbound::Chat(Chat { message: line })));
+                }
+            }
         }
     }
 

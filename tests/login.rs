@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use flintcore::config::Config;
-use flintcore::net::{listener, NetEvent};
+use flintcore::net::{listener, packets::chat::MAX_CHAT_LENGTH, NetEvent};
 use flintcore::server::Server;
 use flintcore::util::bytes::Writer;
 
@@ -437,6 +437,237 @@ async fn outdated_client_is_kicked() {
         assert_eq!(read_u8(&mut client).await, 255);
         let reason = read_string(&mut client).await;
         assert_eq!(reason, "Outdated client! Please use Beta 1.7.3");
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
+    client.write_all(&handshake(username)).await.unwrap();
+    client.write_all(&login(14, username)).await.unwrap();
+
+    assert_eq!(read_u8(client).await, 2);
+    assert_eq!(read_string(client).await, "-");
+
+    assert_eq!(read_u8(client).await, 1);
+    let _ = read_i32(client).await;
+    let _ = read_string(client).await;
+    let _ = read_i64(client).await;
+    let _ = read_u8(client).await;
+
+    assert_eq!(read_u8(client).await, 6);
+    let _ = (
+        read_i32(client).await,
+        read_i32(client).await,
+        read_i32(client).await,
+    );
+
+    assert_eq!(read_u8(client).await, 4);
+    let _ = read_i64(client).await;
+
+    for _ in 0..9 {
+        assert_eq!(read_u8(client).await, 50);
+        let _ = (
+            read_i32(client).await,
+            read_i32(client).await,
+            read_bool(client).await,
+        );
+
+        assert_eq!(read_u8(client).await, 51);
+        let _ = (
+            read_i32(client).await,
+            read_i16(client).await,
+            read_i32(client).await,
+        );
+        let _ = (
+            read_u8(client).await,
+            read_u8(client).await,
+            read_u8(client).await,
+        );
+        let len = read_i32(client).await as usize;
+        let mut comp = vec![0u8; len];
+        client.read_exact(&mut comp).await.unwrap();
+    }
+
+    assert_eq!(read_u8(client).await, 13);
+    let _ = (
+        read_f64(client).await,
+        read_f64(client).await,
+        read_f64(client).await,
+        read_f64(client).await,
+    );
+    let _ = (
+        read_f32(client).await,
+        read_f32(client).await,
+        read_bool(client).await,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_too_long_gets_kicked() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ChatTooLong").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer
+            .write_string(&"a".repeat(101), MAX_CHAT_LENGTH)
+            .unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 255);
+        let reason = read_string(&mut client).await;
+        assert_eq!(reason, "Chat message too long");
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_illegal_characters_gets_kicked() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ChatIllegal").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("hello \u{1F600} world", 100).unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 255);
+        let reason = read_string(&mut client).await;
+        assert_eq!(reason, "Illegal characters in chat");
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_command_is_not_broadcast() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ChatCmd").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("/help", 100).unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        // If the server kicked us for sending a command, write_all above would
+        // have failed (connection closed). Reaching here means the connection
+        // is alive and no kick occurred.
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_normal_broadcast_format() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ChatNormal").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("hello world", 100).unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        let msg = read_string(&mut client).await;
+        assert_eq!(msg, "<ChatNormal> hello world");
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_command_unknown() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ChatUnknown").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("/nonexistent", 100).unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        let msg = read_string(&mut client).await;
+        assert_eq!(msg, "Unknown command. Type \"help\" for help.");
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_command_help() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ChatHelp").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("/help", 100).unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        let msg = read_string(&mut client).await;
+        assert!(msg.contains("Help"));
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_command_say() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ChatSay").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("/say hello from server", 100).unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        let msg = read_string(&mut client).await;
+        assert!(msg.contains("hello from server"));
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_command_me() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ChatMe").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("/me dances", 100).unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        let msg = read_string(&mut client).await;
+        assert!(msg.contains("* ChatMe dances"));
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();

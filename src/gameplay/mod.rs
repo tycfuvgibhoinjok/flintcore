@@ -1,4 +1,5 @@
 pub mod blocks;
+pub mod commands;
 pub mod crafting;
 pub mod inventory;
 pub mod items;
