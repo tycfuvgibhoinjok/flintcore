@@ -135,6 +135,60 @@ impl ItemStack {
         }
     }
 
+    pub fn is_tool(&self) -> bool {
+        matches!(
+            self.id,
+            256..=259
+                | 261
+                | 268..=271
+                | 272..=275
+                | 276..=279
+                | 283..=286
+                | 290..=294
+                | 346
+                | 359
+        )
+    }
+
+    pub fn is_weapon(&self) -> bool {
+        matches!(self.id, 267 | 268 | 272 | 276 | 283)
+    }
+
+    pub fn attack_damage(&self) -> i16 {
+        match self.id {
+            276 => 7, // Diamond Sword
+            267 => 6, // Iron Sword
+            272 => 5, // Stone Sword
+            268 => 4, // Wood Sword
+            283 => 4, // Gold Sword
+            279 => 6, // Diamond Axe
+            258 => 5, // Iron Axe
+            275 => 4, // Stone Axe
+            271 => 3, // Wood Axe
+            286 => 3, // Gold Axe
+            278 => 5, // Diamond Pickaxe
+            257 => 4, // Iron Pickaxe
+            274 => 3, // Stone Pickaxe
+            270 => 2, // Wood Pickaxe
+            285 => 2, // Gold Pickaxe
+            277 => 4, // Diamond Shovel
+            256 => 3, // Iron Shovel
+            273 => 2, // Stone Shovel
+            269 => 1, // Wood Shovel
+            284 => 1, // Gold Shovel
+            _ => 1,
+        }
+    }
+
+    pub fn damage_item(&mut self, amount: i16) -> bool {
+        let max = self.max_damage();
+        if max == 0 {
+            return false;
+        }
+        self.damage += amount;
+        self.damage >= max
+    }
+
     pub fn tool_dig_speed(&self) -> f32 {
         match self.id {
             // Wood

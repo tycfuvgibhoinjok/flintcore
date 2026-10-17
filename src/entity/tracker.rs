@@ -6,6 +6,12 @@ use crate::net::packets::{
     EntityVelocity, NamedEntitySpawn, RelEntityMove, RelEntityMoveLook,
 };
 
+#[inline]
+pub fn pack_angle(angle: f32) -> u8 {
+    let scaled = (angle * 256.0 / 360.0).floor() as i32;
+    (scaled as i8) as u8
+}
+
 #[derive(Debug)]
 pub struct EntityTrackerEntry {
     pub entity_id: i32,
@@ -26,8 +32,8 @@ impl EntityTrackerEntry {
             encoded_x: (player.x * 32.0).floor() as i32,
             encoded_y: (player.y * 32.0).floor() as i32,
             encoded_z: (player.z * 32.0).floor() as i32,
-            encoded_yaw: ((player.yaw / 360.0) * 256.0).floor() as u8,
-            encoded_pitch: ((player.pitch / 360.0) * 256.0).floor() as u8,
+            encoded_yaw: pack_angle(player.yaw),
+            encoded_pitch: pack_angle(player.pitch),
             teleport_ticks: 0,
             tracked_players: HashSet::new(),
             tracking_range,
@@ -229,15 +235,22 @@ impl EntityTracker {
                 let new_x = (player.x * 32.0).floor() as i32;
                 let new_y = (player.y * 32.0).floor() as i32;
                 let new_z = (player.z * 32.0).floor() as i32;
-                let new_yaw = ((player.yaw / 360.0) * 256.0).floor() as u8;
-                let new_pitch = ((player.pitch / 360.0) * 256.0).floor() as u8;
+                let new_yaw = pack_angle(player.yaw);
+                let new_pitch = pack_angle(player.pitch);
 
                 let dx = new_x - entry.encoded_x;
                 let dy = new_y - entry.encoded_y;
                 let dz = new_z - entry.encoded_z;
 
+                let dyaw = (new_yaw.wrapping_sub(entry.encoded_yaw)) as i8;
+                let dpitch = (new_pitch.wrapping_sub(entry.encoded_pitch)) as i8;
+
                 let pos_changed = dx != 0 || dy != 0 || dz != 0;
-                let rot_changed = new_yaw != entry.encoded_yaw || new_pitch != entry.encoded_pitch;
+                let rot_changed = if pos_changed {
+                    new_yaw != entry.encoded_yaw || new_pitch != entry.encoded_pitch
+                } else {
+                    dyaw.abs() >= 4 || dpitch.abs() >= 4
+                };
 
                 if pos_changed || rot_changed {
                     let move_packet = if (-128..=127).contains(&dx)
@@ -350,5 +363,19 @@ mod tests {
             p2_moves_to_p1[0].packet,
             Clientbound::RelEntityMove(_)
         ));
+    }
+
+    #[test]
+    fn pack_angle_negative_and_wrap() {
+        assert_eq!(pack_angle(0.0), 0);
+        assert_eq!(pack_angle(90.0), 64);
+        assert_eq!(pack_angle(180.0), 128);
+        assert_eq!(pack_angle(270.0), 192);
+        assert_eq!(pack_angle(360.0), 0);
+        // Negative angles must wrap correctly rather than saturating to 0
+        assert_eq!(pack_angle(-90.0), 192);
+        assert_eq!(pack_angle(-180.0), 128);
+        assert_eq!(pack_angle(-45.0), 224);
+        assert_eq!(pack_angle(-360.0), 0);
     }
 }

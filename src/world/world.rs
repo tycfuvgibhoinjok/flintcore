@@ -30,6 +30,7 @@ fn with_generator<R>(seed: i64, f: impl FnOnce(&mut Generator) -> R) -> R {
 pub struct World {
     config: WorldConfig,
     chunks: HashMap<ChunkPos, Chunk>,
+    packet_cache: RefCell<HashMap<ChunkPos, (PreChunk, MapChunk)>>,
 }
 
 impl World {
@@ -37,6 +38,7 @@ impl World {
         Self {
             config,
             chunks: HashMap::new(),
+            packet_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -121,6 +123,7 @@ impl World {
         if let Some(chunk) = self.chunks.get_mut(&pos) {
             chunk.state = ChunkState::Populated;
         }
+        self.packet_cache.borrow_mut().remove(&pos);
     }
 
     pub fn generate_base_chunks_parallel(&mut self, positions: &[ChunkPos]) {
@@ -149,6 +152,10 @@ impl World {
     }
 
     pub fn prepare_chunk_packets(&self, pos: ChunkPos) -> Result<(PreChunk, MapChunk)> {
+        if let Some(cached) = self.packet_cache.borrow().get(&pos) {
+            return Ok(cached.clone());
+        }
+
         let chunk = self
             .chunks
             .get(&pos)
@@ -159,7 +166,9 @@ impl World {
             mode: true,
         };
         let map_chunk = MapChunk::from_chunk(chunk)?;
-        Ok((pre_chunk, map_chunk))
+        let result = (pre_chunk, map_chunk);
+        self.packet_cache.borrow_mut().insert(pos, result.clone());
+        Ok(result)
     }
 
     pub fn compress_chunks_parallel(
@@ -222,6 +231,7 @@ impl World {
         if let Some(chunk) = self.chunks.get_mut(&pos) {
             chunk.set_block((x & 15) as usize, y as usize, (z & 15) as usize, id);
         }
+        self.packet_cache.borrow_mut().remove(&pos);
         self.recalc_height(cx, cz, (x & 15) as usize, (z & 15) as usize);
     }
 
@@ -236,6 +246,7 @@ impl World {
             chunk.set_block((x & 15) as usize, y as usize, (z & 15) as usize, id);
             chunk.set_metadata((x & 15) as usize, y as usize, (z & 15) as usize, data);
         }
+        self.packet_cache.borrow_mut().remove(&pos);
         self.recalc_height(cx, cz, (x & 15) as usize, (z & 15) as usize);
     }
 

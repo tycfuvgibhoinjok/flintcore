@@ -91,7 +91,7 @@ impl Player {
     }
 
     pub fn chunk_pos(&self) -> ChunkPos {
-        ChunkPos::new((self.x as i32) >> 4, (self.z as i32) >> 4)
+        ChunkPos::new(self.x.floor() as i32 >> 4, self.z.floor() as i32 >> 4)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -135,6 +135,30 @@ impl Player {
             self.mot_z += dz * 0.4;
             self.velocity_changed = true;
         }
+    }
+
+    pub fn tick(&mut self) {
+        if self.no_damage_ticks > 0 {
+            self.no_damage_ticks -= 1;
+        }
+        if self.fire_ticks > 0 {
+            self.fire_ticks -= 1;
+        }
+    }
+
+    pub fn take_damage_direct(&mut self, amount: i16) -> (i16, bool) {
+        if self.dead || self.no_damage_ticks > 10 {
+            return (0, false);
+        }
+
+        self.health = (self.health - amount).max(0);
+        self.no_damage_ticks = 20;
+
+        let died = self.health == 0;
+        if died {
+            self.dead = true;
+        }
+        (amount, died)
     }
 
     pub fn take_damage(&mut self, amount: i16) -> (i16, bool) {

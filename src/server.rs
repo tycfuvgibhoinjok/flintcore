@@ -15,9 +15,9 @@ use crate::gameplay::inventory::InventoryPlayer;
 use crate::net::connection::ConnectionState;
 use crate::net::packets::chat::{is_allowed_char, wrap_text};
 use crate::net::packets::{
-    BlockChange, Chat, Clientbound, EntityStatus, Handshake, KeepAlive, KickDisconnect, LevelSound,
-    Login, PlayerLookMove, PreChunk, Respawn, Serverbound, SetSlot, SpawnPosition, Transaction,
-    UpdateHealth, UpdateTime, WindowItems,
+    ArmAnimation, BlockChange, Chat, Clientbound, EntityStatus, EntityVelocity, Handshake,
+    KeepAlive, KickDisconnect, LevelSound, Login, OpenWindow, PlayerLookMove, PreChunk, Respawn,
+    Serverbound, SetSlot, SpawnPosition, Transaction, UpdateHealth, UpdateTime, WindowItems,
 };
 use crate::net::protocol::PROTOCOL_VERSION;
 use crate::net::{ConnId, NetEvent, Outbound};
@@ -109,6 +109,12 @@ impl Server {
     fn tick(&mut self, ticks: u64) {
         self.current_tick = ticks;
         self.drain_inbound();
+
+        // Tick each player (no_damage_ticks, fire_ticks decrement)
+        for player in self.entities.iter_players_mut() {
+            player.tick();
+        }
+
         self.stream_chunks();
 
         // Tick entity tracking every 2 ticks (mirroring Poseidon EntityTracker)
@@ -253,38 +259,26 @@ impl Server {
             Serverbound::KeepAlive(_) => {}
             Serverbound::Chat(chat) => self.handle_chat(id, chat),
             Serverbound::Flying(flying) => {
-                if let Some(player) = self.entities.get_by_conn_mut(id) {
-                    player.on_ground = flying.on_ground;
-                }
+                self.handle_movement(id, None, None, flying.on_ground);
             }
             Serverbound::PlayerPosition(pos) => {
-                if let Some(player) = self.entities.get_by_conn_mut(id) {
-                    player.update_position(
-                        pos.x,
-                        pos.y,
-                        pos.stance,
-                        pos.z,
-                        player.yaw,
-                        player.pitch,
-                        pos.on_ground,
-                    );
-                }
+                self.handle_movement(
+                    id,
+                    Some((pos.x, pos.y, pos.stance, pos.z)),
+                    None,
+                    pos.on_ground,
+                );
             }
             Serverbound::PlayerLook(look) => {
-                if let Some(player) = self.entities.get_by_conn_mut(id) {
-                    player.update_position(
-                        player.x,
-                        player.y,
-                        player.stance,
-                        player.z,
-                        look.yaw,
-                        look.pitch,
-                        look.on_ground,
-                    );
-                }
+                self.handle_movement(id, None, Some((look.yaw, look.pitch)), look.on_ground);
             }
             Serverbound::PlayerLookMove(look_move) => {
-                self.handle_player_movement(id, look_move);
+                self.handle_movement(
+                    id,
+                    Some((look_move.x, look_move.y, look_move.stance, look_move.z)),
+                    Some((look_move.yaw, look_move.pitch)),
+                    look_move.on_ground,
+                );
             }
             Serverbound::ArmAnimation(anim) => {
                 // Broadcast arm animation to all other players in Playing state
@@ -317,7 +311,7 @@ impl Server {
             Serverbound::WindowClick(click) => {
                 self.handle_window_click(id, click);
             }
-            Serverbound::CloseWindow(close) => {
+            Serverbound::CloseWindow(_) => {
                 if let Some(player) = self.entities.get_by_conn_mut(id) {
                     if let Some(cursor) = player.inventory.cursor.take() {
                         player.inventory.add_item(cursor);
@@ -331,11 +325,11 @@ impl Server {
                         );
                     }
                 }
-                self.send(id, Clientbound::CloseWindow(close));
             }
-            Serverbound::Transaction(_)
-            | Serverbound::UseEntity(_)
-            | Serverbound::UpdateSign(_) => {}
+            Serverbound::Transaction(_) | Serverbound::UpdateSign(_) => {}
+            Serverbound::UseEntity(use_entity) => {
+                self.handle_use_entity(id, use_entity);
+            }
             Serverbound::Respawn(_) => {
                 self.handle_respawn(id);
             }
@@ -346,19 +340,25 @@ impl Server {
         }
     }
 
-    fn handle_player_movement(
+    fn handle_movement(
         &mut self,
         id: ConnId,
-        look_move: crate::net::packets::PlayerLookMove,
+        pos: Option<(f64, f64, f64, f64)>,
+        rot: Option<(f32, f32)>,
+        on_ground: bool,
     ) {
         let (fall_damage, entity_id) = {
             if let Some(player) = self.entities.get_by_conn_mut(id) {
                 let prev_y = player.y;
                 let mut fall_damage = 0i16;
 
-                if !look_move.on_ground {
-                    if look_move.y < prev_y {
-                        player.fall_distance += (prev_y - look_move.y) as f32;
+                let (x, y, stance, z) =
+                    pos.unwrap_or((player.x, player.y, player.stance, player.z));
+                let (yaw, pitch) = rot.unwrap_or((player.yaw, player.pitch));
+
+                if !on_ground {
+                    if y < prev_y {
+                        player.fall_distance += (prev_y - y) as f32;
                     }
                 } else {
                     if player.fall_distance > 3.0 {
@@ -367,15 +367,7 @@ impl Server {
                     player.fall_distance = 0.0;
                 }
 
-                player.update_position(
-                    look_move.x,
-                    look_move.y,
-                    look_move.stance,
-                    look_move.z,
-                    look_move.yaw,
-                    look_move.pitch,
-                    look_move.on_ground,
-                );
+                player.update_position(x, y, stance, z, yaw, pitch, on_ground);
 
                 (fall_damage, player.entity_id)
             } else {
@@ -384,7 +376,127 @@ impl Server {
         };
 
         if fall_damage > 0 {
-            self.damage_player(entity_id, fall_damage, "fell from a high place");
+            self.damage_player_direct(entity_id, fall_damage, "hit the ground too hard");
+        }
+    }
+
+    fn handle_use_entity(&mut self, id: ConnId, use_entity: crate::net::packets::UseEntity) {
+        let (attacker_id, attacker_x, attacker_z, held_item, attacker_name) = {
+            if let Some(attacker) = self.entities.get_by_conn(id) {
+                (
+                    attacker.entity_id,
+                    attacker.x,
+                    attacker.z,
+                    attacker.inventory.item_in_hand(),
+                    attacker.username.clone(),
+                )
+            } else {
+                return;
+            }
+        };
+
+        // Swing arm animation
+        self.broadcast(Clientbound::ArmAnimation(ArmAnimation {
+            entity_id: attacker_id,
+            animate: 1,
+        }));
+
+        if use_entity.attack {
+            let target_id = use_entity.target;
+            let (target_conn_id, target_name, target_health, died, mot_x, mot_y, mot_z) = {
+                if let Some(target) = self.entities.get_player_mut(target_id) {
+                    if target.dead {
+                        return;
+                    }
+                    // Reach distance check: <= 16.0 (4 blocks)
+                    let dx = target.x - attacker_x;
+                    let dz = target.z - attacker_z;
+                    if dx * dx + dz * dz > 16.0 {
+                        return;
+                    }
+
+                    let raw_damage = held_item.map(|s| s.attack_damage()).unwrap_or(1);
+                    let (dealt, died) = target.take_damage(raw_damage);
+                    if dealt <= 0 {
+                        return;
+                    }
+
+                    target.apply_knockback(attacker_x, attacker_z);
+                    let mot_x = (target.mot_x.clamp(-3.9, 3.9) * 8000.0) as i16;
+                    let mot_y = (target.mot_y.clamp(-3.9, 3.9) * 8000.0) as i16;
+                    let mot_z = (target.mot_z.clamp(-3.9, 3.9) * 8000.0) as i16;
+
+                    (
+                        target.conn_id,
+                        target.username.clone(),
+                        target.health,
+                        died,
+                        mot_x,
+                        mot_y,
+                        mot_z,
+                    )
+                } else {
+                    return;
+                }
+            };
+
+            // Send knockback velocity
+            let vel = Clientbound::EntityVelocity(EntityVelocity {
+                entity_id: target_id,
+                mot_x,
+                mot_y,
+                mot_z,
+            });
+            self.send(target_conn_id, vel.clone());
+            self.broadcast(vel);
+
+            // Hurt status animation (status 2)
+            self.broadcast(Clientbound::EntityStatus(EntityStatus {
+                entity_id: target_id,
+                status: 2,
+            }));
+
+            // Sync target health
+            self.send(
+                target_conn_id,
+                Clientbound::UpdateHealth(UpdateHealth {
+                    health: target_health,
+                }),
+            );
+
+            // Damage weapon durability on attacker
+            if let Some(attacker) = self.entities.get_by_conn_mut(id) {
+                if let Some(mut item) = attacker.inventory.item_in_hand() {
+                    if item.is_tool() || item.is_weapon() {
+                        let broken = item.damage_item(2);
+                        if broken {
+                            attacker.inventory.set_item_in_hand(None);
+                        } else {
+                            attacker.inventory.set_item_in_hand(Some(item));
+                        }
+                        let slot_idx = 36 + attacker.inventory.held_slot as i16;
+                        let slot_item =
+                            InventoryPlayer::to_slot_item(attacker.inventory.item_in_hand());
+                        self.send(
+                            id,
+                            Clientbound::SetSlot(SetSlot {
+                                window_id: 0,
+                                slot: slot_idx,
+                                item: slot_item,
+                            }),
+                        );
+                    }
+                }
+            }
+
+            if died {
+                let death_msg = format!("\u{00A7}e{target_name} was slain by {attacker_name}");
+                self.broadcast_chat(&death_msg);
+                self.broadcast(Clientbound::EntityStatus(EntityStatus {
+                    entity_id: target_id,
+                    status: 3,
+                }));
+            }
         }
     }
 
@@ -515,6 +627,21 @@ impl Server {
             return;
         }
 
+        // Check if right-clicking interactive blocks (Workbench, Chest, Furnace)
+        let clicked_block = self.world.get_block(place.x, place.y as i32, place.z);
+        if clicked_block == crate::gameplay::blocks::WORKBENCH {
+            self.send(
+                id,
+                Clientbound::OpenWindow(OpenWindow {
+                    window_id: 1,
+                    inventory_type: 1,
+                    title: "Crafting".to_string(),
+                    slots_count: 9,
+                }),
+            );
+            return;
+        }
+
         let (tx, ty, tz) = match place.direction {
             0 => (place.x, place.y.saturating_sub(1), place.z),
             1 => (place.x, place.y.saturating_add(1), place.z),
@@ -595,7 +722,11 @@ impl Server {
             player
                 .inventory
                 .handle_window_click(click.slot, click.button, click.shift);
-            let item = InventoryPlayer::to_slot_item(player.inventory.get_window_slot(click.slot));
+            let item = if click.slot >= 0 {
+                InventoryPlayer::to_slot_item(player.inventory.get_window_slot(click.slot))
+            } else {
+                None
+            };
             let cursor = InventoryPlayer::to_slot_item(player.inventory.cursor);
             (item, cursor)
         } else {
@@ -612,15 +743,17 @@ impl Server {
             }),
         );
 
-        // Sync clicked slot
-        self.send(
-            id,
-            Clientbound::SetSlot(SetSlot {
-                window_id: click.window_id as i8,
-                slot: click.slot,
-                item: clicked_item,
-            }),
-        );
+        // Sync clicked slot if valid slot index
+        if click.slot >= 0 {
+            self.send(
+                id,
+                Clientbound::SetSlot(SetSlot {
+                    window_id: click.window_id as i8,
+                    slot: click.slot,
+                    item: clicked_item,
+                }),
+            );
+        }
 
         // Sync cursor slot
         self.send(
@@ -761,10 +894,12 @@ impl Server {
                 let pos = ChunkPos::new(center.x + dx, center.z + dz);
                 self.world.populate_chunk(pos);
                 if let Ok((pre, map)) = self.world.prepare_chunk_packets(pos) {
-                    self.send(id, Clientbound::PreChunk(pre));
-                    self.send(id, Clientbound::MapChunk(map));
-                    if let Some(player) = self.entities.get_by_conn_mut(id) {
-                        player.sent_chunks.insert(pos);
+                    if self.try_send(id, Clientbound::PreChunk(pre))
+                        && self.try_send(id, Clientbound::MapChunk(map))
+                    {
+                        if let Some(player) = self.entities.get_by_conn_mut(id) {
+                            player.sent_chunks.insert(pos);
+                        }
                     }
                 }
             }
@@ -866,14 +1001,16 @@ impl Server {
                             }
 
                             if let Ok((pre, map)) = self.world.prepare_chunk_packets(pos) {
-                                self.send(id, Clientbound::PreChunk(pre));
-                                self.send(id, Clientbound::MapChunk(map));
-                                if let Some(player) = self.entities.get_by_conn_mut(id) {
-                                    player.sent_chunks.insert(pos);
-                                }
-                                sent_this_tick += 1;
-                                if sent_this_tick >= chunks_per_tick {
-                                    break;
+                                if self.try_send(id, Clientbound::PreChunk(pre))
+                                    && self.try_send(id, Clientbound::MapChunk(map))
+                                {
+                                    if let Some(player) = self.entities.get_by_conn_mut(id) {
+                                        player.sent_chunks.insert(pos);
+                                    }
+                                    sent_this_tick += 1;
+                                    if sent_this_tick >= chunks_per_tick {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -890,19 +1027,21 @@ impl Server {
             .and_then(|connection| connection.username.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let message = chat.message.trim().to_string();
+        let raw_message = chat.message.trim();
 
         // Poseidon: length > 100 -> disconnect "Chat message too long"
-        if message.len() > 100 {
+        if raw_message.len() > 100 {
             self.kick(id, "Chat message too long");
             return;
         }
 
         // Poseidon: illegal characters -> disconnect "Illegal characters in chat"
-        if !message.chars().all(is_allowed_char) {
+        if !raw_message.chars().all(is_allowed_char) {
             self.kick(id, "Illegal characters in chat");
             return;
         }
+
+        let message = crate::net::packets::chat::translate_alternate_color_codes('&', raw_message);
 
         if message.is_empty() {
             return;
@@ -969,6 +1108,39 @@ impl Server {
         }
     }
 
+    fn damage_player_direct(&mut self, entity_id: i32, damage: i16, reason: &str) {
+        let (conn_id, username, health, died) = {
+            if let Some(player) = self.entities.get_player_mut(entity_id) {
+                let (dealt, died) = player.take_damage_direct(damage);
+                if dealt > 0 {
+                    (player.conn_id, player.username.clone(), player.health, died)
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        };
+
+        // Hurt status animation (status 2) to observers and player
+        self.broadcast(Clientbound::EntityStatus(EntityStatus {
+            entity_id,
+            status: 2,
+        }));
+
+        self.send(conn_id, Clientbound::UpdateHealth(UpdateHealth { health }));
+
+        if died {
+            let death_msg = format!("\u{00A7}e{username} {reason}");
+            self.broadcast_chat(&death_msg);
+            self.broadcast(Clientbound::EntityStatus(EntityStatus {
+                entity_id,
+                status: 3,
+            }));
+        }
+    }
+
+    #[allow(dead_code)]
     fn damage_player(&mut self, entity_id: i32, damage: i16, reason: &str) {
         let (conn_id, username, health, died) = {
             if let Some(player) = self.entities.get_player_mut(entity_id) {
@@ -1038,6 +1210,14 @@ impl Server {
     fn send(&self, id: ConnId, packet: Clientbound) {
         if let Some(connection) = self.connections.get(&id) {
             let _ = connection.sender.try_send(Outbound::Packet(packet));
+        }
+    }
+
+    fn try_send(&self, id: ConnId, packet: Clientbound) -> bool {
+        if let Some(connection) = self.connections.get(&id) {
+            connection.sender.try_send(Outbound::Packet(packet)).is_ok()
+        } else {
+            false
         }
     }
 

@@ -11,7 +11,7 @@ pub const ALLOWED_CHARS: &str =
     " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_'abcdefghijklmnopqrstuvwxyz{|}~⌂ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜø£Ø×ƒáíóúñÑªº¿®¬½¼¡«»";
 
 pub fn is_allowed_char(c: char) -> bool {
-    ALLOWED_CHARS.contains(c)
+    c == COLOR_CHAR || ALLOWED_CHARS.contains(c)
 }
 
 // Character widths per index (index = position in ALLOWED_CHARS + 32),
@@ -52,22 +52,23 @@ pub fn wrap_text(text: &str) -> Vec<String> {
 
     while let Some(ch) = char_iter.next() {
         // Get the color
-        if ch == COLOR_CHAR && char_iter.peek().is_some() {
-            let next = char_iter.peek().copied().unwrap();
-            // We might need a linebreak ... so ugly ;(
-            if line_length + 2 > CHAT_STRING_LENGTH {
-                out.push('\n');
-                line_length = 0;
-                if color_char != 'f' && color_char != 'F' {
-                    out.push(COLOR_CHAR);
-                    out.push(color_char);
-                    line_length += 2;
+        if ch == COLOR_CHAR {
+            if let Some(next) = char_iter.next() {
+                // We might need a linebreak ... so ugly ;(
+                if line_length + 2 > CHAT_STRING_LENGTH {
+                    out.push('\n');
+                    line_length = 0;
+                    if color_char != 'f' && color_char != 'F' {
+                        out.push(COLOR_CHAR);
+                        out.push(color_char);
+                        line_length += 2;
+                    }
                 }
+                color_char = next;
+                out.push(COLOR_CHAR);
+                out.push(next);
+                line_length += 2;
             }
-            color_char = next;
-            out.push(COLOR_CHAR);
-            out.push(next);
-            line_length += 2;
             continue;
         }
 
@@ -103,6 +104,31 @@ pub fn wrap_text(text: &str) -> Vec<String> {
     out.split('\n').map(|s| s.to_string()).collect()
 }
 
+/// Translates alternate color codes (e.g. '&c' -> '§c').
+pub fn translate_alternate_color_codes(alt_color_char: char, text: &str) -> String {
+    let mut chars = text.chars().peekable();
+    let mut out = String::with_capacity(text.len());
+    while let Some(c) = chars.next() {
+        if c == alt_color_char {
+            if let Some(&next) = chars.peek() {
+                let lower = next.to_ascii_lowercase();
+                if lower.is_ascii_digit()
+                    || ('a'..='f').contains(&lower)
+                    || ('k'..='o').contains(&lower)
+                    || lower == 'r'
+                {
+                    out.push(COLOR_CHAR);
+                    out.push(lower);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chat {
     pub message: String,
@@ -133,8 +159,15 @@ mod tests {
     #[test]
     fn wrap_text_color_code_preserved() {
         let lines = wrap_text("§ctest");
-        assert!(!lines.is_empty());
-        assert!(lines[0].starts_with("§c"));
+        assert_eq!(lines, vec!["§ctest"]);
+    }
+
+    #[test]
+    fn translate_color_codes() {
+        assert_eq!(
+            translate_alternate_color_codes('&', "&aGreen &cRed &eYellow"),
+            "§aGreen §cRed §eYellow"
+        );
     }
 
     #[test]
@@ -153,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn is_allowed_char_section_not_allowed() {
-        assert!(!is_allowed_char('§'));
+    fn is_allowed_char_section_allowed() {
+        assert!(is_allowed_char('§'));
     }
 }

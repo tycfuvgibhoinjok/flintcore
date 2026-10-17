@@ -1084,3 +1084,346 @@ async fn respawn_double_packet_sequence() {
     timeout(Duration::from_secs(5), exchange).await.unwrap();
     harness.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_color_codes_and_section_sign() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "ColorUser").await;
+
+        // Send a message with section sign (§a)
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("§aGreen message", 100).unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        // Must NOT be kicked (not packet 255)
+        let id = read_next_non_chunk_packet_id(&mut client).await;
+        assert_eq!(id, 3);
+        let msg = read_string(&mut client).await;
+        assert!(msg.contains("§aGreen message"));
+
+        // Send a message with ampersand (&c)
+        let mut writer2 = Writer::new();
+        writer2.write_u8(3);
+        writer2.write_string("&cRed message", 100).unwrap();
+        client.write_all(writer2.as_slice()).await.unwrap();
+
+        let id2 = read_next_non_chunk_packet_id(&mut client).await;
+        assert_eq!(id2, 3);
+        let msg2 = read_string(&mut client).await;
+        assert!(msg2.contains("§cRed message"));
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_window_does_not_echo() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "CloseTest").await;
+
+        // Send CloseWindow(0)
+        let mut writer = Writer::new();
+        writer.write_u8(101);
+        writer.write_u8(0);
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        // Send KeepAlive (0)
+        let mut ka_writer = Writer::new();
+        ka_writer.write_u8(0);
+        client.write_all(ka_writer.as_slice()).await.unwrap();
+
+        // Should NOT receive CloseWindow(101) back
+        // Wait a short time to verify no packet 101 arrives
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut buf = [0u8; 1];
+        let peek_res = client.try_read(&mut buf);
+        // Either Nothing or KeepAlive/UpdateTime, definitely not 101
+        if let Ok(n) = peek_res {
+            if n > 0 {
+                assert_ne!(buf[0], 101);
+            }
+        }
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fall_damage_on_player_position() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "FallUser").await;
+
+        // First sync position on ground
+        let mut writer0 = Writer::new();
+        writer0.write_u8(11);
+        writer0.write_f64(0.0);
+        writer0.write_f64(64.0);
+        writer0.write_f64(64.0);
+        writer0.write_f64(0.0);
+        writer0.write_bool(true);
+        client.write_all(writer0.as_slice()).await.unwrap();
+
+        // Fall 5 blocks in air: Packet 11 (PlayerPosition), on_ground = false
+        let mut writer = Writer::new();
+        writer.write_u8(11);
+        writer.write_f64(0.0);
+        writer.write_f64(59.0); // 5 blocks drop
+        writer.write_f64(59.0);
+        writer.write_f64(0.0);
+        writer.write_bool(false);
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        // Land on ground: Packet 11 (PlayerPosition), on_ground = true
+        let mut writer2 = Writer::new();
+        writer2.write_u8(11);
+        writer2.write_f64(0.0);
+        writer2.write_f64(59.0);
+        writer2.write_f64(59.0);
+        writer2.write_f64(0.0);
+        writer2.write_bool(true);
+        client.write_all(writer2.as_slice()).await.unwrap();
+
+        // Should receive EntityStatus (38, status 2) and UpdateHealth (8) with health == 18
+        let mut got_hurt_animation = false;
+        let mut got_damaged_health = false;
+
+        while !got_hurt_animation || !got_damaged_health {
+            let id = read_u8(&mut client).await;
+            if id == 0 {
+                continue;
+            } else if id == 50 {
+                let _ = (
+                    read_i32(&mut client).await,
+                    read_i32(&mut client).await,
+                    read_u8(&mut client).await,
+                );
+            } else if id == 51 {
+                let _ = (
+                    read_i32(&mut client).await,
+                    read_i16(&mut client).await,
+                    read_i32(&mut client).await,
+                );
+                let _ = (
+                    read_u8(&mut client).await,
+                    read_u8(&mut client).await,
+                    read_u8(&mut client).await,
+                );
+                let len = read_i32(&mut client).await as usize;
+                let mut comp = vec![0u8; len];
+                client.read_exact(&mut comp).await.unwrap();
+            } else if id == 38 {
+                let _ent = read_i32(&mut client).await;
+                let status = read_u8(&mut client).await;
+                assert_eq!(status, 2); // hurt animation!
+                got_hurt_animation = true;
+            } else if id == 8 {
+                let health = read_i16(&mut client).await;
+                assert_eq!(health, 18, "Health should be 18 after 5 block fall");
+                got_damaged_health = true;
+            }
+        }
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pvp_attack_deals_damage_and_velocity() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut attacker = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut attacker, "Attacker").await;
+
+        let mut victim = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut victim, "Victim").await;
+
+        // Attacker entity_id is 1, Victim is 2
+        // Attacker attacks Victim (entity 2) with Packet 7 (UseEntity)
+        let mut writer = Writer::new();
+        writer.write_u8(7);
+        writer.write_i32(1); // user
+        writer.write_i32(2); // target
+        writer.write_bool(true); // attack
+        attacker.write_all(writer.as_slice()).await.unwrap();
+
+        // Victim should receive UpdateHealth (health < 20)
+        let mut got_hurt = false;
+        let mut got_health = false;
+        while !got_hurt || !got_health {
+            let id = read_u8(&mut victim).await;
+            if id == 0 {
+                continue;
+            } else if id == 38 {
+                let _ent = read_i32(&mut victim).await;
+                let status = read_u8(&mut victim).await;
+                assert_eq!(status, 2);
+                got_hurt = true;
+            } else if id == 8 {
+                let health = read_i16(&mut victim).await;
+                assert!(health < 20, "Victim health should be reduced, got {health}");
+                got_health = true;
+            } else if id == 28 {
+                let _ = (
+                    read_i32(&mut victim).await,
+                    read_i16(&mut victim).await,
+                    read_i16(&mut victim).await,
+                    read_i16(&mut victim).await,
+                );
+            } else if id == 50 {
+                let _ = (
+                    read_i32(&mut victim).await,
+                    read_i32(&mut victim).await,
+                    read_u8(&mut victim).await,
+                );
+            } else if id == 51 {
+                let _ = (
+                    read_i32(&mut victim).await,
+                    read_i16(&mut victim).await,
+                    read_i32(&mut victim).await,
+                );
+                let _ = (
+                    read_u8(&mut victim).await,
+                    read_u8(&mut victim).await,
+                    read_u8(&mut victim).await,
+                );
+                let len = read_i32(&mut victim).await as usize;
+                let mut comp = vec![0u8; len];
+                victim.read_exact(&mut comp).await.unwrap();
+            } else if id == 3 {
+                let _ = read_string(&mut victim).await;
+            } else if id == 20 {
+                let _ = read_i32(&mut victim).await;
+                let _ = read_string(&mut victim).await;
+                let _ = (
+                    read_i32(&mut victim).await,
+                    read_i32(&mut victim).await,
+                    read_i32(&mut victim).await,
+                );
+                let _ = (
+                    read_u8(&mut victim).await,
+                    read_u8(&mut victim).await,
+                    read_i16(&mut victim).await,
+                );
+            } else if id == 18 {
+                let _ = (read_i32(&mut victim).await, read_u8(&mut victim).await);
+            } else if id == 5 {
+                let _ = (
+                    read_i32(&mut victim).await,
+                    read_i16(&mut victim).await,
+                    read_i16(&mut victim).await,
+                    read_i16(&mut victim).await,
+                );
+            } else if id == 40 {
+                let _ = read_i32(&mut victim).await;
+                let mut meta = [0u8; 3];
+                victim.read_exact(&mut meta).await.unwrap();
+            }
+        }
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negative_yaw_camera_rotation_tracked() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client1 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client1, "Observer").await;
+
+        let mut client2 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client2, "Rotator").await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Rotator looks at negative yaw: -45.0, pitch -30.0
+        let mut writer = Writer::new();
+        writer.write_u8(12); // PlayerLook
+        writer.write_f32(-45.0);
+        writer.write_f32(-30.0);
+        writer.write_bool(true);
+        client2.write_all(writer.as_slice()).await.unwrap();
+
+        // Observer should receive packet 32 (EntityLook) with non-zero yaw (around 224)
+        let mut got_look = false;
+        for _ in 0..60 {
+            let id = read_u8(&mut client1).await;
+            if id == 32 {
+                let ent = read_i32(&mut client1).await;
+                assert_eq!(ent, 2);
+                let yaw = read_u8(&mut client1).await;
+                let pitch = read_u8(&mut client1).await;
+                assert_eq!(yaw, 224, "Negative yaw -45 deg must pack to 224, not 0");
+                assert_eq!(pitch, 234, "Negative pitch -30 deg must pack to 234, not 0");
+                got_look = true;
+                break;
+            } else if id == 0 {
+                continue;
+            } else if id == 3 {
+                let _ = read_string(&mut client1).await;
+            } else if id == 20 {
+                let _ = read_i32(&mut client1).await;
+                let _ = read_string(&mut client1).await;
+                let _ = (
+                    read_i32(&mut client1).await,
+                    read_i32(&mut client1).await,
+                    read_i32(&mut client1).await,
+                );
+                let _ = (
+                    read_u8(&mut client1).await,
+                    read_u8(&mut client1).await,
+                    read_i16(&mut client1).await,
+                );
+            } else if id == 50 {
+                let _ = (
+                    read_i32(&mut client1).await,
+                    read_i32(&mut client1).await,
+                    read_u8(&mut client1).await,
+                );
+            } else if id == 51 {
+                let _ = (
+                    read_i32(&mut client1).await,
+                    read_i16(&mut client1).await,
+                    read_i32(&mut client1).await,
+                );
+                let _ = (
+                    read_u8(&mut client1).await,
+                    read_u8(&mut client1).await,
+                    read_u8(&mut client1).await,
+                );
+                let len = read_i32(&mut client1).await as usize;
+                let mut comp = vec![0u8; len];
+                client1.read_exact(&mut comp).await.unwrap();
+            } else if id == 40 {
+                let _ = read_i32(&mut client1).await;
+                let mut meta = [0u8; 3];
+                client1.read_exact(&mut meta).await.unwrap();
+            } else if id == 5 {
+                let _ = (
+                    read_i32(&mut client1).await,
+                    read_i16(&mut client1).await,
+                    read_i16(&mut client1).await,
+                    read_i16(&mut client1).await,
+                );
+            }
+        }
+        assert!(
+            got_look,
+            "Observer should receive EntityLook with negative yaw packed"
+        );
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
