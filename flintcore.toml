@@ -1,0 +1,25 @@
+schema_version = 1
+
+[server]
+bind = "0.0.0.0"
+port = 25565
+max_players = 20
+motd = "flintcore Beta 1.7.3"
+online_mode = false
+
+[network]
+tcp_nodelay = true
+inbound_capacity = 4096
+outbound_capacity = 1024
+max_read_buffer = 1048576
+max_packets_per_tick = 2048
+
+[world]
+seed = 0
+view_distance = 10
+chunks_per_tick = 16
+gen_workers = 0
+compression_workers = 0
+spawn_x = 0
+spawn_y = 64
+spawn_z = 0
