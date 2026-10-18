@@ -127,61 +127,63 @@ pub fn is_opaque(id: u8) -> bool {
     light_opacity(id) > 0
 }
 
+/// Java `Block.o` (the `opaqueCubeLookup` table) — whitelist dumped from the
+/// reference runtime. Note the quirks: LEAVES and CHEST count as opaque,
+/// while DOUBLE_STEP/STEP, GLASS, BED, CACTUS, ICE etc. do not.
 pub fn is_opaque_cube(id: u8) -> bool {
-    !matches!(
+    matches!(
         id,
-        AIR | SAPLING
-            | WATER
-            | STATIONARY_WATER
-            | LAVA
-            | STATIONARY_LAVA
+        STONE
+            | GRASS
+            | DIRT
+            | COBBLESTONE
+            | WOOD_PLANKS
+            | BEDROCK
+            | SAND
+            | GRAVEL
+            | GOLD_ORE
+            | IRON_ORE
+            | COAL_ORE
+            | LOG
             | LEAVES
-            | GLASS
-            | BED
-            | POWERED_RAIL
-            | DETECTOR_RAIL
-            | STICKY_PISTON
-            | WEB
-            | TALL_GRASS
-            | DEAD_BUSH
-            | PISTON
-            | PISTON_HEAD
-            | YELLOW_FLOWER
-            | RED_ROSE
-            | BROWN_MUSHROOM
-            | RED_MUSHROOM
-            | STEP
-            | TORCH
-            | FIRE
-            | MOB_SPAWNER
-            | WOOD_STAIRS
-            | REDSTONE_WIRE
-            | CROPS
-            | FARMLAND
-            | SIGN
-            | WOODEN_DOOR
-            | LADDER
-            | RAIL
-            | COBBLESTONE_STAIRS
-            | WALL_SIGN
-            | LEVER
-            | STONE_PLATE
-            | IRON_DOOR
-            | WOOD_PLATE
-            | REDSTONE_TORCH_OFF
-            | REDSTONE_TORCH_ON
-            | STONE_BUTTON
-            | SNOW
-            | ICE
-            | CACTUS
-            | REED
-            | FENCE
-            | PORTAL
-            | CAKE
-            | REPEATER_OFF
-            | REPEATER_ON
-            | TRAPDOOR
+            | SPONGE
+            | LAPIS_ORE
+            | LAPIS_BLOCK
+            | DISPENSER
+            | SANDSTONE
+            | NOTE_BLOCK
+            | WOOL
+            | GOLD_BLOCK
+            | IRON_BLOCK
+            | BRICK
+            | TNT
+            | BOOKSHELF
+            | MOSSY_COBBLESTONE
+            | OBSIDIAN
+            | CHEST
+            | DIAMOND_ORE
+            | DIAMOND_BLOCK
+            | WORKBENCH
+            | FURNACE
+            | LIT_FURNACE
+            | REDSTONE_ORE
+            | LIT_REDSTONE_ORE
+            | SNOW_BLOCK
+            | CLAY
+            | JUKEBOX
+            | PUMPKIN
+            | NETHERRACK
+            | SOUL_SAND
+            | GLOWSTONE
+            | JACK_O_LANTERN
+            | LOCKED_CHEST
     )
+}
+
+/// Java `Block.leafDecayBlacklist` (configured ids 54, 63, 68): tree
+/// generation never replaces these blocks with leaves.
+pub fn leaf_decay_blacklist(id: u8) -> bool {
+    matches!(id, CHEST | SIGN | WALL_SIGN)
 }
 
 pub fn is_liquid(id: u8) -> bool {
@@ -211,6 +213,51 @@ pub fn is_solid(id: u8) -> bool {
 
 pub fn is_water(id: u8) -> bool {
     matches!(id, WATER | STATIONARY_WATER)
+}
+
+pub fn is_lava(id: u8) -> bool {
+    matches!(id, LAVA | STATIONARY_LAVA)
+}
+
+/// Java `Material.isSolid()`: false for air, liquids, plants, logic blocks
+/// (torches, wire, ladders, snow layer, ...) and transparent blocks (fire, portal).
+pub fn material_is_solid(id: u8) -> bool {
+    !matches!(
+        id,
+        AIR | WATER
+            | STATIONARY_WATER
+            | LAVA
+            | STATIONARY_LAVA
+            | SAPLING
+            | TALL_GRASS
+            | DEAD_BUSH
+            | YELLOW_FLOWER
+            | RED_ROSE
+            | BROWN_MUSHROOM
+            | RED_MUSHROOM
+            | CROPS
+            | TORCH
+            | FIRE
+            | REDSTONE_WIRE
+            | LADDER
+            | LEVER
+            | STONE_PLATE
+            | WOOD_PLATE
+            | REDSTONE_TORCH_OFF
+            | REDSTONE_TORCH_ON
+            | STONE_BUTTON
+            | SNOW
+            | PORTAL
+            | REPEATER_OFF
+            | REPEATER_ON
+    )
+}
+
+/// Java `Material.isBuildable()`. For every material reachable during world
+/// generation it matches `material_is_solid()` (MaterialLiquid, MaterialLogic
+/// and MaterialTransparent override both to false).
+pub fn material_is_buildable(id: u8) -> bool {
+    material_is_solid(id)
 }
 
 pub fn is_ice(id: u8) -> bool {

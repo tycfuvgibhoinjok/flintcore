@@ -1,0 +1,137 @@
+--- net/minecraft/server/Block.java
++++ net/minecraft/server/Block.java
+@@ -298,6 +298,7 @@
+     }
+ 
+     public final void g(World world, int i, int j, int k, int l) {
++        flintcore.test.Trace.rng3(i, j, k);
+         this.dropNaturally(world, i, j, k, l, 1.0F);
+     }
+ 
+--- net/minecraft/server/BlockFlowing.java
++++ net/minecraft/server/BlockFlowing.java
+@@ -21,7 +21,7 @@
+ 
+     private void i(World world, int i, int j, int k) {
+         int l = world.getData(i, j, k);
+-
++        flintcore.test.Trace.conv(i, j, k, l, this.id + 1);
+         world.setRawTypeIdAndData(i, j, k, this.id + 1, l);
+         world.b(i, j, k, i, j, k);
+         world.notify(i, j, k);
+@@ -35,6 +35,7 @@
+         // CraftBukkit end
+ 
+         int l = this.g(world, i, j, k);
++        flintcore.test.Trace.fa(i, j, k, this.id, l);
+         byte b0 = 1;
+ 
+         if (this.material == Material.LAVA && !world.worldProvider.d) {
+@@ -76,6 +77,9 @@
+                 }
+             }
+ 
++            if (this.material == Material.LAVA && l < 8 && i1 < 8 && i1 > l) {
++                flintcore.test.Trace.rng(i, j, k);
++            }
+             if (this.material == Material.LAVA && l < 8 && i1 < 8 && i1 > l && random.nextInt(4) != 0) {
+                 // Poseidon start - Fix flowing lava not disappearing
+                 boolean fixFlowingLava = PoseidonConfig.getInstance().getConfigBoolean("world.settings.flowing-lava-fix.enabled", true);
+@@ -110,6 +114,7 @@
+             }
+ 
+             if (!event.isCancelled()) {
++                flintcore.test.Trace.down(i, j - 1, k);
+                 if (l >= 8) {
+                     world.setTypeIdAndData(i, j - 1, k, this.id, l);
+                 } else {
+@@ -152,6 +157,7 @@
+     }
+ 
+     private void flow(World world, int i, int j, int k, int l) {
++        flintcore.test.Trace.flow(i, j, k, l);
+         if (this.l(world, i, j, k)) {
+             int i1 = world.getTypeId(i, j, k);
+ 
+@@ -256,6 +262,7 @@
+             this.b[i1] = this.c[i1] == l;
+         }
+ 
++        flintcore.test.Trace.j(i, j, k, this.c[0], this.c[1], this.c[2], this.c[3], this.b[0], this.b[1], this.b[2], this.b[3]);
+         return this.b;
+     }
+ 
+--- net/minecraft/server/BlockFluids.java
++++ net/minecraft/server/BlockFluids.java
+@@ -225,6 +225,7 @@
+     }
+ 
+     protected void h(World world, int i, int j, int k) {
++        flintcore.test.Trace.rng2(i, j, k);
+         world.makeSound((double) ((float) i + 0.5F), (double) ((float) j + 0.5F), (double) ((float) k + 0.5F), "random.fizz", 0.5F, 2.6F + (world.random.nextFloat() - world.random.nextFloat()) * 0.8F);
+ 
+         for (int l = 0; l < 8; ++l) {
+--- net/minecraft/server/BlockStationary.java
++++ net/minecraft/server/BlockStationary.java
+@@ -25,6 +25,7 @@
+         int l = world.getData(i, j, k);
+ 
+         world.suppressPhysics = true;
++        flintcore.test.Trace.conv(i, j, k, l, this.id - 1);
+         world.setRawTypeIdAndData(i, j, k, this.id - 1, l);
+         world.b(i, j, k, i, j, k);
+         world.c(i, j, k, this.id - 1, this.c());
+--- net/minecraft/server/Chunk.java
++++ net/minecraft/server/Chunk.java
+@@ -153,6 +153,7 @@
+         }
+ 
+         if (i1 != l) {
++            flintcore.test.Trace.g(this.x * 16 + i, this.z * 16 + k, l, i1);
+             this.world.g(i, k, i1, l);
+             this.heightMap[k << 4 | i] = (byte) i1;
+             int k1;
+@@ -234,6 +235,7 @@
+             int l1 = this.x * 16 + i;
+             int i2 = this.z * 16 + k;
+ 
++            flintcore.test.Trace.a5(this.x * 16 + i, j, this.z * 16 + k, k1, this.e.a(i, j, k), l, i1);
+             this.b[i << 11 | k << 7 | j] = (byte) (b0 & 255);
+             if (PoseidonConfig.getInstance().getConfigBoolean("world.settings.pistons.transmutation-fix.enabled", true)) {
+                 this.e.a(i, j, k, i1);
+@@ -281,6 +283,7 @@
+             int k1 = this.x * 16 + i;
+             int l1 = this.z * 16 + k;
+ 
++            flintcore.test.Trace.a4(this.x * 16 + i, j, this.z * 16 + k, j1, l);
+             this.b[i << 11 | k << 7 | j] = (byte) (b0 & 255);
+             if (j1 != 0) {
+                 Block.byId[j1].remove(this.world, k1, j, l1);
+@@ -312,6 +315,7 @@
+     }
+ 
+     public void b(int i, int j, int k, int l) {
++        flintcore.test.Trace.b(this.x * 16 + i, j, this.z * 16 + k, this.e.a(i, j, k), l);
+         this.o = true;
+         this.e.a(i, j, k, l);
+     }
+--- net/minecraft/server/World.java
++++ net/minecraft/server/World.java
+@@ -449,6 +449,7 @@
+ 
+     private void k(int i, int j, int k, int l) {
+         if (!this.suppressPhysics && !this.isStatic) {
++            flintcore.test.Trace.phys(i, j, k, l, this.getTypeId(i, j, k));
+             Block block = Block.byId[this.getTypeId(i, j, k)];
+ 
+             if (block != null) {
+--- flintcore/test/PoseidonGenerator.java
++++ flintcore/test/PoseidonGenerator.java
+@@ -117,6 +117,7 @@
+             }
+         }
+         // Populate in order
++        flintcore.test.Trace.armed = true;
+         for (int cz = minCz; cz <= maxCz; cz++) {
+             for (int cx = minCx; cx <= maxCx; cx++) {
+                 provider.getChunkAt(provider, cx, cz);

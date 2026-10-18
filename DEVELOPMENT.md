@@ -101,6 +101,29 @@ Known Beta quirks that must be preserved (non-exhaustive, add as discovered):
 - Login flow, including the login packet's abused `dimension` byte used by
   proxies.
 
+World-generation quirks found while reaching block-for-block Overworld parity
+with Project-Poseidon (verification harness in §6):
+
+- `Block.o` (`opaqueCubeLookup`) decides whether tree leaves replace a cell
+  and whether a mushroom can sit on it. It is *not* "solidity": `LEAVES` and
+  `CHEST` are opaque; `STEP`/`DOUBLE_STEP`, `GLASS`, `BED`, `CACTUS`, `ICE`,
+  `SNOW`, fences etc. are not (`blocks::is_opaque_cube`).
+- Tree leaf writes skip cells with `Block.o[id]` set, so trees never
+  overwrite leaves. `WorldGenTrees`, `WorldGenTaiga1` and `WorldGenTaiga2`
+  also honour the configured `block-tree-growth` blacklist (`poseidon.yml`,
+  default `54,63,68`) — `Taiga1`/`Taiga2` query it at quirky coordinates
+  (the ground block id is used as x, loop variables as z/y) and
+  `WorldGenForest` never consults it. Preserve all three behaviours.
+- Decoration consumes `JavaRandom` in exact order, including draws whose
+  result is invisible (leaf-blob "corner" coin flips happen before the
+  replaceability check).
+- Fluid instant-tick cascades run to completion inside `World.a`/`World.c`;
+  `BlockFlowing`'s per-side flags live on a singleton and are clobbered by
+  nested ticks, so the flow tail must re-read them every iteration
+  (`World::fluid_sides`).
+- `BlockFace` in this build: NORTH=(-X), EAST=(-Z), SOUTH=(+X), WEST=(+Z).
+- The snow pass writes flow through the physics path (`set_block_physics`).
+
 ---
 
 ## 6. Testing
@@ -128,6 +151,31 @@ Rules:
 - New worldgen features need a fixed-seed golden-chunk comparison.
 - Never weaken or delete an existing parity test to make a change pass. If a test
   is wrong, fix it deliberately and explain why in the commit.
+
+Worldgen parity harness (Overworld):
+
+- Ground truth: `tools/poseidon_dump/PoseidonGenerator.java` runs the
+  reference server headless and writes `chunk_<seed>_<cx>_<cz>.bin` per chunk
+  (32768 block bytes, 16384 nibble-packed meta bytes, 256 height bytes).
+  Compile it into the reference class directory:
+  `javac -nowarn -cp "target/poseidon_classes:.references/Project-Poseidon/libs/*" -d target/poseidon_classes tools/poseidon_dump/PoseidonGenerator.java`
+  then run it from the repo root (it reads `./poseidon.yml`):
+  `java -cp "target/poseidon_classes:.references/Project-Poseidon/libs/*" flintcore.test.PoseidonGenerator <seed> /tmp/poseidon_dumps -1 1 -1 1`
+  (prerequisite: the reference Poseidon sources compiled once into
+  `target/poseidon_classes`).
+- `tests/poseidon_compare.rs` regenerates the same 3x3 populated region and
+  compares block/meta/height cell by cell. `POSEIDON_DUMPS` selects the dump
+  dir, `POSEIDON_SEEDS` a comma-separated seed list (the defaults cover 18
+  seeds including tundra/taiga/desert/forest regions).
+- `tests/poseidon_golden.rs` is the JVM-free regression pin: it rebuilds each
+  chunk's full dump image and compares an FNV-1a 64 hash against the
+  committed `tests/golden/poseidon_region_hashes.txt` (derived from Java
+  dumps; regeneration command in the file header). Regenerate from fresh Java
+  dumps only when behavior intentionally changes — never hand-edit hashes.
+- `tests/debug_cube.rs` prints raw id/meta cubes (`DEBUG_SEED`, window envs).
+  With `FLINTCORE_TRACE=<x0,y0,z0,x1,y1,z1>` it emits a write-level event
+  trace (`A4`/`A5`/`B`/`G`/... lines) that can be diffed against a patched
+  reference run for byte-level staged comparison.
 
 ---
 

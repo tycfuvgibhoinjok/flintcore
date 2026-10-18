@@ -10,6 +10,19 @@ pub trait GenWorld {
     fn get_data(&self, x: i32, y: i32, z: i32) -> u8;
     fn set_block(&mut self, x: i32, y: i32, z: i32, id: u8);
     fn set_block_and_data(&mut self, x: i32, y: i32, z: i32, id: u8, data: u8);
+    /// Java `World.setTypeId` — raw write plus physics propagation.
+    fn set_block_physics(&mut self, x: i32, y: i32, z: i32, id: u8) {
+        self.set_block(x, y, z, id);
+    }
+    /// Java `World.setTypeIdAndData` — raw write plus physics propagation.
+    fn set_block_and_data_physics(&mut self, x: i32, y: i32, z: i32, id: u8, data: u8) {
+        self.set_block_and_data(x, y, z, id, data);
+    }
+    /// Java `Block.byId[id].a(world, x, y, z, random)` for flowing fluids,
+    /// invoked directly by `WorldGenLiquids`.
+    fn fluid_tick(&mut self, x: i32, y: i32, z: i32, lava: bool, random: &mut JavaRandom) {
+        let _ = (x, y, z, lava, random);
+    }
     fn set_tile_entity(&mut self, _te: TileEntity) {}
     fn highest_block_y(&self, x: i32, z: i32) -> i32;
     fn sky_light(&self, x: i32, y: i32, z: i32) -> i32;
@@ -33,6 +46,9 @@ fn flower_can_place(world: &dyn GenWorld, id: u8, x: i32, y: i32, z: i32) -> boo
         (0..128).contains(&y)
             && world.light_value(x, y, z) < 13
             && blocks::is_opaque_cube(world.get_block(x, y - 1, z))
+    } else if id == blocks::DEAD_BUSH {
+        (world.light_value(x, y, z) >= 8 || world.see_sky(x, y, z))
+            && world.get_block(x, y - 1, z) == blocks::SAND
     } else {
         (world.light_value(x, y, z) >= 8 || world.see_sky(x, y, z))
             && flower_soil(world.get_block(x, y - 1, z))
@@ -250,12 +266,12 @@ pub fn generate_dungeons(
                     && i2 != k + i1 + 1)
                     || (l1 >= 0 && !blocks::is_solid(world.get_block(k1, l1 - 1, i2)))
                 {
-                    world.set_block(k1, l1, i2, blocks::AIR);
+                    world.set_block_physics(k1, l1, i2, blocks::AIR);
                 } else if blocks::is_solid(world.get_block(k1, l1, i2)) {
                     if l1 == j - 1 && random.next_i32_bound(4) != 0 {
-                        world.set_block(k1, l1, i2, blocks::MOSSY_COBBLESTONE);
+                        world.set_block_physics(k1, l1, i2, blocks::MOSSY_COBBLESTONE);
                     } else {
-                        world.set_block(k1, l1, i2, blocks::COBBLESTONE);
+                        world.set_block_physics(k1, l1, i2, blocks::COBBLESTONE);
                     }
                 }
             }
@@ -283,7 +299,7 @@ pub fn generate_dungeons(
                     k2 += 1;
                 }
                 if k2 == 1 {
-                    world.set_block(i2, j, j2, blocks::CHEST);
+                    world.set_block_physics(i2, j, j2, blocks::CHEST);
                     let mut chest_te = TileEntity::new_chest(i2, j, j2);
                     for _ in 0..8 {
                         if let Some((slot, stack)) = dungeon_loot(random) {
@@ -307,7 +323,7 @@ pub fn generate_dungeons(
         }
     }
 
-    world.set_block(i, j, k, blocks::MOB_SPAWNER);
+    world.set_block_physics(i, j, k, blocks::MOB_SPAWNER);
     let spawner_mob = match random.next_i32_bound(4) {
         0 => "Skeleton",
         1 | 2 => "Zombie",
@@ -607,7 +623,7 @@ pub fn generate_pumpkin(
 
 pub fn generate_liquids(
     world: &mut dyn GenWorld,
-    _random: &mut JavaRandom,
+    random: &mut JavaRandom,
     i: i32,
     j: i32,
     k: i32,
@@ -650,7 +666,10 @@ pub fn generate_liquids(
         air += 1;
     }
     if stone == 3 && air == 1 {
-        world.set_block(i, j, k, block);
+        // Java WorldGenLiquids: place with full physics, then tick the fluid
+        // once directly (`world.a` is a no-op flag in Poseidon).
+        world.set_block_physics(i, j, k, block);
+        world.fluid_tick(i, j, k, block == blocks::LAVA, random);
     }
     true
 }
@@ -723,6 +742,7 @@ pub fn generate_trees(
                 let l2 = k2 - k;
                 if (j2.abs() != k1 || l2.abs() != k1 || random.next_i32_bound(2) != 0 && j1 != 0)
                     && !blocks::is_opaque_cube(world.get_block(l1, i2, k2))
+                    && !blocks::leaf_decay_blacklist(world.get_block(l1, i2, k2))
                 {
                     world.set_block(l1, i2, k2, blocks::LEAVES);
                 }
@@ -880,6 +900,7 @@ pub fn generate_taiga1(
                 let j3 = i3 - k;
                 if (k2.abs() != l2 || j3.abs() != l2 || l2 <= 0)
                     && !blocks::is_opaque_cube(world.get_block(j2, i2, i3))
+                    && !blocks::leaf_decay_blacklist(world.get_block(ground as i32, i2, k2))
                 {
                     world.set_block_and_data(j2, i2, i3, blocks::LEAVES, 1);
                 }
@@ -966,6 +987,7 @@ pub fn generate_taiga2(
                 let i4 = l3 - k;
                 if (k3.abs() != k2 || i4.abs() != k2 || k2 <= 0)
                     && !blocks::is_opaque_cube(world.get_block(i3, j3, l3))
+                    && !blocks::leaf_decay_blacklist(world.get_block(ground as i32, i2, k2))
                 {
                     world.set_block_and_data(i3, j3, l3, blocks::LEAVES, 1);
                 }
