@@ -26,6 +26,9 @@ impl RegionFileCache {
     pub fn get_or_open(&mut self, rx: i32, rz: i32) -> Result<&mut RegionFile> {
         let key = (rx, rz);
         if !self.regions.contains_key(&key) {
+            if self.regions.len() >= 256 {
+                self.close_all();
+            }
             std::fs::create_dir_all(&self.region_dir)?;
             let path = self.region_path(rx, rz);
             let region = RegionFile::open(&path)?;

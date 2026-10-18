@@ -24,9 +24,11 @@ thread_local! {
 /// `x0,y0,z0,x1,y1,z1` to print every pipeline event inside that box. The
 /// output matches the instrumented Poseidon reference dump byte for byte and
 /// is used to locate divergences between the two generators.
-pub(crate) fn trace_region() -> Option<(i32, i32, i32, i32, i32, i32)> {
+pub(crate) type TraceBox = (i32, i32, i32, i32, i32, i32);
+
+pub(crate) fn trace_region() -> Option<TraceBox> {
     use std::sync::OnceLock;
-    static REGION: OnceLock<Option<(i32, i32, i32, i32, i32, i32)>> = OnceLock::new();
+    static REGION: OnceLock<Option<TraceBox>> = OnceLock::new();
     *REGION.get_or_init(|| {
         std::env::var("FLINTCORE_TRACE").ok().and_then(|s| {
             let p: Vec<i32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
@@ -537,6 +539,7 @@ impl World {
         if let Some(chunk) = self.chunks.get_mut(&pos) {
             chunk.state = ChunkState::Populated;
             chunk.dirty = true;
+            chunk.compact();
         }
         self.packet_cache.borrow_mut().remove(&pos);
     }
@@ -565,6 +568,7 @@ impl World {
                 }
             }
         }
+        chunk.compact();
         chunk.dirty = true;
         chunk
     }
@@ -574,7 +578,11 @@ impl World {
     pub(crate) fn try_load_chunk_from_storage(&mut self, pos: ChunkPos) -> Option<Chunk> {
         let storage = self.storage.as_ref()?;
         match storage.borrow_mut().read_chunk(pos.x, pos.z) {
-            Ok(Some(nbt)) => ChunkLoader::chunk_from_nbt(&nbt).ok(),
+            Ok(Some(nbt)) => {
+                let mut c = ChunkLoader::chunk_from_nbt(&nbt).ok()?;
+                c.compact();
+                Some(c)
+            }
             _ => None,
         }
     }
@@ -892,6 +900,7 @@ impl World {
     /// Java `World.setData(i, j, k, l)`: metadata write followed by physics.
     pub fn java_set_data(&mut self, x: i32, y: i32, z: i32, data: u8) -> bool {
         if self.java_set_raw_data(x, y, z, data) {
+            self.flag_dirty(x, y, z);
             let id = self.get_block(x, y, z);
             self.java_apply_physics(x, y, z, id as i32);
             true
@@ -923,7 +932,7 @@ impl World {
     }
 
     fn java_update(&mut self, x: i32, y: i32, z: i32, l: i32) {
-        // `notify` only informs IWorldAccess listeners (client updates); no-op here.
+        self.flag_dirty(x, y, z);
         self.java_apply_physics(x, y, z, l);
     }
 
@@ -1017,8 +1026,14 @@ impl World {
         let key = (x, y, z, id);
         if !self.scheduled_set.contains(&key) {
             self.scheduled_set.insert(key);
-            self.scheduled
-                .insert(ScheduledTick { x, y, z, id, time, seq });
+            self.scheduled.insert(ScheduledTick {
+                x,
+                y,
+                z,
+                id,
+                time,
+                seq,
+            });
         }
     }
 
@@ -1224,7 +1239,11 @@ impl World {
         // The raw write runs `Block.byId[id - 1].c` (fizz + schedule inside
         // BlockFlowing.c), then `BlockStationary.i` schedules again explicitly.
         self.java_set_raw_type_id_and_data(x, y, z, id - 1, data);
-        let delay = if id == blocks::STATIONARY_WATER { 5 } else { 30 };
+        let delay = if id == blocks::STATIONARY_WATER {
+            5
+        } else {
+            30
+        };
         self.java_schedule_tick(x, y, z, id - 1, delay);
         self.suppress_physics = false;
     }
@@ -1376,11 +1395,11 @@ impl World {
                 }
                 chunk.set_sky_light(lx, y1 as usize, lz, i2 as u8);
             }
-            while y1 > 0 && blocks::light_opacity(chunk.get_block(lx, (y1 - 1) as usize, lz)) == 0
-            {
+            while y1 > 0 && blocks::light_opacity(chunk.get_block(lx, (y1 - 1) as usize, lz)) == 0 {
                 y1 -= 1;
             }
             chunk.dirty = true;
+            self.packet_cache.borrow_mut().remove(&pos);
             if self.live.active && y1 != j2 {
                 self.java_schedule_light(LightType::Sky, k1 - 1, y1, l1 - 1, k1 + 1, j2, l1 + 1);
             }
@@ -1493,11 +1512,13 @@ impl World {
                 LightType::Sky => chunk.set_sky_light(lx, y as usize, lz, l as u8),
                 LightType::Block => chunk.set_block_light(lx, y as usize, lz, l as u8),
             }
+            self.packet_cache.borrow_mut().remove(&pos);
         }
     }
 
     /// Java `World.a(EnumSkyBlock, int i, int j, int k, int l, int i1, int j1, boolean flag)`
     /// (lines 1652-1700).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn java_schedule_light(
         &mut self,
         kind: LightType,
@@ -1827,6 +1848,7 @@ impl World {
     /// BlockFlowing.j: choose the directions the fluid spreads to. Stores the
     /// result in the shared `fluid_sides` field (Java `this.b`) exactly like
     /// the reference singleton — nested ticks overwrite it mid-loop.
+    #[allow(clippy::needless_range_loop)]
     fn flowing_sides(&mut self, x: i32, y: i32, z: i32, lava: bool) {
         let li = if lava { 1 } else { 0 };
         let mut c = [1000i32; 4];
@@ -1915,6 +1937,7 @@ impl World {
     /// `BlockFlowing.a(World, i, j, k, Random)` — invoked directly by
     /// WorldGenLiquids after the fluid is placed (scheduled ticks never run
     /// during generation).
+    #[allow(clippy::if_same_then_else)]
     pub fn java_fluid_tick(&mut self, x: i32, y: i32, z: i32, random: &mut JavaRandom, lava: bool) {
         let this_id = if lava { blocks::LAVA } else { blocks::WATER };
         let b0: i32 = if lava { 2 } else { 1 };
@@ -2009,6 +2032,575 @@ impl World {
 
     pub fn set_block_and_data(&mut self, x: i32, y: i32, z: i32, id: u8, data: u8) {
         self.java_set_raw_type_id_and_data(x, y, z, id, data);
+    }
+
+    /// Java `World.e(x, y, z)`: `block.isOpaqueCube() && block.b()`.
+    pub fn is_solid_normal_at(&self, x: i32, y: i32, z: i32) -> bool {
+        blocks::is_solid_normal_block(self.get_block(x, y, z))
+    }
+
+    pub fn get_tile_entity(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Option<&crate::gameplay::tile::TileEntity> {
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        self.chunks.get(&pos)?.get_tile_entity(x, y, z)
+    }
+
+    pub fn get_tile_entity_mut(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Option<&mut crate::gameplay::tile::TileEntity> {
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        let chunk = self.chunks.get_mut(&pos)?;
+        chunk.dirty = true;
+        chunk
+            .tile_entities
+            .iter_mut()
+            .find(|te| te.x == x && te.y == y && te.z == z)
+    }
+
+    pub fn set_world_tile_entity(&mut self, te: crate::gameplay::tile::TileEntity) {
+        let pos = ChunkPos::new(te.x >> 4, te.z >> 4);
+        if let Some(chunk) = self.chunks.get_mut(&pos) {
+            chunk.set_tile_entity(te);
+            self.packet_cache.borrow_mut().remove(&pos);
+        }
+    }
+
+    pub fn remove_world_tile_entity(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Option<crate::gameplay::tile::TileEntity> {
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        let chunk = self.chunks.get_mut(&pos)?;
+        let idx = chunk
+            .tile_entities
+            .iter()
+            .position(|te| te.x == x && te.y == y && te.z == z)?;
+        let removed = chunk.tile_entities.swap_remove(idx);
+        chunk.dirty = true;
+        self.packet_cache.borrow_mut().remove(&pos);
+        Some(removed)
+    }
+
+    /// Java `Block.canPlace(world, x, y, z, face)`.
+    pub fn can_place_block_at(&self, block_id: u8, x: i32, y: i32, z: i32, face: u8) -> bool {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return false;
+        }
+        let existing = self.get_block(x, y, z);
+        if existing != blocks::AIR && !blocks::material(existing).is_replaceable() {
+            return false;
+        }
+
+        match block_id {
+            blocks::TORCH | blocks::REDSTONE_TORCH_OFF | blocks::REDSTONE_TORCH_ON => {
+                self.is_solid_normal_at(x - 1, y, z)
+                    || self.is_solid_normal_at(x + 1, y, z)
+                    || self.is_solid_normal_at(x, y, z - 1)
+                    || self.is_solid_normal_at(x, y, z + 1)
+                    || self.is_solid_normal_at(x, y - 1, z)
+                    || self.get_block(x, y - 1, z) == blocks::FENCE
+            }
+            blocks::LADDER => {
+                self.is_solid_normal_at(x - 1, y, z)
+                    || self.is_solid_normal_at(x + 1, y, z)
+                    || self.is_solid_normal_at(x, y, z - 1)
+                    || self.is_solid_normal_at(x, y, z + 1)
+            }
+            blocks::STONE_BUTTON => match face {
+                2 => self.is_solid_normal_at(x, y, z + 1),
+                3 => self.is_solid_normal_at(x, y, z - 1),
+                4 => self.is_solid_normal_at(x + 1, y, z),
+                5 => self.is_solid_normal_at(x - 1, y, z),
+                _ => false,
+            },
+            blocks::LEVER => match face {
+                1 => self.is_solid_normal_at(x, y - 1, z),
+                2 => self.is_solid_normal_at(x, y, z + 1),
+                3 => self.is_solid_normal_at(x, y, z - 1),
+                4 => self.is_solid_normal_at(x + 1, y, z),
+                5 => self.is_solid_normal_at(x - 1, y, z),
+                _ => false,
+            },
+            blocks::TRAPDOOR => match face {
+                2 => self.is_solid_normal_at(x, y, z + 1),
+                3 => self.is_solid_normal_at(x, y, z - 1),
+                4 => self.is_solid_normal_at(x + 1, y, z),
+                5 => self.is_solid_normal_at(x - 1, y, z),
+                _ => false,
+            },
+            blocks::STONE_PLATE
+            | blocks::WOOD_PLATE
+            | blocks::REDSTONE_WIRE
+            | blocks::RAIL
+            | blocks::POWERED_RAIL
+            | blocks::DETECTOR_RAIL
+            | blocks::REPEATER_OFF
+            | blocks::REPEATER_ON
+            | blocks::PUMPKIN
+            | blocks::JACK_O_LANTERN
+            | blocks::SNOW => self.is_solid_normal_at(x, y - 1, z),
+            blocks::CAKE => blocks::material(self.get_block(x, y - 1, z)).is_buildable(),
+            blocks::SAPLING | blocks::YELLOW_FLOWER | blocks::RED_ROSE | blocks::TALL_GRASS => {
+                matches!(
+                    self.get_block(x, y - 1, z),
+                    blocks::GRASS | blocks::DIRT | blocks::FARMLAND
+                )
+            }
+            blocks::DEAD_BUSH => self.get_block(x, y - 1, z) == blocks::SAND,
+            blocks::BROWN_MUSHROOM | blocks::RED_MUSHROOM => {
+                blocks::is_opaque_cube(self.get_block(x, y - 1, z))
+            }
+            blocks::CROPS => self.get_block(x, y - 1, z) == blocks::FARMLAND,
+            blocks::CACTUS => self.cactus_can_survive(x, y, z),
+            blocks::REED => self.reed_can_survive(x, y, z),
+            blocks::CHEST => {
+                let mut adj = 0;
+                for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    if self.get_block(x + dx, y, z + dz) == blocks::CHEST {
+                        adj += 1;
+                        // Cannot place next to an already-double chest
+                        for (dx2, dz2) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                            if (dx + dx2 != 0 || dz + dz2 != 0)
+                                && self.get_block(x + dx + dx2, y, z + dz + dz2) == blocks::CHEST
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                adj <= 1
+            }
+            _ => true,
+        }
+    }
+
+    /// Reproduce `Block.postPlace` + `Block.c` orientation and `TileEntity` setup on player placement.
+    #[allow(clippy::too_many_arguments, clippy::if_same_then_else)]
+    pub fn post_place_block(
+        &mut self,
+        block_id: u8,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        yaw: f32,
+        pitch: f32,
+    ) {
+        use crate::gameplay::tile::TileEntity;
+        let facing_4 = (((yaw * 4.0 / 360.0) + 0.5).floor() as i32) & 3;
+
+        match block_id {
+            blocks::TORCH | blocks::REDSTONE_TORCH_OFF | blocks::REDSTONE_TORCH_ON => {
+                let mut meta = 0u8;
+                let can_floor = self.is_solid_normal_at(x, y - 1, z)
+                    || self.get_block(x, y - 1, z) == blocks::FENCE;
+                if face == 1 && can_floor {
+                    meta = 5;
+                } else if face == 2 && self.is_solid_normal_at(x, y, z + 1) {
+                    meta = 4;
+                } else if face == 3 && self.is_solid_normal_at(x, y, z - 1) {
+                    meta = 3;
+                } else if face == 4 && self.is_solid_normal_at(x + 1, y, z) {
+                    meta = 2;
+                } else if face == 5 && self.is_solid_normal_at(x - 1, y, z) {
+                    meta = 1;
+                } else if self.is_solid_normal_at(x - 1, y, z) {
+                    meta = 1;
+                } else if self.is_solid_normal_at(x + 1, y, z) {
+                    meta = 2;
+                } else if self.is_solid_normal_at(x, y, z - 1) {
+                    meta = 3;
+                } else if self.is_solid_normal_at(x, y, z + 1) {
+                    meta = 4;
+                } else if can_floor {
+                    meta = 5;
+                }
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::LADDER => {
+                let mut meta = 0u8;
+                if (meta == 0 || face == 2) && self.is_solid_normal_at(x, y, z + 1) {
+                    meta = 2;
+                }
+                if (meta == 0 || face == 3) && self.is_solid_normal_at(x, y, z - 1) {
+                    meta = 3;
+                }
+                if (meta == 0 || face == 4) && self.is_solid_normal_at(x + 1, y, z) {
+                    meta = 4;
+                }
+                if (meta == 0 || face == 5) && self.is_solid_normal_at(x - 1, y, z) {
+                    meta = 5;
+                }
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::WOOD_STAIRS | blocks::COBBLESTONE_STAIRS => {
+                let meta = match facing_4 {
+                    0 => 2,
+                    1 => 1,
+                    2 => 3,
+                    _ => 0,
+                };
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::FURNACE | blocks::LIT_FURNACE | blocks::DISPENSER => {
+                let meta = match facing_4 {
+                    0 => 2,
+                    1 => 5,
+                    2 => 3,
+                    _ => 4,
+                };
+                self.java_set_data(x, y, z, meta);
+                if block_id == blocks::DISPENSER {
+                    self.set_world_tile_entity(TileEntity::new_dispenser(x, y, z));
+                } else {
+                    self.set_world_tile_entity(TileEntity::new_furnace(x, y, z));
+                }
+            }
+            blocks::CHEST => {
+                self.set_world_tile_entity(TileEntity::new_chest(x, y, z));
+            }
+            blocks::NOTE_BLOCK => {
+                self.set_world_tile_entity(TileEntity::new_note(x, y, z));
+            }
+            blocks::JUKEBOX => {
+                self.set_world_tile_entity(TileEntity::new_record_player(x, y, z));
+            }
+            blocks::PUMPKIN | blocks::JACK_O_LANTERN => {
+                let meta = (((yaw * 4.0 / 360.0) + 2.5).floor() as i32 & 3) as u8;
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::TRAPDOOR => {
+                let meta = match face {
+                    2 => 0,
+                    3 => 1,
+                    4 => 2,
+                    5 => 3,
+                    _ => 0,
+                };
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::STONE_BUTTON => {
+                let meta = match face {
+                    2 if self.is_solid_normal_at(x, y, z + 1) => 4,
+                    3 if self.is_solid_normal_at(x, y, z - 1) => 3,
+                    4 if self.is_solid_normal_at(x + 1, y, z) => 2,
+                    5 if self.is_solid_normal_at(x - 1, y, z) => 1,
+                    _ => 1,
+                };
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::LEVER => {
+                let meta = match face {
+                    1 if self.is_solid_normal_at(x, y - 1, z) => {
+                        5 + (self.world_random.next_i32_bound(2) as u8)
+                    }
+                    2 if self.is_solid_normal_at(x, y, z + 1) => 4,
+                    3 if self.is_solid_normal_at(x, y, z - 1) => 3,
+                    4 if self.is_solid_normal_at(x + 1, y, z) => 2,
+                    5 if self.is_solid_normal_at(x - 1, y, z) => 1,
+                    _ => 5,
+                };
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::REPEATER_OFF | blocks::REPEATER_ON => {
+                let meta = (((yaw * 4.0 / 360.0) + 0.5).floor() as i32 & 3) as u8;
+                let meta = (meta + 2) & 3;
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::PISTON | blocks::STICKY_PISTON => {
+                let meta = if pitch > 45.0 {
+                    1
+                } else if pitch < -45.0 {
+                    0
+                } else {
+                    match facing_4 {
+                        0 => 2,
+                        1 => 5,
+                        2 => 3,
+                        _ => 4,
+                    }
+                };
+                self.java_set_data(x, y, z, meta);
+            }
+            blocks::STEP if y > 0 && self.get_block(x, y - 1, z) == blocks::STEP => {
+                // BlockStep.c: merge onto matching bottom slab
+                let top_data = self.get_data(x, y, z);
+                let bot_data = self.get_data(x, y - 1, z);
+                if top_data == bot_data {
+                    self.java_set_type_id(x, y, z, blocks::AIR);
+                    self.java_set_type_id_and_data(x, y - 1, z, blocks::DOUBLE_STEP, bot_data);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check attached blocks around `(cx, cy, cz)` after a player breaks/places a block,
+    /// popping off unsupported torches, ladders, levers, buttons, doors, beds, signs, etc.
+    pub fn check_attached_blocks_around(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        cz: i32,
+    ) -> Vec<(i32, i32, i32, crate::gameplay::items::ItemStack)> {
+        let mut drops = Vec::new();
+        let neighbors = [
+            (cx - 1, cy, cz),
+            (cx + 1, cy, cz),
+            (cx, cy - 1, cz),
+            (cx, cy + 1, cz),
+            (cx, cy, cz - 1),
+            (cx, cy, cz + 1),
+        ];
+
+        for (x, y, z) in neighbors {
+            if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+                continue;
+            }
+            let id = self.get_block(x, y, z);
+            if id == blocks::AIR {
+                continue;
+            }
+            let data = self.get_data(x, y, z);
+            let mut supported = true;
+
+            match id {
+                blocks::TORCH | blocks::REDSTONE_TORCH_OFF | blocks::REDSTONE_TORCH_ON => {
+                    let can_floor = self.is_solid_normal_at(x, y - 1, z)
+                        || self.get_block(x, y - 1, z) == blocks::FENCE;
+                    supported = match data {
+                        1 => self.is_solid_normal_at(x - 1, y, z),
+                        2 => self.is_solid_normal_at(x + 1, y, z),
+                        3 => self.is_solid_normal_at(x, y, z - 1),
+                        4 => self.is_solid_normal_at(x, y, z + 1),
+                        5 => can_floor,
+                        _ => false,
+                    };
+                }
+                blocks::LADDER => {
+                    supported = match data {
+                        2 => self.is_solid_normal_at(x, y, z + 1),
+                        3 => self.is_solid_normal_at(x, y, z - 1),
+                        4 => self.is_solid_normal_at(x + 1, y, z),
+                        5 => self.is_solid_normal_at(x - 1, y, z),
+                        _ => false,
+                    };
+                }
+                blocks::STONE_BUTTON => {
+                    supported = match data & 7 {
+                        1 => self.is_solid_normal_at(x - 1, y, z),
+                        2 => self.is_solid_normal_at(x + 1, y, z),
+                        3 => self.is_solid_normal_at(x, y, z - 1),
+                        4 => self.is_solid_normal_at(x, y, z + 1),
+                        _ => false,
+                    };
+                }
+                blocks::LEVER => {
+                    supported = match data & 7 {
+                        1 => self.is_solid_normal_at(x - 1, y, z),
+                        2 => self.is_solid_normal_at(x + 1, y, z),
+                        3 => self.is_solid_normal_at(x, y, z - 1),
+                        4 => self.is_solid_normal_at(x, y, z + 1),
+                        5 | 6 => self.is_solid_normal_at(x, y - 1, z),
+                        _ => false,
+                    };
+                }
+                blocks::TRAPDOOR => {
+                    supported = match data & 3 {
+                        0 => self.is_solid_normal_at(x, y, z + 1),
+                        1 => self.is_solid_normal_at(x, y, z - 1),
+                        2 => self.is_solid_normal_at(x + 1, y, z),
+                        3 => self.is_solid_normal_at(x - 1, y, z),
+                        _ => false,
+                    };
+                }
+                blocks::SIGN => {
+                    supported = blocks::material(self.get_block(x, y - 1, z)).is_buildable();
+                }
+                blocks::WALL_SIGN => {
+                    supported = match data {
+                        2 => blocks::material(self.get_block(x, y, z + 1)).is_buildable(),
+                        3 => blocks::material(self.get_block(x, y, z - 1)).is_buildable(),
+                        4 => blocks::material(self.get_block(x + 1, y, z)).is_buildable(),
+                        5 => blocks::material(self.get_block(x - 1, y, z)).is_buildable(),
+                        _ => false,
+                    };
+                }
+                blocks::WOODEN_DOOR | blocks::IRON_DOOR => {
+                    if (data & 8) != 0 {
+                        if self.get_block(x, y - 1, z) != id {
+                            self.java_set_type_id(x, y, z, blocks::AIR);
+                        }
+                    } else if self.get_block(x, y + 1, z) != id
+                        || !self.is_solid_normal_at(x, y - 1, z)
+                    {
+                        self.java_set_type_id(x, y, z, blocks::AIR);
+                        if self.get_block(x, y + 1, z) == id {
+                            self.java_set_type_id(x, y + 1, z, blocks::AIR);
+                        }
+                        supported = false;
+                    }
+                }
+                blocks::BED => {
+                    let dir = (data & 3) as usize;
+                    let offsets = [(0, 1), (-1, 0), (0, -1), (1, 0)];
+                    let (dx, dz) = offsets[dir];
+                    if (data & 8) != 0 {
+                        // Head of bed: check foot at (x - dx, y, z - dz)
+                        if self.get_block(x - dx, y, z - dz) != blocks::BED {
+                            self.java_set_type_id(x, y, z, blocks::AIR);
+                        }
+                    } else if self.get_block(x + dx, y, z + dz) != blocks::BED {
+                        self.java_set_type_id(x, y, z, blocks::AIR);
+                        supported = false;
+                    }
+                }
+                blocks::STONE_PLATE
+                | blocks::WOOD_PLATE
+                | blocks::REDSTONE_WIRE
+                | blocks::RAIL
+                | blocks::POWERED_RAIL
+                | blocks::DETECTOR_RAIL
+                | blocks::REPEATER_OFF
+                | blocks::REPEATER_ON => {
+                    supported = self.is_solid_normal_at(x, y - 1, z);
+                }
+                blocks::CAKE => {
+                    supported = blocks::material(self.get_block(x, y - 1, z)).is_buildable();
+                }
+                _ => {}
+            }
+
+            if !supported {
+                let _ = self.remove_world_tile_entity(x, y, z);
+                self.java_set_type_id(x, y, z, blocks::AIR);
+                let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
+                let item_drops = blocks::get_block_drops(id, data, &mut rng, None);
+                self.world_random = rng;
+                for stack in item_drops {
+                    drops.push((x, y, z, stack));
+                }
+            }
+        }
+
+        drops
+    }
+
+    /// Tick all loaded furnace tile entities (`TileEntityFurnace.g_()`).
+    pub fn tick_furnaces(&mut self) {
+        let positions: Vec<ChunkPos> = self.chunks.keys().copied().collect();
+        let mut block_switches: Vec<(i32, i32, i32, bool)> = Vec::new();
+
+        for pos in positions {
+            let Some(chunk) = self.chunks.get_mut(&pos) else {
+                continue;
+            };
+            let mut chunk_dirty = false;
+            for te in &mut chunk.tile_entities {
+                let (dirty, switch) = te.tick_furnace();
+                if dirty {
+                    chunk_dirty = true;
+                }
+                if let Some(burning) = switch {
+                    block_switches.push((te.x, te.y, te.z, burning));
+                }
+            }
+            if chunk_dirty {
+                chunk.dirty = true;
+            }
+        }
+
+        for (x, y, z, burning) in block_switches {
+            let meta = self.get_data(x, y, z);
+            let new_id = if burning {
+                blocks::LIT_FURNACE
+            } else {
+                blocks::FURNACE
+            };
+            self.java_set_type_id_and_data(x, y, z, new_id, meta);
+        }
+    }
+
+    /// Java `BlockSapling.b(world, x, y, z, random)` — grow a tree from a sapling.
+    pub fn grow_sapling_tree(&mut self, x: i32, y: i32, z: i32) -> bool {
+        use crate::world::biome::TreeKind;
+        use crate::world::decorate;
+
+        let data = self.get_data(x, y, z) & 3;
+        self.java_set_raw_type_id(x, y, z, blocks::AIR);
+
+        let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
+        let kind = match data {
+            1 => TreeKind::Taiga2,
+            2 => TreeKind::Forest,
+            _ => {
+                if rng.next_i32_bound(10) == 0 {
+                    TreeKind::BigTree
+                } else {
+                    TreeKind::Trees
+                }
+            }
+        };
+        decorate::generate_tree(self, &mut rng, kind, x, y, z);
+        self.world_random = rng;
+
+        let grown = self.get_block(x, y, z) == blocks::LOG;
+        if !grown {
+            self.java_set_raw_type_id_and_data(x, y, z, blocks::SAPLING, data);
+            false
+        } else {
+            let cpos = ChunkPos::new(x >> 4, z >> 4);
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let p = ChunkPos::new(cpos.x + dx, cpos.z + dz);
+                    self.packet_cache.borrow_mut().remove(&p);
+                    if self.live.instances.contains_key(&p) {
+                        let entry = self.live.dirty_chunks.entry(p).or_default();
+                        entry.count = 10;
+                    }
+                }
+            }
+            true
+        }
+    }
+
+    /// Java `ItemDye.a`: apply bone meal to a grass block, growing tall grass and flowers around `(x, y, z)`.
+    pub fn apply_bonemeal_to_grass(&mut self, x: i32, y: i32, z: i32) {
+        let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
+        'outer: for j1 in 0..128 {
+            let mut kx = x;
+            let mut ly = y + 1;
+            let mut iz = z;
+            for _ in 0..(j1 / 16) {
+                kx += rng.next_i32_bound(3) - 1;
+                ly += (rng.next_i32_bound(3) - 1) * rng.next_i32_bound(3) / 2;
+                iz += rng.next_i32_bound(3) - 1;
+                if self.get_block(kx, ly - 1, iz) != blocks::GRASS
+                    || self.is_solid_normal_at(kx, ly, iz)
+                {
+                    continue 'outer;
+                }
+            }
+            if self.get_block(kx, ly, iz) == blocks::AIR {
+                if rng.next_i32_bound(10) != 0 {
+                    self.java_set_type_id_and_data(kx, ly, iz, blocks::TALL_GRASS, 1);
+                } else if rng.next_i32_bound(3) != 0 {
+                    self.java_set_type_id(kx, ly, iz, blocks::YELLOW_FLOWER);
+                } else {
+                    self.java_set_type_id(kx, ly, iz, blocks::RED_ROSE);
+                }
+            }
+        }
+        self.world_random = rng;
     }
 }
 

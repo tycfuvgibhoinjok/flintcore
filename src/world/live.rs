@@ -8,14 +8,14 @@
 //!
 //! * `World.c()`            — spawn search (top block == sand, `isLoading` on).
 //! * `MinecraftServer`      — spawn-region prep, a `(spawn-196)..(spawn+188)`
-//!                            square loaded x-major at startup.
+//!   square loaded x-major at startup.
 //! * `ChunkProviderServer`  — chunk load plus the 2x2 populate triggers, the
-//!                            server-level populate wrapper, the unload queue
-//!                            and `keepSpawnInMemory` (radius 128).
+//!   server-level populate wrapper, the unload queue
+//!   and `keepSpawnInMemory` (radius 128).
 //! * `PlayerManager`        — the `addPlayer` spiral, `movePlayer` frame moves
-//!                            and `removePlayer`, all of which drive loads.
+//!   and `removePlayer`, all of which drive loads.
 //! * `World.getChunkAt`     — the `lastChunkAccessed` cache, which can serve a
-//!                            stale `EmptyChunk` for missing targets.
+//!   stale `EmptyChunk` for missing targets.
 //!
 //! Empty-chunk semantics: `EmptyChunk.getTypeId/getData` return 0, its writes
 //! are silently accepted (`a(...)`/`b(...)` return true) and they do *not*
@@ -29,6 +29,12 @@ use crate::gameplay::blocks;
 use crate::util::rng::JavaRandom;
 use crate::world::chunk::{ChunkPos, ChunkState};
 use crate::world::world::{with_generator, World};
+
+#[derive(Debug, Clone, Default)]
+pub struct DirtyChunk {
+    pub blocks: [u16; 10],
+    pub count: usize,
+}
 
 /// Shared state for the live/server choreography.
 pub struct LiveState {
@@ -46,6 +52,12 @@ pub struct LiveState {
     /// `PlayerManager.b`: chunk -> set of players watching it. A present key
     /// means a `PlayerInstance` exists (which keeps the chunk loaded).
     pub instances: HashMap<ChunkPos, BTreeSet<u64>>,
+    /// `PlayerInstance.dirtyBlocks` / `dirtyCount` per watched chunk.
+    pub dirty_chunks: HashMap<ChunkPos, DirtyChunk>,
+    /// Per-player chunks added via `PlayerInstance.a(player)`.
+    pub player_added: HashMap<u64, Vec<ChunkPos>>,
+    /// Per-player chunks removed via `PlayerInstance.b(player)`.
+    pub player_removed: HashMap<u64, Vec<ChunkPos>>,
     /// `EntityPlayer.d`/`e`: the position that opened the current view square.
     pub anchors: HashMap<u64, (f64, f64)>,
     /// `ChunkProviderServer.unloadQueue` (insertion-ordered; CraftBukkit's
@@ -65,6 +77,9 @@ impl LiveState {
             force_chunk_load: false,
             last_access: Cell::new(None),
             instances: HashMap::new(),
+            dirty_chunks: HashMap::new(),
+            player_added: HashMap::new(),
+            player_removed: HashMap::new(),
             anchors: HashMap::new(),
             unload_queue: VecDeque::new(),
             view_distance,
@@ -298,7 +313,17 @@ impl World {
         let chunk = self.chunks.get_mut(&pos).unwrap();
         chunk.state = ChunkState::Populated;
         chunk.dirty = true;
-        self.packet_cache.borrow_mut().remove(&pos);
+        chunk.compact();
+        for dz in 0..=1 {
+            for dx in 0..=1 {
+                let cpos = ChunkPos::new(pos.x + dx, pos.z + dz);
+                self.packet_cache.borrow_mut().remove(&cpos);
+                if self.live.instances.contains_key(&cpos) {
+                    let entry = self.live.dirty_chunks.entry(cpos).or_default();
+                    entry.count = 10;
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------- spawn prep
@@ -414,6 +439,58 @@ impl World {
             }
         }
         self.live.anchors.remove(&id);
+        self.live.player_added.remove(&id);
+        self.live.player_removed.remove(&id);
+    }
+
+    pub fn take_player_chunk_events(&mut self, id: u64) -> (Vec<ChunkPos>, Vec<ChunkPos>) {
+        let added = self.live.player_added.remove(&id).unwrap_or_default();
+        let removed = self.live.player_removed.remove(&id).unwrap_or_default();
+        (added, removed)
+    }
+
+    /// `PlayerManager.flagDirty(x, y, z)`: record a block modification in a watched chunk.
+    pub fn flag_dirty(&mut self, x: i32, y: i32, z: i32) {
+        if !(0..128).contains(&y) {
+            return;
+        }
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        self.packet_cache.borrow_mut().remove(&pos);
+        if self.live.instances.contains_key(&pos) {
+            let entry = self.live.dirty_chunks.entry(pos).or_default();
+            if entry.count < 10 {
+                let short1 = (((x & 15) as u16) << 12) | (((z & 15) as u16) << 8) | (y as u16);
+                if !entry.blocks[..entry.count].contains(&short1) {
+                    entry.blocks[entry.count] = short1;
+                    entry.count += 1;
+                }
+            }
+        }
+    }
+
+    /// `PlayerManager.flush()`: drain all dirty chunk records accumulated this tick.
+    pub fn take_dirty_chunks(&mut self) -> Vec<(ChunkPos, DirtyChunk, Vec<u64>)> {
+        let dirty = std::mem::take(&mut self.live.dirty_chunks);
+        let mut out = Vec::with_capacity(dirty.len());
+        for (pos, entry) in dirty {
+            if entry.count > 0 {
+                if let Some(watchers) = self.live.instances.get(&pos) {
+                    out.push((pos, entry, watchers.iter().copied().collect()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Queue any loaded chunks that have no `PlayerInstance` and lie outside
+    /// the `keepSpawnInMemory` radius (used to clean up spawn-search / prep edge chunks).
+    pub fn queue_unwatched_chunks(&mut self) {
+        let positions: Vec<ChunkPos> = self.chunks.keys().copied().collect();
+        for pos in positions {
+            if !self.live.instances.contains_key(&pos) {
+                self.queue_unload(pos);
+            }
+        }
     }
 
     /// `PlayerManager.a(i, j, true)` + `PlayerInstance.a(player)`: create the
@@ -424,35 +501,43 @@ impl World {
             self.server_get_chunk_at(pos);
             self.live.instances.insert(pos, BTreeSet::new());
         }
-        self.live.instances.get_mut(&pos).unwrap().insert(id);
+        if self.live.instances.get_mut(&pos).unwrap().insert(id) {
+            self.live.player_added.entry(id).or_default().push(pos);
+        }
     }
 
     /// `PlayerInstance.b(player)`: unregister; an empty instance queues the
     /// chunk for unload.
     fn instance_remove(&mut self, pos: ChunkPos, id: u64) {
-        let emptied = match self.live.instances.get_mut(&pos) {
+        let (removed_player, emptied) = match self.live.instances.get_mut(&pos) {
             Some(players) => {
-                players.remove(&id);
-                players.is_empty()
+                let removed = players.remove(&id);
+                (removed, players.is_empty())
             }
-            None => false,
+            None => (false, false),
         };
+        if removed_player {
+            self.live.player_removed.entry(id).or_default().push(pos);
+        }
         if emptied {
             self.live.instances.remove(&pos);
+            self.live.dirty_chunks.remove(&pos);
             self.queue_unload(pos);
         }
     }
 
     /// Java `ChunkProviderServer.queueUnload`: chunks farther than 128 blocks
     /// from spawn (when `keepSpawnInMemory` is set) are queued for unload.
-    fn queue_unload(&mut self, pos: ChunkPos) {
+    pub fn queue_unload(&mut self, pos: ChunkPos) {
         let (sx, sz) = (self.spawn_point().0, self.spawn_point().2);
         let k = pos.x * 16 + 8 - sx;
         let l = pos.z * 16 + 8 - sz;
-        if k < -128 || k > 128 || l < -128 || l > 128 || !self.live.keep_spawn_in_memory {
-            if !self.live.unload_queue.contains(&pos) {
-                self.live.unload_queue.push_back(pos);
-            }
+        if (!(-128..=128).contains(&k)
+            || !(-128..=128).contains(&l)
+            || !self.live.keep_spawn_in_memory)
+            && !self.live.unload_queue.contains(&pos)
+        {
+            self.live.unload_queue.push_back(pos);
         }
     }
 
@@ -470,6 +555,9 @@ impl World {
             let Some(pos) = self.live.unload_queue.pop_front() else {
                 break;
             };
+            if self.live.instances.contains_key(&pos) {
+                continue;
+            }
             if !self.chunks.contains_key(&pos) {
                 continue;
             }
@@ -477,6 +565,13 @@ impl World {
                 .retain(|e| (e.x >> 4) != pos.x || (e.z >> 4) != pos.z);
             let _ = self.write_chunk_to_storage(pos);
             self.chunks.remove(&pos);
+            self.packet_cache.borrow_mut().remove(&pos);
+            self.live.dirty_chunks.remove(&pos);
+            if let Some((cx, cz, _)) = self.live.last_access.get() {
+                if cx == pos.x && cz == pos.z {
+                    self.live.last_access.set(None);
+                }
+            }
         }
     }
 
@@ -572,5 +667,35 @@ mod tests {
         let (sx, sz) = world.live_find_spawn(12345);
         assert_eq!((sx, sz), (-45, -3));
         assert_eq!(world.live_world_top_block(sx, sz), blocks::SAND);
+    }
+
+    #[test]
+    fn walking_forward_unloads_chunks_and_evicts_packet_cache() {
+        let config = WorldConfig {
+            seed: 100,
+            save_enabled: false,
+            view_distance: 2,
+            ..Default::default()
+        };
+        let mut world = World::new(config);
+        world.live_enable();
+        world.live.keep_spawn_in_memory = false;
+
+        world.live_player_join(1, 8.0, 8.0);
+        for step in 1..=25 {
+            let wx = (step * 16 + 8) as f64;
+            world.live_player_move(1, wx, 8.0);
+            let (added, _removed) = world.take_player_chunk_events(1);
+            for pos in added {
+                let _ = world.prepare_chunk_packets(pos);
+            }
+            world.live_tick();
+        }
+
+        // View distance 2 -> (2*2 + 1)^2 = 25 chunks. Even after walking 25 chunks
+        // (which would load 25 + 25*5 = 150 chunks without unloading), both
+        // `world.chunks` and `world.packet_cache` must stay strictly bounded to 25!
+        assert_eq!(world.chunk_count(), 25);
+        assert!(world.packet_cache.borrow().len() <= 25);
     }
 }

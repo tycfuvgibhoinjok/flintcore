@@ -1428,3 +1428,136 @@ async fn negative_yaw_camera_rotation_tracked() {
     timeout(Duration::from_secs(5), exchange).await.unwrap();
     harness.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_mining_spawns_pickup_and_collects() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "Miner").await;
+
+        // Move player outside spawn protection (x = 20.5, y = 70.0, z = 0.5)
+        let mut move_writer = Writer::new();
+        move_writer.write_u8(11); // PlayerPosition
+        move_writer.write_f64(20.5);
+        move_writer.write_f64(70.0);
+        move_writer.write_f64(71.62);
+        move_writer.write_f64(0.5);
+        move_writer.write_bool(true);
+        client.write_all(move_writer.as_slice()).await.unwrap();
+
+        // Give Miner 1 Dirt block (id 3) via /give Miner 3 1, and wait for pickup
+        let mut chat_writer = Writer::new();
+        chat_writer.write_u8(3);
+        chat_writer.write_string("/give Miner 3 1", 100).unwrap();
+        client.write_all(chat_writer.as_slice()).await.unwrap();
+
+        let mut got_pickup = false;
+        let mut got_collect = false;
+        for _ in 0..80 {
+            let id = read_u8(&mut client).await;
+            match id {
+                0 => {}
+                3 => {
+                    let _ = read_string(&mut client).await;
+                }
+                21 => {
+                    // PickupSpawn!
+                    let _eid = read_i32(&mut client).await;
+                    let item_id = read_i16(&mut client).await;
+                    let count = read_u8(&mut client).await;
+                    let _damage = read_i16(&mut client).await;
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                    );
+                    let _ = (
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                    assert_eq!(item_id, 3);
+                    assert_eq!(count, 1);
+                    got_pickup = true;
+                }
+                22 => {
+                    // Collect!
+                    let _collected = read_i32(&mut client).await;
+                    let _collector = read_i32(&mut client).await;
+                    got_collect = true;
+                }
+                28 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i16(&mut client).await,
+                    );
+                }
+                29 => {
+                    let _ = read_i32(&mut client).await;
+                }
+                31 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                34 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                50 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                51 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i32(&mut client).await,
+                    );
+                    let _ = (
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                    let len = read_i32(&mut client).await as usize;
+                    let mut comp = vec![0u8; len];
+                    client.read_exact(&mut comp).await.unwrap();
+                }
+                104 => {
+                    let _ = read_u8(&mut client).await;
+                    let count = read_i16(&mut client).await;
+                    for _ in 0..count {
+                        let item = read_i16(&mut client).await;
+                        if item >= 0 {
+                            let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if got_pickup && got_collect {
+                break;
+            }
+        }
+        assert!(got_pickup, "Should receive PickupSpawn (21)");
+        assert!(got_collect, "Should receive Collect (22)");
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}

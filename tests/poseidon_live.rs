@@ -96,7 +96,10 @@ fn read_region(path: &Path, out: &mut BTreeMap<(i32, i32), RawChunk>) {
         let raw = match ver[0] {
             1 => inflate_gzip(&comp, 1 << 22).unwrap(),
             2 => inflate_zlib(&comp, 1 << 22).unwrap(),
-            v => panic!("unknown region compression version {v} in {}", path.display()),
+            v => panic!(
+                "unknown region compression version {v} in {}",
+                path.display()
+            ),
         };
         let (_name, nbt) = NbtTag::from_bytes(&raw).unwrap();
         let level = nbt
@@ -110,7 +113,11 @@ fn read_region(path: &Path, out: &mut BTreeMap<(i32, i32), RawChunk>) {
         let populated = matches!(level.get("TerrainPopulated"), Some(NbtTag::Byte(v)) if *v != 0);
         assert_eq!(blocks.len(), 32768, "chunk ({chx},{chz}) bad Blocks length");
         assert_eq!(data.len(), 16384, "chunk ({chx},{chz}) bad Data length");
-        assert_eq!(height.len(), 256, "chunk ({chx},{chz}) bad HeightMap length");
+        assert_eq!(
+            height.len(),
+            256,
+            "chunk ({chx},{chz}) bad HeightMap length"
+        );
         out.insert(
             (chx, chz),
             RawChunk {
@@ -126,7 +133,10 @@ fn read_region(path: &Path, out: &mut BTreeMap<(i32, i32), RawChunk>) {
 fn build_manifest(dir: &Path) -> String {
     let world = read_world(dir);
     let mut text = String::new();
-    let _ = writeln!(text, "# flintcore live-world manifest (blocks+data+heightmap fnv1a64)");
+    let _ = writeln!(
+        text,
+        "# flintcore live-world manifest (blocks+data+heightmap fnv1a64)"
+    );
     let _ = writeln!(text, "# dir: {}", dir.display());
     let _ = writeln!(text, "# chunks: {}", world.len());
     for (&(cx, cz), chunk) in &world {
@@ -145,6 +155,7 @@ fn golden_path() -> PathBuf {
 }
 
 #[test]
+#[allow(clippy::excessive_precision)]
 fn golden_poseidon_manifest() {
     let dir = references_root().join("poseidon");
     if !dir.join("region").exists() {
@@ -155,7 +166,10 @@ fn golden_poseidon_manifest() {
         .unwrap()
         .expect("reference level.dat");
     assert_eq!(level.seed, 222);
-    assert_eq!((level.spawn_x, level.spawn_y, level.spawn_z), (-4, 64, -235));
+    assert_eq!(
+        (level.spawn_x, level.spawn_y, level.spawn_z),
+        (-4, 64, -235)
+    );
     assert_eq!(level.time, 771);
 
     let player_dat = dir.join("players/13495f67-7e70-397d-a647-53d7b52b9b1a.dat");
@@ -204,10 +218,18 @@ fn golden_poseidon_manifest() {
         let exp: Vec<&str> = expected.lines().filter(|l| !l.starts_with('#')).collect();
         let act: Vec<&str> = manifest.lines().filter(|l| !l.starts_with('#')).collect();
         let mut report = String::new();
-        let _ = writeln!(report, "manifest lines: expected {}, actual {}", exp.len(), act.len());
+        let _ = writeln!(
+            report,
+            "manifest lines: expected {}, actual {}",
+            exp.len(),
+            act.len()
+        );
         for (i, (e, a)) in exp.iter().zip(act.iter()).enumerate() {
             if e != a {
-                let _ = writeln!(report, "first diff at line {i}: expected `{e}` actual `{a}`");
+                let _ = writeln!(
+                    report,
+                    "first diff at line {i}: expected `{e}` actual `{a}`"
+                );
                 break;
             }
         }
@@ -471,8 +493,14 @@ fn print_diff_detail(
                 by_z[(i >> 7) & 15] += 1;
             }
         }
-        println!("REPLAY: worst chunk {pos:?} block diffs by local x: {:?}", by_x);
-        println!("REPLAY: worst chunk {pos:?} block diffs by local z: {:?}", by_z);
+        println!(
+            "REPLAY: worst chunk {pos:?} block diffs by local x: {:?}",
+            by_x
+        );
+        println!(
+            "REPLAY: worst chunk {pos:?} block diffs by local z: {:?}",
+            by_z
+        );
         let mut shown = 0;
         for i in (0..32768).step_by(7) {
             if r.blocks[i] != a.blocks[i] {
@@ -566,7 +594,10 @@ fn replay_poseidon_live() {
     let root = references_root();
     let reference_dir = root.join("poseidon");
     if !reference_dir.join("region").exists() {
-        eprintln!("reference world {} not found, skipping", reference_dir.display());
+        eprintln!(
+            "reference world {} not found, skipping",
+            reference_dir.display()
+        );
         return;
     }
     let level = flintcore::world::storage::LevelData::load_from_dir(&reference_dir)
@@ -654,7 +685,11 @@ fn replay_poseidon_live() {
             }
         }
     }
-    println!("after walk ({} samples): {} chunks loaded", walk.len(), world.chunk_count());
+    println!(
+        "after walk ({} samples): {} chunks loaded",
+        walk.len(),
+        world.chunk_count()
+    );
 
     // The reference session was saved at world time 771; scheduled block
     // ticks (fluids, sand/gravel) were processed once per `doTick`.
@@ -665,7 +700,11 @@ fn replay_poseidon_live() {
     while world.live_time() < target_time {
         world.live_tick_ex(!no_unload);
     }
-    println!("after ticks: time {}, {} chunks loaded", world.live_time(), world.chunk_count());
+    println!(
+        "after ticks: time {}, {} chunks loaded",
+        world.live_time(),
+        world.chunk_count()
+    );
 
     world.live_player_quit(1);
 
@@ -719,7 +758,11 @@ fn replay_poseidon_live() {
     }
 
     if std::env::var("FLINTCORE_LIVE_EXPECT").as_deref() == Ok("exact") {
-        assert_eq!(stats.only_reference.len(), 0, "chunks missing from the replay");
+        assert_eq!(
+            stats.only_reference.len(),
+            0,
+            "chunks missing from the replay"
+        );
         assert_eq!(stats.only_actual.len(), 0, "extra chunks in the replay");
         assert_eq!(stats.populated_mismatch, 0, "populated-flag mismatches");
         assert_eq!(stats.blocks, 0, "block diffs");
@@ -743,7 +786,11 @@ fn controlled_live_spawn_parity() {
     world.live_enable();
     let spawn = world.live_find_spawn(12345);
     println!("FlintCore spawn found at: ({}, 64, {})", spawn.0, spawn.1);
-    assert_eq!(spawn, (-45, -3), "spawn location parity with Java PoseidonLive");
+    assert_eq!(
+        spawn,
+        (-45, -3),
+        "spawn location parity with Java PoseidonLive"
+    );
 
     let java_dir = Path::new("/tmp/opencode/poseidon_live_test/world");
     if !java_dir.join("region").exists() {
@@ -752,14 +799,22 @@ fn controlled_live_spawn_parity() {
 
     world.live_prepare_spawn_region();
     world.live_player_join(1, spawn.0 as f64 + 0.5, spawn.1 as f64 + 0.5);
-    for &(wx, wz) in &[(-50.0, -20.0), (-50.0, -40.0), (-35.0, -55.0), (-20.0, -40.0)] {
+    for &(wx, wz) in &[
+        (-50.0, -20.0),
+        (-50.0, -40.0),
+        (-35.0, -55.0),
+        (-20.0, -40.0),
+    ] {
         world.live_player_move(1, wx, wz);
         world.live_tick_ex(true);
     }
     while world.live_time() < 300 {
         world.live_tick_ex(true);
     }
-    println!("FlintCore after 300 ticks: {} chunks loaded", world.chunk_count());
+    println!(
+        "FlintCore after 300 ticks: {} chunks loaded",
+        world.chunk_count()
+    );
     world.live_player_quit(1);
     for _ in 0..200 {
         world.live_unload_chunks();

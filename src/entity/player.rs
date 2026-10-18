@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::gameplay::inventory::InventoryPlayer;
+use crate::gameplay::inventory::{InventoryPlayer, OpenContainer};
 use crate::gameplay::items::ItemStack;
 use crate::net::ConnId;
 use crate::world::chunk::ChunkPos;
@@ -43,14 +43,28 @@ pub struct Player {
     pub no_damage_ticks: u8,
     pub sneaking: bool,
     pub sleeping: bool,
+    pub bed_pos: Option<(i32, i32, i32)>,
+    pub spawn_bed: Option<(i32, i32, i32)>,
     pub inventory: InventoryPlayer,
+    pub open_container: Option<OpenContainer>,
+    pub next_window_id: u8,
+    pub editing_sign: Option<(i32, i32, i32)>,
     pub equipment_cache: [Option<ItemStack>; 5],
+    /// `EntityPlayer.playerChunkCoordIntPairs`: chunks with active `PreChunk(true)` on the client.
+    pub pre_chunk_sent: HashSet<ChunkPos>,
+    /// Chunks whose `MapChunk` payload has been sent to the client.
     pub sent_chunks: HashSet<ChunkPos>,
+    /// `EntityPlayer.chunkCoordIntPairQueue`: chunks waiting for `MapChunk` streaming.
     pub chunk_queue: Vec<ChunkPos>,
     pub last_eval_x: f64,
     pub last_eval_z: f64,
     pub digging: Option<DiggingState>,
+    /// `ItemInWorldManager.i/j/k/l/m`: deferred break when client finishes digging early.
+    pub pending_dig: Option<DiggingState>,
     pub last_place_tick: u64,
+    pub last_place_item: Option<(u64, i16)>,
+    pub last_drop_tick: u64,
+    pub drop_count: u32,
     pub dead: bool,
 }
 
@@ -84,20 +98,35 @@ impl Player {
             no_damage_ticks: 0,
             sneaking: false,
             sleeping: false,
+            bed_pos: None,
+            spawn_bed: None,
             inventory: InventoryPlayer::new(),
+            open_container: None,
+            next_window_id: 0,
+            editing_sign: None,
             equipment_cache: [None; 5],
+            pre_chunk_sent: HashSet::new(),
             sent_chunks: HashSet::new(),
             chunk_queue: Vec::new(),
             last_eval_x: x,
             last_eval_z: z,
             digging: None,
+            pending_dig: None,
             last_place_tick: 0,
+            last_place_item: None,
+            last_drop_tick: 0,
+            drop_count: 0,
             dead: false,
         }
     }
 
+    pub fn next_window_id(&mut self) -> u8 {
+        self.next_window_id = self.next_window_id % 100 + 1;
+        self.next_window_id
+    }
+
     pub fn chunk_pos(&self) -> ChunkPos {
-        ChunkPos::new(self.x.floor() as i32 >> 4, self.z.floor() as i32 >> 4)
+        ChunkPos::new((self.x as i32) >> 4, (self.z as i32) >> 4)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -205,6 +234,8 @@ impl Player {
         self.prev_x = spawn_x;
         self.prev_y = spawn_y;
         self.prev_z = spawn_z;
+        self.last_eval_x = spawn_x;
+        self.last_eval_z = spawn_z;
         self.fall_distance = 0.0;
         self.fire_ticks = 0;
         self.air_ticks = 300;
@@ -212,6 +243,15 @@ impl Player {
         self.mot_y = 0.0;
         self.mot_z = 0.0;
         self.velocity_changed = false;
+        self.sleeping = false;
+        self.bed_pos = None;
+        self.open_container = None;
+        self.editing_sign = None;
+        self.digging = None;
+        self.pending_dig = None;
+        self.pre_chunk_sent.clear();
+        self.sent_chunks.clear();
+        self.chunk_queue.clear();
     }
 
     pub fn equipment_changed(&self) -> Vec<(i16, Option<ItemStack>)> {

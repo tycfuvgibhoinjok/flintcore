@@ -1,3 +1,6 @@
+use crate::gameplay::items::{self, ItemStack};
+use crate::util::rng::JavaRandom;
+
 pub const AIR: u8 = 0;
 pub const STONE: u8 = 1;
 pub const GRASS: u8 = 2;
@@ -34,6 +37,7 @@ pub const DEAD_BUSH: u8 = 32;
 pub const PISTON: u8 = 33;
 pub const PISTON_HEAD: u8 = 34;
 pub const WOOL: u8 = 35;
+pub const PISTON_MOVING: u8 = 36;
 pub const YELLOW_FLOWER: u8 = 37;
 pub const RED_ROSE: u8 = 38;
 pub const BROWN_MUSHROOM: u8 = 39;
@@ -95,17 +99,238 @@ pub const REPEATER_ON: u8 = 94;
 pub const LOCKED_CHEST: u8 = 95;
 pub const TRAPDOOR: u8 = 96;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Material {
+    Air,
+    Grass,
+    Earth,
+    Wood,
+    Stone,
+    Ore,
+    Water,
+    Lava,
+    Leaves,
+    Plant,
+    Sponge,
+    Cloth,
+    Fire,
+    Sand,
+    Orientable,
+    Shatterable,
+    Tnt,
+    Coral,
+    Ice,
+    SnowLayer,
+    SnowBlock,
+    Cactus,
+    Clay,
+    Pumpkin,
+    Portal,
+    Cake,
+    Web,
+    Piston,
+}
+
+impl Material {
+    pub fn is_liquid(self) -> bool {
+        matches!(self, Self::Water | Self::Lava)
+    }
+
+    pub fn is_solid(self) -> bool {
+        !matches!(
+            self,
+            Self::Air
+                | Self::Water
+                | Self::Lava
+                | Self::Plant
+                | Self::Fire
+                | Self::Orientable
+                | Self::SnowLayer
+                | Self::Portal
+        )
+    }
+
+    pub fn is_buildable(self) -> bool {
+        self.is_solid()
+    }
+
+    pub fn blocks_light(self) -> bool {
+        !matches!(
+            self,
+            Self::Air
+                | Self::Plant
+                | Self::Fire
+                | Self::Orientable
+                | Self::SnowLayer
+                | Self::Portal
+        )
+    }
+
+    pub fn is_replaceable(self) -> bool {
+        matches!(
+            self,
+            Self::Air | Self::Water | Self::Lava | Self::Fire | Self::SnowLayer
+        )
+    }
+
+    pub fn is_burnable(self) -> bool {
+        matches!(self, Self::Wood | Self::Leaves | Self::Cloth | Self::Tnt)
+    }
+
+    /// Java `Material.i()`: true when the material does not require a specific tool to harvest.
+    pub fn requires_no_tool(self) -> bool {
+        !matches!(
+            self,
+            Self::Stone | Self::Ore | Self::SnowLayer | Self::SnowBlock | Self::Web
+        )
+    }
+}
+
+pub fn material(id: u8) -> Material {
+    match id {
+        AIR => Material::Air,
+        STONE | COBBLESTONE | GOLD_ORE | IRON_ORE | COAL_ORE | LAPIS_ORE | LAPIS_BLOCK
+        | DISPENSER | SANDSTONE | DOUBLE_STEP | STEP | BRICK | MOSSY_COBBLESTONE | OBSIDIAN
+        | MOB_SPAWNER | DIAMOND_ORE | FURNACE | LIT_FURNACE | COBBLESTONE_STAIRS | STONE_PLATE
+        | REDSTONE_ORE | LIT_REDSTONE_ORE | NETHERRACK | GLOWSTONE => Material::Stone,
+        GRASS => Material::Grass,
+        DIRT | FARMLAND => Material::Earth,
+        WOOD_PLANKS | LOG | NOTE_BLOCK | BOOKSHELF | WOOD_STAIRS | CHEST | WORKBENCH | SIGN
+        | WOODEN_DOOR | WALL_SIGN | WOOD_PLATE | JUKEBOX | FENCE | LOCKED_CHEST | TRAPDOOR => {
+            Material::Wood
+        }
+        SAPLING | TALL_GRASS | DEAD_BUSH | YELLOW_FLOWER | RED_ROSE | BROWN_MUSHROOM
+        | RED_MUSHROOM | CROPS | REED => Material::Plant,
+        BEDROCK => Material::Stone,
+        WATER | STATIONARY_WATER => Material::Water,
+        LAVA | STATIONARY_LAVA => Material::Lava,
+        SAND | GRAVEL | SOUL_SAND => Material::Sand,
+        LEAVES => Material::Leaves,
+        SPONGE => Material::Sponge,
+        GLASS => Material::Shatterable,
+        BED | WOOL => Material::Cloth,
+        POWERED_RAIL | DETECTOR_RAIL | TORCH | LADDER | RAIL | LEVER | REDSTONE_TORCH_OFF
+        | REDSTONE_TORCH_ON | STONE_BUTTON | REPEATER_OFF | REPEATER_ON | REDSTONE_WIRE => {
+            Material::Orientable
+        }
+        STICKY_PISTON | PISTON | PISTON_HEAD | PISTON_MOVING => Material::Piston,
+        WEB => Material::Web,
+        GOLD_BLOCK | IRON_BLOCK | DIAMOND_BLOCK | IRON_DOOR => Material::Ore,
+        TNT => Material::Tnt,
+        FIRE => Material::Fire,
+        SNOW => Material::SnowLayer,
+        ICE => Material::Ice,
+        SNOW_BLOCK => Material::SnowBlock,
+        CACTUS => Material::Cactus,
+        CLAY => Material::Clay,
+        PUMPKIN | JACK_O_LANTERN => Material::Pumpkin,
+        PORTAL => Material::Portal,
+        CAKE => Material::Cake,
+        _ => Material::Air,
+    }
+}
+
+/// Java `Block.strength` (hardness). Negative values mean unbreakable (Bedrock, Portal).
+pub fn hardness(id: u8) -> f32 {
+    match id {
+        BEDROCK | PORTAL | PISTON_MOVING => -1.0,
+        SAPLING | TALL_GRASS | DEAD_BUSH | YELLOW_FLOWER | RED_ROSE | BROWN_MUSHROOM
+        | RED_MUSHROOM | TNT | TORCH | FIRE | REDSTONE_WIRE | CROPS | REDSTONE_TORCH_OFF
+        | REDSTONE_TORCH_ON | REED | REPEATER_OFF | REPEATER_ON | LOCKED_CHEST | LAVA => 0.0,
+        SNOW => 0.1,
+        LEAVES | BED | SNOW_BLOCK => 0.2,
+        GLASS | GLOWSTONE => 0.3,
+        LADDER | CACTUS | NETHERRACK => 0.4,
+        DIRT | SAND | STICKY_PISTON | PISTON | PISTON_HEAD | LEVER | STONE_PLATE | WOOD_PLATE
+        | STONE_BUTTON | ICE | SOUL_SAND | CAKE => 0.5,
+        GRASS | GRAVEL | SPONGE | FARMLAND | CLAY => 0.6,
+        POWERED_RAIL | DETECTOR_RAIL | RAIL => 0.7,
+        SANDSTONE | NOTE_BLOCK | WOOL => 0.8,
+        SIGN | WALL_SIGN | PUMPKIN | JACK_O_LANTERN => 1.0,
+        STONE | BOOKSHELF => 1.5,
+        COBBLESTONE | WOOD_PLANKS | LOG | DOUBLE_STEP | STEP | BRICK | MOSSY_COBBLESTONE
+        | WOOD_STAIRS | COBBLESTONE_STAIRS | JUKEBOX | FENCE => 2.0,
+        CHEST | WORKBENCH => 2.5,
+        GOLD_ORE | IRON_ORE | COAL_ORE | LAPIS_ORE | LAPIS_BLOCK | GOLD_BLOCK | DIAMOND_ORE
+        | WOODEN_DOOR | REDSTONE_ORE | LIT_REDSTONE_ORE | TRAPDOOR => 3.0,
+        DISPENSER | FURNACE | LIT_FURNACE => 3.5,
+        WEB => 4.0,
+        IRON_BLOCK | MOB_SPAWNER | DIAMOND_BLOCK | IRON_DOOR => 5.0,
+        OBSIDIAN => 10.0,
+        WATER | STATIONARY_WATER | STATIONARY_LAVA => 100.0,
+        _ => 0.0,
+    }
+}
+
+pub fn is_tile_entity(id: u8) -> bool {
+    matches!(
+        id,
+        DISPENSER
+            | NOTE_BLOCK
+            | MOB_SPAWNER
+            | CHEST
+            | FURNACE
+            | LIT_FURNACE
+            | SIGN
+            | WALL_SIGN
+            | JUKEBOX
+            | PISTON_MOVING
+    )
+}
+
+pub fn ticks_randomly(id: u8) -> bool {
+    matches!(
+        id,
+        GRASS
+            | SAPLING
+            | WATER
+            | LAVA
+            | LEAVES
+            | TALL_GRASS
+            | DEAD_BUSH
+            | YELLOW_FLOWER
+            | RED_ROSE
+            | BROWN_MUSHROOM
+            | RED_MUSHROOM
+            | TORCH
+            | FIRE
+            | CROPS
+            | FARMLAND
+            | LIT_REDSTONE_ORE
+            | REDSTONE_TORCH_OFF
+            | REDSTONE_TORCH_ON
+            | STONE_BUTTON
+            | SNOW
+            | ICE
+            | SNOW_BLOCK
+            | CACTUS
+            | REED
+            | PORTAL
+            | CAKE
+            | LOCKED_CHEST
+    )
+}
+
+pub fn friction_factor(id: u8) -> f32 {
+    if id == ICE {
+        0.98
+    } else {
+        0.6
+    }
+}
+
 pub fn light_opacity(id: u8) -> u8 {
     match id {
         AIR => 0,
         WATER | STATIONARY_WATER | ICE => 3,
         LEAVES | WEB => 1,
         SAPLING | GLASS | BED | POWERED_RAIL | DETECTOR_RAIL | STICKY_PISTON | TALL_GRASS
-        | DEAD_BUSH | PISTON | PISTON_HEAD | YELLOW_FLOWER | RED_ROSE | BROWN_MUSHROOM
-        | RED_MUSHROOM | STEP | TORCH | FIRE | MOB_SPAWNER | WOOD_STAIRS | REDSTONE_WIRE
-        | CROPS | FARMLAND | SIGN | WOODEN_DOOR | LADDER | COBBLESTONE_STAIRS | WALL_SIGN
-        | LEVER | STONE_PLATE | IRON_DOOR | WOOD_PLATE | STONE_BUTTON | SNOW | CACTUS | REED
-        | FENCE | PORTAL | CAKE | REPEATER_OFF | REPEATER_ON | TRAPDOOR => 0,
+        | DEAD_BUSH | PISTON | PISTON_HEAD | PISTON_MOVING | YELLOW_FLOWER | RED_ROSE
+        | BROWN_MUSHROOM | RED_MUSHROOM | STEP | TORCH | FIRE | MOB_SPAWNER | WOOD_STAIRS
+        | REDSTONE_WIRE | CROPS | FARMLAND | SIGN | WOODEN_DOOR | LADDER | RAIL
+        | COBBLESTONE_STAIRS | WALL_SIGN | LEVER | STONE_PLATE | IRON_DOOR | WOOD_PLATE
+        | STONE_BUTTON | SNOW | CACTUS | REED | FENCE | PORTAL | CAKE | REPEATER_OFF
+        | REPEATER_ON | TRAPDOOR => 0,
         _ => 255,
     }
 }
@@ -178,6 +403,16 @@ pub fn is_opaque_cube(id: u8) -> bool {
             | JACK_O_LANTERN
             | LOCKED_CHEST
     )
+}
+
+/// Java `Block.b()` (`renderAsNormalBlock`).
+pub fn is_normal_cube(id: u8) -> bool {
+    is_opaque_cube(id) && !matches!(id, LEAVES | CHEST)
+}
+
+/// Java `World.e(x, y, z)`: `block.isOpaqueCube() && block.b()`.
+pub fn is_solid_normal_block(id: u8) -> bool {
+    is_opaque_cube(id) && !matches!(id, LEAVES | CHEST)
 }
 
 /// Java `Block.leafDecayBlacklist` (configured ids 54, 63, 68): tree
@@ -290,6 +525,177 @@ pub fn is_normal_solid(id: u8) -> bool {
         )
 }
 
+/// Java `Block.a_(int metadata)` — dropped item damage/metadata.
+pub fn drop_damage(block_id: u8, metadata: u8) -> i16 {
+    match block_id {
+        LOG | WOOL | STEP | DOUBLE_STEP => metadata as i16,
+        SAPLING | LEAVES => (metadata & 3) as i16,
+        LAPIS_ORE => 4,
+        _ => 0,
+    }
+}
+
+/// Java `Block.a(Random)` — base drop count before per-item roll.
+pub fn drop_count(block_id: u8, rng: &mut JavaRandom) -> usize {
+    match block_id {
+        AIR | BEDROCK | WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA | GLASS | BOOKSHELF
+        | FIRE | MOB_SPAWNER | SNOW | ICE | PORTAL | CAKE | PISTON_HEAD | PISTON_MOVING
+        | DEAD_BUSH | LOCKED_CHEST | TNT => 0,
+        LEAVES => {
+            if rng.next_i32_bound(20) == 0 {
+                1
+            } else {
+                0
+            }
+        }
+        LAPIS_ORE => (4 + rng.next_i32_bound(5)) as usize,
+        DOUBLE_STEP => 2,
+        REDSTONE_ORE | LIT_REDSTONE_ORE => (4 + rng.next_i32_bound(2)) as usize,
+        SNOW_BLOCK | CLAY => 4,
+        GLOWSTONE => (2 + rng.next_i32_bound(3)) as usize,
+        _ => 1,
+    }
+}
+
+/// Java `Block.a(int metadata, Random)` — dropped item ID (`<= 0` means nothing).
+pub fn drop_item_id(block_id: u8, metadata: u8, rng: &mut JavaRandom) -> i16 {
+    match block_id {
+        AIR | BEDROCK | WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA | GLASS | BOOKSHELF
+        | FIRE | MOB_SPAWNER | ICE | PORTAL | CAKE | PISTON_HEAD | PISTON_MOVING | DEAD_BUSH
+        | LOCKED_CHEST | TNT => -1,
+        STONE => COBBLESTONE as i16,
+        GRASS | FARMLAND => DIRT as i16,
+        GRAVEL => {
+            if rng.next_i32_bound(10) == 0 {
+                items::FLINT
+            } else {
+                GRAVEL as i16
+            }
+        }
+        COAL_ORE => items::COAL,
+        DIAMOND_ORE => items::DIAMOND,
+        LAPIS_ORE => items::INK_SACK,
+        LEAVES => SAPLING as i16,
+        BED => {
+            if (metadata & 8) != 0 {
+                -1
+            } else {
+                items::BED
+            }
+        }
+        WEB => items::STRING,
+        TALL_GRASS => {
+            if rng.next_i32_bound(8) == 0 {
+                items::SEEDS
+            } else {
+                -1
+            }
+        }
+        DOUBLE_STEP | STEP => STEP as i16,
+        REDSTONE_WIRE | REDSTONE_ORE | LIT_REDSTONE_ORE => items::REDSTONE,
+        CROPS => {
+            if metadata == 7 {
+                items::WHEAT
+            } else {
+                -1
+            }
+        }
+        LIT_FURNACE => FURNACE as i16,
+        SIGN | WALL_SIGN => items::SIGN,
+        WOODEN_DOOR => {
+            if (metadata & 8) != 0 {
+                -1
+            } else {
+                items::WOOD_DOOR
+            }
+        }
+        IRON_DOOR => {
+            if (metadata & 8) != 0 {
+                -1
+            } else {
+                items::IRON_DOOR
+            }
+        }
+        REDSTONE_TORCH_OFF | REDSTONE_TORCH_ON => REDSTONE_TORCH_ON as i16,
+        SNOW | SNOW_BLOCK => items::SNOW_BALL,
+        CLAY => items::CLAY_BALL,
+        REED => items::SUGAR_CANE,
+        GLOWSTONE => items::GLOWSTONE_DUST,
+        REPEATER_OFF | REPEATER_ON => items::DIODE,
+        other => other as i16,
+    }
+}
+
+/// Complete reproduction of `Block.a(World, EntityHuman, x, y, z, data)` / `Block.dropNaturally`.
+pub fn get_block_drops(
+    block_id: u8,
+    metadata: u8,
+    rng: &mut JavaRandom,
+    held_item: Option<ItemStack>,
+) -> Vec<ItemStack> {
+    if block_id == LEAVES {
+        if let Some(held) = held_item {
+            if held.id == items::SHEARS {
+                return vec![ItemStack::new(LEAVES as i16, 1, (metadata & 3) as i16)];
+            }
+        }
+    }
+
+    if block_id == SNOW {
+        return vec![ItemStack::new(items::SNOW_BALL, 1, 0)];
+    }
+
+    let mut drops = Vec::new();
+    let count = drop_count(block_id, rng);
+    for _ in 0..count {
+        let item_id = drop_item_id(block_id, metadata, rng);
+        if item_id > 0 {
+            drops.push(ItemStack::new(item_id, 1, drop_damage(block_id, metadata)));
+        }
+    }
+
+    if block_id == CROPS {
+        for _ in 0..3 {
+            if rng.next_i32_bound(15) <= metadata as i32 {
+                drops.push(ItemStack::new(items::SEEDS, 1, 0));
+            }
+        }
+    }
+
+    drops
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepSound {
+    pub name: &'static str,
+    pub volume1: f32,
+    pub volume2: f32,
+}
+
+impl StepSound {
+    pub fn new(name: &'static str, volume1: f32, volume2: f32) -> Self {
+        Self {
+            name,
+            volume1,
+            volume2,
+        }
+    }
+}
+
+pub fn step_sound(block_id: u8) -> StepSound {
+    match block_id {
+        STONE | COBBLESTONE | MOSSY_COBBLESTONE | SANDSTONE | OBSIDIAN | GOLD_BLOCK
+        | IRON_BLOCK | LAPIS_BLOCK | DISPENSER | NOTE_BLOCK | DOUBLE_STEP | STEP | BRICK
+        | BOOKSHELF => StepSound::new("step.stone", 1.0, 1.0),
+        GRASS | FARMLAND => StepSound::new("step.grass", 1.0, 1.0),
+        SAND | SOUL_SAND => StepSound::new("step.sand", 1.0, 1.0),
+        WOOD_PLANKS | LOG => StepSound::new("step.wood", 1.0, 1.0),
+        GRAVEL => StepSound::new("step.gravel", 1.0, 1.0),
+        WOOL | SNOW | SNOW_BLOCK | CACTUS | CAKE => StepSound::new("step.cloth", 1.0, 1.0),
+        _ => StepSound::new("step.stone", 1.0, 1.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,35 +734,55 @@ mod tests {
         assert_eq!(step_sound(GRAVEL).name, "step.gravel");
         assert_eq!(step_sound(AIR).name, "step.stone");
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StepSound {
-    pub name: &'static str,
-    pub volume1: f32,
-    pub volume2: f32,
-}
+    #[test]
+    fn block_drops_match_poseidon() {
+        let mut rng = JavaRandom::new(42);
+        assert_eq!(
+            get_block_drops(STONE, 0, &mut rng, None),
+            vec![ItemStack::new(COBBLESTONE as i16, 1, 0)]
+        );
+        assert_eq!(
+            get_block_drops(GRASS, 0, &mut rng, None),
+            vec![ItemStack::new(DIRT as i16, 1, 0)]
+        );
+        assert_eq!(
+            get_block_drops(COAL_ORE, 0, &mut rng, None),
+            vec![ItemStack::new(items::COAL, 1, 0)]
+        );
+        assert_eq!(
+            get_block_drops(DIAMOND_ORE, 0, &mut rng, None),
+            vec![ItemStack::new(items::DIAMOND, 1, 0)]
+        );
+        let lapis_drops = get_block_drops(LAPIS_ORE, 0, &mut rng, None);
+        assert!((4..=8).contains(&lapis_drops.len()));
+        assert_eq!(lapis_drops[0].id, items::INK_SACK);
+        assert_eq!(lapis_drops[0].damage, 4);
 
-impl StepSound {
-    pub fn new(name: &'static str, volume1: f32, volume2: f32) -> Self {
-        Self {
-            name,
-            volume1,
-            volume2,
-        }
-    }
-}
-
-pub fn step_sound(block_id: u8) -> StepSound {
-    match block_id {
-        STONE | COBBLESTONE | MOSSY_COBBLESTONE | SANDSTONE | OBSIDIAN | GOLD_BLOCK
-        | IRON_BLOCK | LAPIS_BLOCK | DISPENSER | NOTE_BLOCK | DOUBLE_STEP | STEP | BRICK
-        | BOOKSHELF => StepSound::new("step.stone", 1.0, 1.0),
-        GRASS | FARMLAND => StepSound::new("step.grass", 1.0, 1.0),
-        SAND => StepSound::new("step.sand", 1.0, 1.0),
-        WOOD_PLANKS | LOG => StepSound::new("step.wood", 1.0, 1.0),
-        GRAVEL => StepSound::new("step.gravel", 1.0, 1.0),
-        WOOL => StepSound::new("step.cloth", 1.0, 1.0),
-        _ => StepSound::new("step.stone", 1.0, 1.0),
+        assert_eq!(
+            get_block_drops(LOG, 2, &mut rng, None),
+            vec![ItemStack::new(LOG as i16, 1, 2)]
+        );
+        assert_eq!(
+            get_block_drops(WOOL, 14, &mut rng, None),
+            vec![ItemStack::new(WOOL as i16, 1, 14)]
+        );
+        assert_eq!(
+            get_block_drops(
+                LEAVES,
+                9,
+                &mut rng,
+                Some(ItemStack::new(items::SHEARS, 1, 0))
+            ),
+            vec![ItemStack::new(LEAVES as i16, 1, 1)]
+        );
+        assert_eq!(get_block_drops(GLASS, 0, &mut rng, None), vec![]);
+        assert_eq!(
+            get_block_drops(DOUBLE_STEP, 2, &mut rng, None),
+            vec![
+                ItemStack::new(STEP as i16, 1, 2),
+                ItemStack::new(STEP as i16, 1, 2)
+            ]
+        );
     }
 }

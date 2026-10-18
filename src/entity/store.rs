@@ -1,14 +1,39 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::entity::player::Player;
+use crate::gameplay::items::ItemStack;
 use crate::net::ConnId;
 use crate::world::chunk::ChunkPos;
+
+#[derive(Debug, Clone)]
+pub struct DroppedItem {
+    pub entity_id: i32,
+    pub item: ItemStack,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub mot_x: f64,
+    pub mot_y: f64,
+    pub mot_z: f64,
+    pub on_ground: bool,
+    pub age: i32,
+    pub pickup_delay: i32,
+    pub health: i16,
+    pub dead: bool,
+}
+
+impl DroppedItem {
+    pub fn chunk_pos(&self) -> ChunkPos {
+        ChunkPos::new((self.x as i32) >> 4, (self.z as i32) >> 4)
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct EntityStore {
     players: HashMap<i32, Player>,
     conn_to_entity: HashMap<ConnId, i32>,
     chunk_index: HashMap<ChunkPos, HashSet<i32>>,
+    dropped_items: HashMap<i32, DroppedItem>,
     next_id: i32,
 }
 
@@ -18,6 +43,7 @@ impl EntityStore {
             players: HashMap::new(),
             conn_to_entity: HashMap::new(),
             chunk_index: HashMap::new(),
+            dropped_items: HashMap::new(),
             next_id: 1,
         }
     }
@@ -132,6 +158,71 @@ impl EntityStore {
             }
         }
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_dropped_item(
+        &mut self,
+        item: ItemStack,
+        x: f64,
+        y: f64,
+        z: f64,
+        mot_x: f64,
+        mot_y: f64,
+        mot_z: f64,
+        pickup_delay: i32,
+    ) -> i32 {
+        let entity_id = self.allocate_id();
+        let dropped = DroppedItem {
+            entity_id,
+            item,
+            x,
+            y,
+            z,
+            mot_x,
+            mot_y,
+            mot_z,
+            on_ground: false,
+            age: 0,
+            pickup_delay,
+            health: 5,
+            dead: false,
+        };
+        self.dropped_items.insert(entity_id, dropped);
+        entity_id
+    }
+
+    pub fn get_dropped_item(&self, entity_id: i32) -> Option<&DroppedItem> {
+        self.dropped_items.get(&entity_id)
+    }
+
+    pub fn get_dropped_item_mut(&mut self, entity_id: i32) -> Option<&mut DroppedItem> {
+        self.dropped_items.get_mut(&entity_id)
+    }
+
+    pub fn remove_dropped_item(&mut self, entity_id: i32) -> Option<DroppedItem> {
+        self.dropped_items.remove(&entity_id)
+    }
+
+    pub fn iter_dropped_items(&self) -> impl Iterator<Item = &DroppedItem> {
+        self.dropped_items.values()
+    }
+
+    pub fn iter_dropped_items_mut(&mut self) -> impl Iterator<Item = &mut DroppedItem> {
+        self.dropped_items.values_mut()
+    }
+
+    pub fn remove_dropped_items_in_chunk(&mut self, pos: ChunkPos) -> Vec<i32> {
+        let mut removed = Vec::new();
+        self.dropped_items.retain(|&id, item| {
+            if item.chunk_pos() == pos {
+                removed.push(id);
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 }
 
