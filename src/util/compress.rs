@@ -29,6 +29,26 @@ pub fn inflate_zlib(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+pub fn deflate_gzip(input: &[u8], level: u8) -> Result<Vec<u8>> {
+    let mut compressor = Compressor::new(compression_level(level));
+    let bound = compressor.gzip_compress_bound(input.len());
+    let mut output = vec![0u8; bound];
+    let written = compressor
+        .gzip_compress(input, &mut output)
+        .map_err(|_| Error::Compression("gzip compression failed"))?;
+    output.truncate(written);
+    Ok(output)
+}
+
+pub fn inflate_gzip(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+    let mut output = vec![0u8; expected_len.max(1)];
+    let written = Decompressor::new()
+        .gzip_decompress(input, &mut output)
+        .map_err(|_| Error::Compression("gzip decompression failed"))?;
+    output.truncate(written);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +67,15 @@ mod tests {
     fn rejects_truncated_stream() {
         let compressed = deflate_zlib(b"flintcore", SMALL_DEFLATE_LEVEL).unwrap();
         assert!(inflate_zlib(&compressed[..compressed.len() / 2], 64).is_err());
+    }
+
+    #[test]
+    fn round_trips_gzip_payload() {
+        let input = b"Hello, Beta 1.7.3 level.dat world!";
+        let compressed = deflate_gzip(input, CHUNK_DEFLATE_LEVEL).unwrap();
+        assert_eq!(compressed[0], 0x1f);
+        assert_eq!(compressed[1], 0x8b);
+        let restored = inflate_gzip(&compressed, input.len()).unwrap();
+        assert_eq!(restored, input);
     }
 }

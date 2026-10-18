@@ -23,7 +23,7 @@ use crate::net::protocol::PROTOCOL_VERSION;
 use crate::net::{ConnId, NetEvent, Outbound};
 use crate::plugin::events::{PlayerChatEvent, PluginManager};
 use crate::util::{log, Result};
-use crate::world::chunk::{ChunkPos, ChunkState};
+use crate::world::chunk::ChunkPos;
 use crate::world::world::World;
 
 const TICK: Duration = Duration::from_millis(50);
@@ -45,6 +45,7 @@ pub struct Server {
     entities: EntityStore,
     tracker: EntityTracker,
     world: World,
+    player_store: crate::world::storage::PlayerStore,
     commands: CommandMap,
     plugin_manager: PluginManager,
     current_tick: u64,
@@ -57,6 +58,7 @@ impl Server {
         running: Arc<AtomicBool>,
     ) -> Self {
         let world = World::new(config.world.clone());
+        let player_store = crate::world::storage::PlayerStore::new(world.world_dir());
         let view_distance = config.world.view_distance;
         Self {
             config,
@@ -66,6 +68,7 @@ impl Server {
             entities: EntityStore::new(),
             tracker: EntityTracker::new(view_distance),
             world,
+            player_store,
             commands: CommandMap::new(),
             plugin_manager: PluginManager::new(),
             current_tick: 0,
@@ -102,13 +105,30 @@ impl Server {
             }
         }
 
+        if self.config.world.save_enabled {
+            log::info("saving world and player data before shutdown...");
+            for player in self.entities.iter_players() {
+                let _ = self.player_store.save_player(player);
+            }
+            let _ = self.world.save_all();
+        }
+
         log::info("simulation thread stopped");
         Ok(())
     }
 
     fn tick(&mut self, ticks: u64) {
         self.current_tick = ticks;
+        self.world.increment_time();
         self.drain_inbound();
+
+        // Auto-save every 6000 ticks (5 minutes)
+        if ticks % 6000 == 0 && ticks > 0 {
+            for player in self.entities.iter_players() {
+                let _ = self.player_store.save_player(player);
+            }
+            let _ = self.world.save_all();
+        }
 
         // Tick each player (no_damage_ticks, fire_ticks decrement)
         for player in self.entities.iter_players_mut() {
@@ -214,6 +234,11 @@ impl Server {
     fn remove_and_handle_disconnect(&mut self, id: ConnId) {
         if let Some(conn) = self.connections.remove(&id) {
             if let Some(player) = self.entities.remove_by_conn(id) {
+                // Save player persistence
+                if self.config.world.save_enabled {
+                    let _ = self.player_store.save_player(&player);
+                }
+
                 // Untrack player and send DestroyEntity to observers
                 let untrack_packets = self.tracker.untrack_player(player.entity_id);
                 for outbound in untrack_packets {
@@ -367,6 +392,11 @@ impl Server {
                     player.fall_distance = 0.0;
                 }
 
+                eprintln!(
+                    "FALL_DBG: y={y}, prev_y={prev_y}, on_ground={on_ground}, fall_dist={}, fall_damage={fall_damage}, health={}",
+                    player.fall_distance, player.health
+                );
+
                 player.update_position(x, y, stance, z, yaw, pitch, on_ground);
 
                 (fall_damage, player.entity_id)
@@ -377,6 +407,86 @@ impl Server {
 
         if fall_damage > 0 {
             self.damage_player_direct(entity_id, fall_damage, "hit the ground too hard");
+        }
+
+        // Distance check for chunk visibility updates
+        let move_eval = if let Some(player) = self.entities.get_by_conn(id) {
+            let dx = player.x - player.last_eval_x;
+            let dz = player.z - player.last_eval_z;
+            if dx * dx + dz * dz >= 64.0 {
+                let old_cx = (player.last_eval_x.floor() as i32) >> 4;
+                let old_cz = (player.last_eval_z.floor() as i32) >> 4;
+                let new_cx = (player.x.floor() as i32) >> 4;
+                let new_cz = (player.z.floor() as i32) >> 4;
+                if old_cx != new_cx || old_cz != new_cz {
+                    Some((
+                        old_cx,
+                        old_cz,
+                        new_cx,
+                        new_cz,
+                        player.sent_chunks.clone(),
+                        player.x,
+                        player.z,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((old_cx, old_cz, new_cx, new_cz, sent_chunks, cur_x, cur_z)) = move_eval {
+            let view_dist = self.config.world.view_distance;
+            let to_unload: Vec<ChunkPos> = sent_chunks
+                .iter()
+                .copied()
+                .filter(|p| (p.x - new_cx).abs() > view_dist || (p.z - new_cz).abs() > view_dist)
+                .collect();
+
+            for p in to_unload {
+                self.send(
+                    id,
+                    Clientbound::PreChunk(PreChunk {
+                        x: p.x,
+                        z: p.z,
+                        mode: false,
+                    }),
+                );
+                if let Some(p_mut) = self.entities.get_by_conn_mut(id) {
+                    p_mut.sent_chunks.remove(&p);
+                    p_mut.chunk_queue.retain(|&q| q != p);
+                }
+            }
+
+            let mut new_chunks = Vec::new();
+            for dz in -view_dist..=view_dist {
+                for dx in -view_dist..=view_dist {
+                    let p = ChunkPos::new(new_cx + dx, new_cz + dz);
+                    let was_in_old =
+                        (p.x - old_cx).abs() <= view_dist && (p.z - old_cz).abs() <= view_dist;
+                    if !was_in_old && !sent_chunks.contains(&p) {
+                        new_chunks.push(p);
+                    }
+                }
+            }
+
+            new_chunks.sort_by_key(|p| (p.x - new_cx).abs().max((p.z - new_cz).abs()));
+
+            for p in new_chunks {
+                if let Some(p_mut) = self.entities.get_by_conn_mut(id) {
+                    if !p_mut.sent_chunks.contains(&p) && !p_mut.chunk_queue.contains(&p) {
+                        p_mut.chunk_queue.push(p);
+                    }
+                }
+            }
+
+            if let Some(p_mut) = self.entities.get_by_conn_mut(id) {
+                p_mut.last_eval_x = cur_x;
+                p_mut.last_eval_z = cur_z;
+            }
         }
     }
 
@@ -559,7 +669,7 @@ impl Server {
                 data: old_block as i32,
             }));
 
-            // BlockChange to all observers
+            // BlockChange to observers of this chunk
             let change = Clientbound::BlockChange(BlockChange {
                 x,
                 y: y as u8,
@@ -567,7 +677,12 @@ impl Server {
                 block_type: blocks::AIR,
                 metadata: 0,
             });
-            self.broadcast(change);
+            let cpos = ChunkPos::new(x >> 4, z >> 4);
+            for p in self.entities.iter_players() {
+                if p.sent_chunks.contains(&cpos) {
+                    self.send(p.conn_id, change.clone());
+                }
+            }
 
             // Damage tool in hand
             if let Some(player) = self.entities.get_player_mut(entity_id) {
@@ -684,7 +799,12 @@ impl Server {
                 block_type: block_id,
                 metadata: meta,
             });
-            self.broadcast(change);
+            let cpos = ChunkPos::new(tx >> 4, tz >> 4);
+            for p in self.entities.iter_players() {
+                if p.sent_chunks.contains(&cpos) {
+                    self.send(p.conn_id, change.clone());
+                }
+            }
 
             // Decrement item in hand
             let slot_update = if let Some(player) = self.entities.get_by_conn_mut(id) {
@@ -823,6 +943,14 @@ impl Server {
             self.entities
                 .insert_player(id, login.username.clone(), player_x, player_y, player_z);
 
+        if self.config.world.save_enabled {
+            if let Some(player) = self.entities.get_player_mut(entity_id) {
+                let _ = self.player_store.load_player(player);
+                player.last_eval_x = player.x;
+                player.last_eval_z = player.z;
+            }
+        }
+
         if let Some(connection) = self.connections.get_mut(&id) {
             connection.state = ConnectionState::Playing;
             connection.username = Some(login.username.clone());
@@ -855,7 +983,8 @@ impl Server {
                 z: spawn_z,
             }),
         );
-        self.send(id, Clientbound::UpdateTime(UpdateTime { time: 0 }));
+        let world_time = self.world.world_time();
+        self.send(id, Clientbound::UpdateTime(UpdateTime { time: world_time }));
 
         // Stream initial spawn area chunks and send spawn teleport
         self.stream_initial_chunks(id);
@@ -873,7 +1002,12 @@ impl Server {
         }
 
         // Send UpdateHealth to the new player
-        self.send(id, Clientbound::UpdateHealth(UpdateHealth { health: 20 }));
+        let health = self
+            .entities
+            .get_player(entity_id)
+            .map(|p| p.health)
+            .unwrap_or(20);
+        self.send(id, Clientbound::UpdateHealth(UpdateHealth { health }));
 
         // Poseidon: PlayerJoinEvent -> broadcast join message to other players
         let join_msg = self
@@ -885,29 +1019,64 @@ impl Server {
     }
 
     fn stream_initial_chunks(&mut self, id: ConnId) {
-        let (spawn_x, spawn_y, spawn_z) = self.world.safe_spawn_point();
-        let center = ChunkPos::new(spawn_x >> 4, spawn_z >> 4);
-        let radius = 1; // 3x3 immediate area for spawn handshake
+        let (player_x, player_y, player_z, yaw, pitch) = {
+            let p = self.entities.get_by_conn(id).unwrap();
+            (p.x, p.y, p.z, p.yaw, p.pitch)
+        };
+        let center = ChunkPos::new(
+            (player_x.floor() as i32) >> 4,
+            (player_z.floor() as i32) >> 4,
+        );
+        let view_distance = self.config.world.view_distance;
 
-        for dz in -radius..=radius {
-            for dx in -radius..=radius {
-                let pos = ChunkPos::new(center.x + dx, center.z + dz);
-                self.world.populate_chunk(pos);
-                if let Ok((pre, map)) = self.world.prepare_chunk_packets(pos) {
-                    if self.try_send(id, Clientbound::PreChunk(pre))
-                        && self.try_send(id, Clientbound::MapChunk(map))
+        // Spiral ordering of chunks around player
+        let mut spiral = Vec::new();
+        spiral.push(center);
+        let directions = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+        let mut dir_idx = 0;
+        let mut cx = 0;
+        let mut cz = 0;
+        for k1 in 1..=view_distance * 2 {
+            for _ in 0..2 {
+                let (dx, dz) = directions[dir_idx % 4];
+                dir_idx += 1;
+                for _ in 0..k1 {
+                    cx += dx;
+                    cz += dz;
+                    let p = ChunkPos::new(center.x + cx, center.z + cz);
+                    if (p.x - center.x).abs() <= view_distance
+                        && (p.z - center.z).abs() <= view_distance
                     {
-                        if let Some(player) = self.entities.get_by_conn_mut(id) {
-                            player.sent_chunks.insert(pos);
-                        }
+                        spiral.push(p);
                     }
                 }
             }
         }
+        dir_idx %= 4;
+        for _ in 0..view_distance * 2 {
+            cx += directions[dir_idx].0;
+            cz += directions[dir_idx].1;
+            let p = ChunkPos::new(center.x + cx, center.z + cz);
+            if (p.x - center.x).abs() <= view_distance && (p.z - center.z).abs() <= view_distance {
+                spiral.push(p);
+            }
+        }
 
-        let player_x = spawn_x as f64 + 0.5;
-        let player_y = spawn_y as f64;
-        let player_z = spawn_z as f64 + 0.5;
+        // Send 3x3 immediate area synchronously so player spawns on solid terrain
+        let immediate_radius = 1;
+        for dz in -immediate_radius..=immediate_radius {
+            for dx in -immediate_radius..=immediate_radius {
+                let pos = ChunkPos::new(center.x + dx, center.z + dz);
+                self.world.populate_chunk(pos);
+                if let Ok((pre, map)) = self.world.prepare_chunk_packets(pos) {
+                    self.send(id, Clientbound::PreChunk(pre));
+                    self.send(id, Clientbound::MapChunk(map));
+                    if let Some(player) = self.entities.get_by_conn_mut(id) {
+                        player.sent_chunks.insert(pos);
+                    }
+                }
+            }
+        }
 
         self.send(
             id,
@@ -916,102 +1085,78 @@ impl Server {
                 y: player_y + 1.62,
                 z: player_z,
                 stance: player_y,
-                yaw: 0.0,
-                pitch: 0.0,
+                yaw,
+                pitch,
                 on_ground: false,
             }),
         );
+
+        // Queue remaining chunks in spiral order for tick streaming
+        if let Some(player) = self.entities.get_by_conn_mut(id) {
+            for pos in spiral {
+                if !player.sent_chunks.contains(&pos) {
+                    player.chunk_queue.push(pos);
+                }
+            }
+        }
     }
 
     fn stream_chunks(&mut self) {
-        let view_distance = self.config.world.view_distance;
-        let chunks_per_tick = self.config.world.chunks_per_tick;
+        let chunks_per_tick = self.config.world.chunks_per_tick.clamp(1, 2);
 
-        let players: Vec<(ConnId, ChunkPos)> = self
-            .entities
-            .iter_players()
-            .map(|p| (p.conn_id, p.chunk_pos()))
-            .collect();
+        let player_ids: Vec<ConnId> = self.entities.iter_players().map(|p| p.conn_id).collect();
 
-        for (id, center) in players {
-            let mut sent_this_tick = 0;
-            let mut populated_this_tick = 0;
+        let mut populated_this_tick = 0;
 
-            // Unload out of range chunks
-            let unload_radius = view_distance + 1;
-            let to_unload: Vec<ChunkPos> = if let Some(player) = self.entities.get_by_conn(id) {
-                player
-                    .sent_chunks
-                    .iter()
-                    .copied()
-                    .filter(|pos| {
-                        (pos.x - center.x).abs() > unload_radius
-                            || (pos.z - center.z).abs() > unload_radius
-                    })
-                    .collect()
+        for id in player_ids {
+            let chunks_to_send = if let Some(player) = self.entities.get_by_conn_mut(id) {
+                let count = player.chunk_queue.len().min(chunks_per_tick);
+                player.chunk_queue.drain(0..count).collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
 
-            for pos in to_unload {
-                self.send(
-                    id,
-                    Clientbound::PreChunk(PreChunk {
-                        x: pos.x,
-                        z: pos.z,
-                        mode: false,
-                    }),
-                );
-                if let Some(player) = self.entities.get_by_conn_mut(id) {
-                    player.sent_chunks.remove(&pos);
-                }
-            }
-
-            // Stream new chunks in view distance ring by ring outwards from player
-            for r in 0..=view_distance {
-                if sent_this_tick >= chunks_per_tick {
-                    break;
-                }
-                for dz in -r..=r {
-                    if sent_this_tick >= chunks_per_tick {
+            for (i, pos) in chunks_to_send.iter().enumerate() {
+                let is_pop = self
+                    .world
+                    .get_chunk(*pos)
+                    .is_some_and(|c| c.state == crate::world::chunk::ChunkState::Populated);
+                if !is_pop {
+                    if populated_this_tick >= 1 {
+                        if let Some(player) = self.entities.get_by_conn_mut(id) {
+                            for remaining in chunks_to_send[i..].iter().rev() {
+                                player.chunk_queue.insert(0, *remaining);
+                            }
+                        }
                         break;
                     }
-                    for dx in -r..=r {
-                        if dx.abs() != r && dz.abs() != r {
-                            continue;
-                        }
-                        let pos = ChunkPos::new(center.x + dx, center.z + dz);
-                        let already_sent = self
-                            .entities
-                            .get_by_conn(id)
-                            .is_some_and(|p| p.sent_chunks.contains(&pos));
+                    self.world.populate_chunk(*pos);
+                    populated_this_tick += 1;
+                }
 
-                        if !already_sent {
-                            let is_populated = self
-                                .world
-                                .get_chunk(pos)
-                                .is_some_and(|c| c.state == ChunkState::Populated);
+                if let Ok((pre, map)) = self.world.prepare_chunk_packets(*pos) {
+                    self.send(id, Clientbound::PreChunk(pre));
+                    self.send(id, Clientbound::MapChunk(map));
+                    if let Some(player) = self.entities.get_by_conn_mut(id) {
+                        player.sent_chunks.insert(*pos);
+                    }
 
-                            if !is_populated {
-                                if populated_this_tick >= 1 {
-                                    continue;
-                                }
-                                self.world.populate_chunk(pos);
-                                populated_this_tick += 1;
-                            }
-
-                            if let Ok((pre, map)) = self.world.prepare_chunk_packets(pos) {
-                                if self.try_send(id, Clientbound::PreChunk(pre))
-                                    && self.try_send(id, Clientbound::MapChunk(map))
-                                {
-                                    if let Some(player) = self.entities.get_by_conn_mut(id) {
-                                        player.sent_chunks.insert(pos);
-                                    }
-                                    sent_this_tick += 1;
-                                    if sent_this_tick >= chunks_per_tick {
-                                        break;
-                                    }
-                                }
+                    // Send tile entities in this chunk
+                    if let Some(chunk) = self.world.get_chunk(*pos) {
+                        for te in &chunk.tile_entities {
+                            if let crate::gameplay::tile::TileEntityKind::Sign { lines } = &te.kind
+                            {
+                                self.send(
+                                    id,
+                                    Clientbound::UpdateSign(
+                                        crate::net::packets::sign::UpdateSign {
+                                            x: te.x,
+                                            y: te.y as i16,
+                                            z: te.z,
+                                            lines: lines.clone(),
+                                        },
+                                    ),
+                                );
                             }
                         }
                     }
@@ -1213,6 +1358,7 @@ impl Server {
         }
     }
 
+    #[allow(dead_code)]
     fn try_send(&self, id: ConnId, packet: Clientbound) -> bool {
         if let Some(connection) = self.connections.get(&id) {
             connection.sender.try_send(Outbound::Packet(packet)).is_ok()

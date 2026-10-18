@@ -1,4 +1,6 @@
 use crate::gameplay::blocks;
+use crate::gameplay::items::ItemStack;
+use crate::gameplay::tile::TileEntity;
 use crate::util::math;
 use crate::util::rng::JavaRandom;
 use crate::world::biome::{Biome, TreeKind};
@@ -8,6 +10,7 @@ pub trait GenWorld {
     fn get_data(&self, x: i32, y: i32, z: i32) -> u8;
     fn set_block(&mut self, x: i32, y: i32, z: i32, id: u8);
     fn set_block_and_data(&mut self, x: i32, y: i32, z: i32, id: u8, data: u8);
+    fn set_tile_entity(&mut self, _te: TileEntity) {}
     fn highest_block_y(&self, x: i32, z: i32) -> i32;
     fn sky_light(&self, x: i32, y: i32, z: i32) -> i32;
     fn light_value(&self, x: i32, y: i32, z: i32) -> i32;
@@ -144,42 +147,59 @@ pub fn generate_lakes(
     true
 }
 
-fn dungeon_loot(random: &mut JavaRandom) {
+fn dungeon_loot(random: &mut JavaRandom) -> Option<(usize, ItemStack)> {
     let i = random.next_i32_bound(11);
     let item = match i {
-        0 => true,
+        0 => Some(ItemStack::new(329, 1, 0)),
         1 => {
-            random.next_i32_bound(4);
-            true
+            let count = (random.next_i32_bound(4) + 1) as u8;
+            Some(ItemStack::new(265, count, 0))
         }
-        2 => true,
-        3..=5 => {
-            random.next_i32_bound(4);
-            true
+        2 => Some(ItemStack::new(297, 1, 0)),
+        3 => {
+            let count = (random.next_i32_bound(4) + 1) as u8;
+            Some(ItemStack::new(296, count, 0))
         }
-        6 => true,
-        7 => random.next_i32_bound(100) == 0,
+        4 => {
+            let count = (random.next_i32_bound(4) + 1) as u8;
+            Some(ItemStack::new(289, count, 0))
+        }
+        5 => {
+            let count = (random.next_i32_bound(4) + 1) as u8;
+            Some(ItemStack::new(287, count, 0))
+        }
+        6 => Some(ItemStack::new(325, 1, 0)),
+        7 => {
+            if random.next_i32_bound(100) == 0 {
+                Some(ItemStack::new(322, 1, 0))
+            } else {
+                None
+            }
+        }
         8 => {
             if random.next_i32_bound(2) == 0 {
-                random.next_i32_bound(4);
-                true
+                let count = (random.next_i32_bound(4) + 1) as u8;
+                Some(ItemStack::new(331, count, 0))
             } else {
-                false
+                None
             }
         }
         9 => {
             if random.next_i32_bound(10) == 0 {
-                random.next_i32_bound(2);
-                true
+                let rec = (2256 + random.next_i32_bound(2)) as i16;
+                Some(ItemStack::new(rec, 1, 0))
             } else {
-                false
+                None
             }
         }
-        10 => true,
-        _ => false,
+        10 => Some(ItemStack::new(351, 1, 3)),
+        _ => None,
     };
-    if item {
-        random.next_i32_bound(27);
+    if let Some(stack) = item {
+        let slot = random.next_i32_bound(27) as usize;
+        Some((slot, stack))
+    } else {
+        None
     }
 }
 
@@ -264,9 +284,19 @@ pub fn generate_dungeons(
                 }
                 if k2 == 1 {
                     world.set_block(i2, j, j2, blocks::CHEST);
+                    let mut chest_te = TileEntity::new_chest(i2, j, j2);
                     for _ in 0..8 {
-                        dungeon_loot(random);
+                        if let Some((slot, stack)) = dungeon_loot(random) {
+                            if let crate::gameplay::tile::TileEntityKind::Chest { items } =
+                                &mut chest_te.kind
+                            {
+                                if slot < 27 {
+                                    items[slot] = Some(stack);
+                                }
+                            }
+                        }
                     }
+                    world.set_tile_entity(chest_te);
                     placed = true;
                     break;
                 }
@@ -278,7 +308,12 @@ pub fn generate_dungeons(
     }
 
     world.set_block(i, j, k, blocks::MOB_SPAWNER);
-    random.next_i32_bound(4);
+    let spawner_mob = match random.next_i32_bound(4) {
+        0 => "Skeleton",
+        1 | 2 => "Zombie",
+        _ => "Spider",
+    };
+    world.set_tile_entity(TileEntity::new_spawner(i, j, k, spawner_mob.into()));
     true
 }
 

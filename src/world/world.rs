@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
@@ -7,10 +8,12 @@ use crate::config::WorldConfig;
 use crate::gameplay::blocks;
 use crate::net::packets::chunk::{MapChunk, PreChunk};
 use crate::util::{Error, Result};
-use crate::world::biome::Biome;
+use crate::world::biome::{Biome, WorldChunkManager};
 use crate::world::chunk::{Chunk, ChunkPos, ChunkState, CHUNK_HEIGHT};
 use crate::world::decorate::GenWorld;
 use crate::world::generator::Generator;
+use crate::world::lighting::{update_block_light, LightType, LightingWorld};
+use crate::world::storage::{ChunkLoader, LevelData, RegionFileCache, SessionLock};
 
 thread_local! {
     static GENERATOR: RefCell<Option<(i64, Generator)>> = const { RefCell::new(None) };
@@ -29,21 +32,82 @@ fn with_generator<R>(seed: i64, f: impl FnOnce(&mut Generator) -> R) -> R {
 
 pub struct World {
     config: WorldConfig,
+    world_dir: PathBuf,
     chunks: HashMap<ChunkPos, Chunk>,
     packet_cache: RefCell<HashMap<ChunkPos, (PreChunk, MapChunk)>>,
+    chunk_mgr: RefCell<WorldChunkManager>,
+    storage: Option<RefCell<RegionFileCache>>,
+    level_data: RefCell<LevelData>,
+    _session_lock: Option<SessionLock>,
 }
 
 impl World {
-    pub fn new(config: WorldConfig) -> Self {
+    pub fn new(mut config: WorldConfig) -> Self {
+        let world_dir = PathBuf::from(&config.level_name);
+
+        let (_session_lock, storage, level_data) = if config.save_enabled {
+            let lock = SessionLock::acquire(&world_dir).ok();
+            let loaded = LevelData::load_from_dir(&world_dir).ok().flatten();
+            let level = if let Some(lvl) = loaded {
+                config.seed = lvl.seed;
+                config.spawn_x = lvl.spawn_x;
+                config.spawn_y = lvl.spawn_y;
+                config.spawn_z = lvl.spawn_z;
+                lvl
+            } else {
+                LevelData {
+                    seed: config.seed,
+                    spawn_x: config.spawn_x,
+                    spawn_y: config.spawn_y,
+                    spawn_z: config.spawn_z,
+                    level_name: config.level_name.clone(),
+                    ..LevelData::default()
+                }
+            };
+            let cache = RegionFileCache::new(&world_dir);
+            (lock, Some(RefCell::new(cache)), RefCell::new(level))
+        } else {
+            let level = LevelData {
+                seed: config.seed,
+                spawn_x: config.spawn_x,
+                spawn_y: config.spawn_y,
+                spawn_z: config.spawn_z,
+                level_name: config.level_name.clone(),
+                ..LevelData::default()
+            };
+            (None, None, RefCell::new(level))
+        };
+
+        let chunk_mgr = RefCell::new(WorldChunkManager::new(config.seed));
+
         Self {
             config,
+            world_dir,
             chunks: HashMap::new(),
             packet_cache: RefCell::new(HashMap::new()),
+            chunk_mgr,
+            storage,
+            level_data,
+            _session_lock,
         }
     }
 
     pub fn config(&self) -> &WorldConfig {
         &self.config
+    }
+
+    pub fn world_dir(&self) -> &Path {
+        &self.world_dir
+    }
+
+    pub fn world_time(&self) -> i64 {
+        self.level_data.borrow().time
+    }
+
+    pub fn increment_time(&self) -> i64 {
+        let mut data = self.level_data.borrow_mut();
+        data.time += 1;
+        data.time
     }
 
     pub fn seed(&self) -> i64 {
@@ -89,8 +153,22 @@ impl World {
 
     pub fn ensure_chunk_base(&mut self, pos: ChunkPos) -> &mut Chunk {
         if !self.chunks.contains_key(&pos) {
-            let seed = self.config.seed;
-            let chunk = with_generator(seed, |gen| gen.generate_base(pos.x, pos.z));
+            let loaded_chunk = if let Some(storage) = &self.storage {
+                match storage.borrow_mut().read_chunk(pos.x, pos.z) {
+                    Ok(Some(nbt)) => ChunkLoader::chunk_from_nbt(&nbt).ok(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let chunk = match loaded_chunk {
+                Some(c) => c,
+                None => {
+                    let seed = self.config.seed;
+                    with_generator(seed, |gen| gen.generate_base(pos.x, pos.z))
+                }
+            };
             self.chunks.insert(pos, chunk);
         }
         self.chunks.get_mut(&pos).unwrap()
@@ -103,8 +181,7 @@ impl World {
             }
         }
 
-        // Ensure 5x5 region around target chunk has base terrain generated
-        // so decorators extending slightly over borders find valid chunks.
+        // Ensure surrounding chunks have base terrain generated
         for dz in -2..=2 {
             for dx in -2..=2 {
                 self.ensure_chunk_base(ChunkPos::new(pos.x + dx, pos.z + dz));
@@ -122,8 +199,25 @@ impl World {
 
         if let Some(chunk) = self.chunks.get_mut(&pos) {
             chunk.state = ChunkState::Populated;
+            chunk.dirty = true;
         }
         self.packet_cache.borrow_mut().remove(&pos);
+    }
+
+    pub fn save_all(&mut self) -> Result<()> {
+        if let Some(storage) = &self.storage {
+            let time = self.level_data.borrow().time;
+            for (&pos, chunk) in &mut self.chunks {
+                if chunk.dirty {
+                    let nbt = ChunkLoader::chunk_to_nbt(chunk, time);
+                    storage.borrow_mut().write_chunk(pos.x, pos.z, &nbt)?;
+                    chunk.dirty = false;
+                }
+            }
+            storage.borrow_mut().flush_all()?;
+            self.level_data.borrow_mut().save_to_dir(&self.world_dir)?;
+        }
+        Ok(())
     }
 
     pub fn generate_base_chunks_parallel(&mut self, positions: &[ChunkPos]) {
@@ -225,18 +319,8 @@ impl World {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return;
         }
-        let cx = x >> 4;
-        let cz = z >> 4;
-        let pos = ChunkPos::new(cx, cz);
-        if let Some(chunk) = self.chunks.get_mut(&pos) {
-            chunk.set_block((x & 15) as usize, y as usize, (z & 15) as usize, id);
-        }
-        self.packet_cache.borrow_mut().remove(&pos);
-        self.recalc_height(cx, cz, (x & 15) as usize, (z & 15) as usize);
-    }
-
-    pub fn set_block_and_data(&mut self, x: i32, y: i32, z: i32, id: u8, data: u8) {
-        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+        let old_id = self.get_block(x, y, z);
+        if old_id == id {
             return;
         }
         let cx = x >> 4;
@@ -244,10 +328,31 @@ impl World {
         let pos = ChunkPos::new(cx, cz);
         if let Some(chunk) = self.chunks.get_mut(&pos) {
             chunk.set_block((x & 15) as usize, y as usize, (z & 15) as usize, id);
-            chunk.set_metadata((x & 15) as usize, y as usize, (z & 15) as usize, data);
+            chunk.dirty = true;
         }
         self.packet_cache.borrow_mut().remove(&pos);
         self.recalc_height(cx, cz, (x & 15) as usize, (z & 15) as usize);
+        update_block_light(self, x, y, z, old_id, id);
+    }
+
+    pub fn set_block_and_data(&mut self, x: i32, y: i32, z: i32, id: u8, data: u8) {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return;
+        }
+        let old_id = self.get_block(x, y, z);
+        let cx = x >> 4;
+        let cz = z >> 4;
+        let pos = ChunkPos::new(cx, cz);
+        if let Some(chunk) = self.chunks.get_mut(&pos) {
+            chunk.set_block((x & 15) as usize, y as usize, (z & 15) as usize, id);
+            chunk.set_metadata((x & 15) as usize, y as usize, (z & 15) as usize, data);
+            chunk.dirty = true;
+        }
+        self.packet_cache.borrow_mut().remove(&pos);
+        self.recalc_height(cx, cz, (x & 15) as usize, (z & 15) as usize);
+        if old_id != id {
+            update_block_light(self, x, y, z, old_id, id);
+        }
     }
 
     fn recalc_height(&mut self, cx: i32, cz: i32, lx: usize, lz: usize) {
@@ -278,6 +383,13 @@ impl GenWorld for World {
 
     fn set_block_and_data(&mut self, x: i32, y: i32, z: i32, id: u8, data: u8) {
         self.set_block_and_data(x, y, z, id, data);
+    }
+
+    fn set_tile_entity(&mut self, te: crate::gameplay::tile::TileEntity) {
+        let pos = ChunkPos::new(te.x >> 4, te.z >> 4);
+        if let Some(chunk) = self.chunks.get_mut(&pos) {
+            chunk.set_tile_entity(te);
+        }
     }
 
     fn highest_block_y(&self, x: i32, z: i32) -> i32 {
@@ -348,8 +460,62 @@ impl GenWorld for World {
         blocks::is_normal_solid(self.get_block(x, y, z))
     }
 
-    fn biome_at(&self, _x: i32, _z: i32) -> Biome {
-        Biome::Tundra
+    fn biome_at(&self, x: i32, z: i32) -> Biome {
+        self.chunk_mgr.borrow_mut().biome_at(x, z)
+    }
+}
+
+impl LightingWorld for World {
+    fn get_block(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.get_block(x, y, z)
+    }
+
+    fn get_light(&self, light_type: LightType, x: i32, y: i32, z: i32) -> u8 {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return if light_type == LightType::Sky { 15 } else { 0 };
+        }
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        if let Some(chunk) = self.chunks.get(&pos) {
+            match light_type {
+                LightType::Sky => {
+                    chunk.get_sky_light((x & 15) as usize, y as usize, (z & 15) as usize)
+                }
+                LightType::Block => {
+                    chunk.get_block_light((x & 15) as usize, y as usize, (z & 15) as usize)
+                }
+            }
+        } else if light_type == LightType::Sky {
+            15
+        } else {
+            0
+        }
+    }
+
+    fn set_light(&mut self, light_type: LightType, x: i32, y: i32, z: i32, val: u8) {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return;
+        }
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        if let Some(chunk) = self.chunks.get_mut(&pos) {
+            match light_type {
+                LightType::Sky => {
+                    chunk.set_sky_light((x & 15) as usize, y as usize, (z & 15) as usize, val);
+                }
+                LightType::Block => {
+                    chunk.set_block_light((x & 15) as usize, y as usize, (z & 15) as usize, val);
+                }
+            }
+            chunk.dirty = true;
+        }
+        self.packet_cache.borrow_mut().remove(&pos);
+    }
+
+    fn can_see_sky(&self, x: i32, y: i32, z: i32) -> bool {
+        self.see_sky(x, y, z)
+    }
+
+    fn is_chunk_loaded(&self, cx: i32, cz: i32) -> bool {
+        self.is_chunk_loaded(ChunkPos::new(cx, cz))
     }
 }
 

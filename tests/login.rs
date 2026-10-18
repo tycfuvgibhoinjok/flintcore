@@ -26,7 +26,8 @@ impl Drop for Harness {
 
 impl Harness {
     async fn start() -> Self {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.world.save_enabled = false;
         let running = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(AtomicU64::new(1));
         let (inbound_tx, inbound_rx) = mpsc::channel::<NetEvent>(64);

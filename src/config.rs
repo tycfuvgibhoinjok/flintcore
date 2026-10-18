@@ -116,6 +116,8 @@ impl Default for NetworkConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct WorldConfig {
     pub seed: i64,
+    pub level_name: String,
+    pub save_enabled: bool,
     pub view_distance: i32,
     pub chunks_per_tick: usize,
     pub gen_workers: usize,
@@ -130,6 +132,8 @@ impl Default for WorldConfig {
     fn default() -> Self {
         Self {
             seed: 0,
+            level_name: "world".to_string(),
+            save_enabled: true,
             view_distance: 10,
             chunks_per_tick: 16,
             gen_workers: 0,

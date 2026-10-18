@@ -1,4 +1,5 @@
 use crate::gameplay::blocks;
+use crate::gameplay::tile::TileEntity;
 
 pub const CHUNK_WIDTH: usize = 16;
 pub const CHUNK_HEIGHT: usize = 128;
@@ -166,8 +167,10 @@ impl SubChunk {
 pub struct Chunk {
     pub pos: ChunkPos,
     pub state: ChunkState,
+    pub dirty: bool,
     pub height_map: [u8; CHUNK_AREA],
     pub biomes: [u8; CHUNK_AREA],
+    pub tile_entities: Vec<TileEntity>,
     sub_chunks: [SubChunk; SUB_CHUNK_COUNT],
 }
 
@@ -176,9 +179,34 @@ impl Chunk {
         Self {
             pos,
             state: ChunkState::Generating,
+            dirty: false,
             height_map: [0; CHUNK_AREA],
             biomes: [0; CHUNK_AREA],
+            tile_entities: Vec::new(),
             sub_chunks: std::array::from_fn(|_| SubChunk::new()),
+        }
+    }
+
+    pub fn get_tile_entity(&self, x: i32, y: i32, z: i32) -> Option<&TileEntity> {
+        self.tile_entities
+            .iter()
+            .find(|te| te.x == x && te.y == y && te.z == z)
+    }
+
+    pub fn set_tile_entity(&mut self, te: TileEntity) {
+        self.remove_tile_entity(te.x, te.y, te.z);
+        self.tile_entities.push(te);
+        self.dirty = true;
+    }
+
+    pub fn remove_tile_entity(&mut self, x: i32, y: i32, z: i32) {
+        if let Some(idx) = self
+            .tile_entities
+            .iter()
+            .position(|te| te.x == x && te.y == y && te.z == z)
+        {
+            self.tile_entities.swap_remove(idx);
+            self.dirty = true;
         }
     }
 
@@ -264,30 +292,7 @@ impl Chunk {
     }
 
     pub fn init_lighting(&mut self) {
-        for x in 0..CHUNK_WIDTH {
-            for z in 0..CHUNK_WIDTH {
-                let mut height = CHUNK_HEIGHT as i32 - 1;
-                while height > 0
-                    && blocks::light_opacity(self.get_block(x, height as usize - 1, z)) == 0
-                {
-                    height -= 1;
-                }
-                self.height_map[(z << 4) | x] = height as u8;
-
-                let mut level = 15i32;
-                let mut y = CHUNK_HEIGHT as i32 - 1;
-                loop {
-                    level -= blocks::light_opacity(self.get_block(x, y as usize, z)) as i32;
-                    if level > 0 {
-                        self.set_sky_light(x, y as usize, z, level as u8);
-                    }
-                    y -= 1;
-                    if y <= 0 || level <= 0 {
-                        break;
-                    }
-                }
-            }
-        }
+        crate::world::lighting::init_chunk_lighting(self);
     }
 
     pub fn compact(&mut self) {

@@ -307,34 +307,38 @@ Each world owns its chunk store, entity list and block-update queues, and runs:
 
 This mirrors Poseidon's `World.doTick` split into deterministic, testable steps.
 
-### 7.3 Storage
+### 7.3 Storage and Persistence (`src/world/storage/`)
 
-- Region files use the Beta `.mcr` format: 32×32 chunks, 4 KiB sectors,
-  1024-entry header, zlib/GZIP payloads (Sector → header → NBT `Level`).
-- NBT read/write is handled on the region I/O pool; the sim thread only sees
-  decoded chunk data.
-- `level.dat`, `session.lock` and player `.dat` files are managed in the same
-  layer.
-- An 8-slot (configurable) region-file cache bounds open file descriptors.
+- **McRegion format (`region.rs`, `cache.rs`)**:
+  - Full `.mcr` binary layout: 32×32 chunks (1,024 chunks per region), 4 KiB sectors.
+  - Sector 0 (0..4095): 1024 big-endian entries `(sector_offset << 8) | sector_count`.
+  - Sector 1 (4096..8191): 1024 big-endian epoch-second timestamp entries.
+  - Dynamic sector allocator with free-list tracking (`sector_free`), in-place rewrites, and hole reuse.
+  - Chunks written as 4-byte length prefix + 1-byte version (`2` = ZLIB) + compressed NBT payload, aligned to 4096 bytes.
+  - `RegionFileCache`: LRU cache of open region files with `close_all` and `flush_all`.
+- **NBT codec (`nbt.rs`)**:
+  - Complete zero-dependency implementation of standard NBT specification (all 11 tags, big-endian).
+  - Built-in GZIP and ZLIB streaming wrappers via `libdeflater`.
+- **World metadata (`level.rs`)**:
+  - `level.dat`: GZIP NBT root `"" -> "Data"` with `RandomSeed`, `SpawnX/Y/Z/Yaw/Pitch`, `Time`, `SizeOnDisk`, `LevelName`, `version` = 19132, weather times.
+  - 3-stage atomic save protocol: `level.dat_new` $\to$ `level.dat_old` $\to$ `level.dat`.
+  - `session.lock`: 8-byte big-endian millisecond timestamp ensuring single-process exclusivity.
+- **Player data persistence (`player_store.rs`)**:
+  - `<world_dir>/players/<username>.dat` (GZIP NBT) with position, rotation, health, fire, air, hotbar/inventory (`0..35`), and armor slots (`100..103`).
+- **Tile entity persistence (`src/gameplay/tile.rs`, `chunk_loader.rs`)**:
+  - Full NBT serialization of `Chest`, `Furnace`, `Sign`, `MobSpawner`, `Dispenser`, `Note` into chunk `TileEntities` lists.
 
-### 7.4 Generation pipeline
+### 7.4 Generation and Lighting Pipeline
 
-```
-sim: mark chunk needed
-  └─▶ gen pool: generate terrain (deterministic per chunk)
-        └─▶ sim: integrate chunk, enqueue population
-  └─▶ gen pool (or sim): populate (biomes, caves, ores, structures)
-        └─▶ sim: finalize chunk, make visible
-```
-
-- Generation runs on Rayon with `thread_local` generator instances rebuilt only
-  when the world seed changes (avoids reallocating noise permutation tables).
-- A **per-player per-tick budget** (e.g. ~16 chunks) bounds generation work so it
-  cannot starve the tick; fair-share cursors prevent one player from monopolizing
-  the generator.
-- A chunk produced by a worker is integrated only on the sim thread. Writes that
-  arrived while generation was in flight are replayed onto the finished chunk
-  ("bleed writes"), preserving correctness.
+- **Dual-wave BFS Lighting Engine (`lighting.rs`)**:
+  - `init_chunk_lighting`: 100% vanilla `Chunk.initLighting()` heightmap (`height_map[z << 4 | x]`) and vertical skylight attenuation.
+  - Dynamic `update_block_light`:
+    - **Bright Wave (Light Increase)**: BFS propagation queue for sunlight and block light sources.
+    - **Dark Wave (Light Decrease)**: BFS zeroing queue for removed light sources and light-blocking placements, followed by perimeter re-propagation.
+- **Chunk Streaming & Rate Limiting (`src/server.rs`)**:
+  - Per-player Archimedean spiral ordering on join and Chebyshev distance sorting ($L_\infty$) on movement/teleport.
+  - Decoupled two-phase protocol: `PreChunk(true)` sent on allocation, throttled `MapChunk` delivery (up to `chunks_per_tick` per tick per player), `PreChunk(false)` on view exit.
+  - Scoped block updates: `BlockChange` sent only to chunk observers, not global broadcasts.
 
 ---
 
