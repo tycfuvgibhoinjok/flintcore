@@ -5,6 +5,7 @@ pub mod decorate;
 pub mod generator;
 pub mod lighting;
 pub mod live;
+pub mod redstone;
 pub mod storage;
 pub mod ticks;
 #[allow(clippy::module_inception)]

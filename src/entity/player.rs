@@ -43,6 +43,7 @@ pub struct Player {
     pub no_damage_ticks: u8,
     pub sneaking: bool,
     pub sleeping: bool,
+    pub vehicle_id: Option<i32>,
     pub bed_pos: Option<(i32, i32, i32)>,
     pub spawn_bed: Option<(i32, i32, i32)>,
     pub inventory: InventoryPlayer,
@@ -98,6 +99,7 @@ impl Player {
             no_damage_ticks: 0,
             sneaking: false,
             sleeping: false,
+            vehicle_id: None,
             bed_pos: None,
             spawn_bed: None,
             inventory: InventoryPlayer::new(),
@@ -243,7 +245,9 @@ impl Player {
         self.mot_y = 0.0;
         self.mot_z = 0.0;
         self.velocity_changed = false;
+        self.sneaking = false;
         self.sleeping = false;
+        self.vehicle_id = None;
         self.bed_pos = None;
         self.open_container = None;
         self.editing_sign = None;
@@ -269,5 +273,19 @@ impl Player {
         for slot in 0..5 {
             self.equipment_cache[slot as usize] = self.inventory.get_equipment(slot);
         }
+    }
+
+    pub fn metadata_flags(&self) -> u8 {
+        let mut flags = 0u8;
+        if self.fire_ticks > 0 {
+            flags |= 0x01;
+        }
+        if self.sneaking {
+            flags |= 0x02;
+        }
+        if self.vehicle_id.is_some() {
+            flags |= 0x04;
+        }
+        flags
     }
 }

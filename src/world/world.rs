@@ -195,7 +195,7 @@ pub struct World {
     storage: Option<RefCell<RegionFileCache>>,
     pub(crate) level_data: RefCell<LevelData>,
     _session_lock: Option<SessionLock>,
-    suppress_physics: bool,
+    pub(crate) suppress_physics: bool,
     /// Java `World.a`: while true, `World.c`/`World.d` executes scheduled
     /// block ticks immediately (recursively). `WorldGenLiquids` enables it
     /// around the direct fluid tick, which cascades through flowed blocks.
@@ -231,8 +231,20 @@ pub struct World {
     pub(crate) light_schedule_depth: i32,
     /// Java `World.M` — recursion depth counter for `World.doLighting()`.
     pub(crate) do_lighting_depth: i32,
+    /// Chunks whose light layers were modified by `java_do_lighting` and should be compacted.
+    pub(crate) light_dirty_chunks: HashSet<ChunkPos>,
     /// Java `EntityFallingSand` instances in `World.entityList`.
     pub(crate) falling_sands: Vec<FallingSand>,
+    /// Java `BlockRedstoneWire.a` — false while evaluating wire indirect power.
+    pub(crate) wire_can_provide_power: bool,
+    /// Java `BlockRedstoneTorch.b` — burnout toggle history.
+    pub(crate) torch_burnout_list: Vec<crate::world::redstone::RedstoneUpdateInfo>,
+    /// Events emitted by redstone/pistons/dispensers/random ticks for `Server`.
+    pub(crate) world_events: Vec<crate::world::redstone::WorldEvent>,
+    /// Java `World.g` LCG state for `World.j()` random block ticks.
+    pub(crate) random_tick_lcg: i32,
+    /// Separate RNG for live random block ticks so `world_random` stays untouched for parity tests.
+    pub(crate) tick_random: JavaRandom,
 }
 
 /// Active `EntityFallingSand` instance ticked by `World.cleanUp()`.
@@ -394,6 +406,7 @@ impl World {
         let chunk_mgr = RefCell::new(WorldChunkManager::new(config.seed));
         let live = crate::world::live::LiveState::new(config.view_distance);
         let initial_time = level_data.borrow().time;
+        let world_seed = config.seed;
 
         Self {
             config,
@@ -417,7 +430,15 @@ impl World {
             light_updates: Vec::new(),
             light_schedule_depth: 0,
             do_lighting_depth: 0,
+            light_dirty_chunks: HashSet::new(),
             falling_sands: Vec::new(),
+            wire_can_provide_power: true,
+            torch_burnout_list: Vec::new(),
+            world_events: Vec::new(),
+            random_tick_lcg: (world_seed as i32)
+                .wrapping_mul(3)
+                .wrapping_add(1_013_904_223),
+            tick_random: JavaRandom::new(world_seed ^ 0x5DEECE66D),
         }
     }
 
@@ -673,7 +694,11 @@ impl World {
         };
         let map_chunk = MapChunk::from_chunk(chunk)?;
         let result = (pre_chunk, map_chunk);
-        self.packet_cache.borrow_mut().insert(pos, result.clone());
+        let mut cache = self.packet_cache.borrow_mut();
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(pos, result.clone());
         Ok(result)
     }
 
@@ -936,7 +961,7 @@ impl World {
         self.java_apply_physics(x, y, z, l);
     }
 
-    fn java_apply_physics(&mut self, x: i32, y: i32, z: i32, l: i32) {
+    pub(crate) fn java_apply_physics(&mut self, x: i32, y: i32, z: i32, l: i32) {
         self.java_neighbor_physics(x - 1, y, z, l);
         self.java_neighbor_physics(x + 1, y, z, l);
         self.java_neighbor_physics(x, y - 1, z, l);
@@ -993,6 +1018,103 @@ impl World {
             }
             // BlockSand/BlockGravel schedule a tick (delay `BlockSand.c()` = 3).
             blocks::SAND | blocks::GRAVEL => self.java_schedule_tick(x, y, z, id, 3),
+            blocks::REDSTONE_WIRE => {
+                if !self.is_solid_normal_at(x, y - 1, z) {
+                    self.java_set_type_id(x, y, z, 0);
+                    self.world_events
+                        .push(crate::world::redstone::WorldEvent::DropItem {
+                            x: x as f64,
+                            y: y as f64,
+                            z: z as f64,
+                            item: crate::gameplay::items::ItemStack::new(
+                                crate::gameplay::items::REDSTONE,
+                                1,
+                                0,
+                            ),
+                        });
+                } else {
+                    self.update_redstone_wire(x, y, z);
+                }
+            }
+            blocks::REDSTONE_TORCH_OFF | blocks::REDSTONE_TORCH_ON => {
+                self.java_schedule_tick(x, y, z, id, 2);
+            }
+            blocks::REPEATER_OFF | blocks::REPEATER_ON => {
+                self.do_physics_repeater(x, y, z, id);
+            }
+            blocks::WOODEN_DOOR | blocks::IRON_DOOR => {
+                let meta = self.get_data(x, y, z);
+                if (meta & 8) != 0 {
+                    if self.get_block(x, y - 1, z) != id {
+                        self.java_set_type_id(x, y, z, 0);
+                    } else if l > 0 && self.is_power_source_block(l as u8) {
+                        self.java_neighbor_physics(x, y - 1, z, l);
+                    }
+                } else if self.get_block(x, y + 1, z) != id || !self.is_solid_normal_at(x, y - 1, z)
+                {
+                    self.java_set_type_id(x, y, z, 0);
+                } else if l > 0 && self.is_power_source_block(l as u8) {
+                    let powered = self.is_block_indirectly_powered(x, y, z)
+                        || self.is_block_indirectly_powered(x, y + 1, z);
+                    self.power_door(x, y, z, id, powered);
+                }
+            }
+            blocks::TRAPDOOR => {
+                if l > 0 && self.is_power_source_block(l as u8) {
+                    let powered = self.is_block_indirectly_powered(x, y, z);
+                    self.power_trapdoor(x, y, z, powered);
+                }
+            }
+            blocks::NOTE_BLOCK => {
+                if l > 0 && self.is_power_source_block(l as u8) {
+                    let powered = self.is_block_indirectly_powered(x, y, z);
+                    let was_powered = self.get_data(x, y, z) != 0;
+                    if was_powered != powered {
+                        self.java_set_raw_data(x, y, z, u8::from(powered));
+                        if powered {
+                            self.trigger_note_block(x, y, z);
+                        }
+                    }
+                }
+            }
+            blocks::DISPENSER => {
+                if l > 0 && self.is_power_source_block(l as u8) {
+                    let powered = self.is_block_indirectly_powered(x, y, z)
+                        || self.is_block_indirectly_powered(x, y + 1, z);
+                    if powered {
+                        self.java_schedule_tick(x, y, z, blocks::DISPENSER, 4);
+                    }
+                }
+            }
+            blocks::PISTON | blocks::STICKY_PISTON => {
+                self.update_piston_state(x, y, z, id);
+            }
+            blocks::PISTON_HEAD => {
+                let meta = self.get_data(x, y, z);
+                let dir = (meta & 7) as usize;
+                if dir <= 5 {
+                    let bx = x - [0, 0, 0, 0, -1, 1][dir];
+                    let by = y - [-1, 1, 0, 0, 0, 0][dir];
+                    let bz = z - [0, 0, -1, 1, 0, 0][dir];
+                    let base_id = self.get_block(bx, by, bz);
+                    if base_id != blocks::PISTON && base_id != blocks::STICKY_PISTON {
+                        self.java_set_type_id(x, y, z, 0);
+                    } else {
+                        self.java_neighbor_physics(bx, by, bz, l);
+                    }
+                }
+            }
+            blocks::TNT => {
+                if l > 0
+                    && self.is_power_source_block(l as u8)
+                    && self.is_block_indirectly_powered(x, y, z)
+                {
+                    self.ignite_tnt(x, y, z, false);
+                }
+            }
+            blocks::POWERED_RAIL => {
+                self.update_powered_rail(x, y, z);
+            }
             _ => {}
         }
     }
@@ -1001,7 +1123,7 @@ impl World {
     /// (Java `World.a`) is set the tick runs immediately and recursively; in
     /// the server tick loop (`World.a(boolean)`) queued entries run when their
     /// time arrives. The queue branch drops entries outside loaded chunks.
-    fn java_schedule_tick(&mut self, x: i32, y: i32, z: i32, id: u8, delay: i64) {
+    pub(crate) fn java_schedule_tick(&mut self, x: i32, y: i32, z: i32, id: u8, delay: i64) {
         // `NextTickListEntry` is constructed (and the global sequence counter
         // consumed) before any branch checks.
         let seq = self.scheduled_seq;
@@ -1081,6 +1203,25 @@ impl World {
                 self.world_random = rng;
             }
             blocks::SAND | blocks::GRAVEL => self.java_sand_fall(x, y, z, id),
+            blocks::REDSTONE_TORCH_OFF => self.tick_redstone_torch(x, y, z, false),
+            blocks::REDSTONE_TORCH_ON => self.tick_redstone_torch(x, y, z, true),
+            blocks::REPEATER_OFF => self.tick_repeater(x, y, z, false),
+            blocks::REPEATER_ON => self.tick_repeater(x, y, z, true),
+            blocks::STONE_BUTTON => self.tick_button(x, y, z),
+            blocks::STONE_PLATE | blocks::WOOD_PLATE => {
+                if self.get_data(x, y, z) == 1 {
+                    self.set_pressure_plate_state(x, y, z, id, false);
+                }
+            }
+            blocks::DETECTOR_RAIL => {
+                let meta = self.get_data(x, y, z);
+                if (meta & 8) != 0 {
+                    self.java_set_data(x, y, z, meta & 7);
+                    self.java_apply_physics(x, y, z, id as i32);
+                    self.java_apply_physics(x, y - 1, z, id as i32);
+                }
+            }
+            blocks::DISPENSER => self.tick_dispenser(x, y, z),
             _ => {}
         }
     }
@@ -1308,7 +1449,7 @@ impl World {
     }
 
     /// `world.k(i, j, k)` — max(sky, block) light with y clamped to [0, 127].
-    fn light_at(&self, x: i32, y: i32, z: i32) -> i32 {
+    pub(crate) fn light_at(&self, x: i32, y: i32, z: i32) -> i32 {
         if y < 0 {
             return 0;
         }
@@ -1467,7 +1608,7 @@ impl World {
     }
 
     /// Java `World.a(EnumSkyBlock, int i, int j, int k)` (lines 598-621).
-    fn java_get_saved_light(&self, kind: LightType, x: i32, mut y: i32, z: i32) -> i32 {
+    pub(crate) fn java_get_saved_light(&self, kind: LightType, x: i32, mut y: i32, z: i32) -> i32 {
         if y < 0 {
             y = 0;
         }
@@ -1512,6 +1653,7 @@ impl World {
                 LightType::Sky => chunk.set_sky_light(lx, y as usize, lz, l as u8),
                 LightType::Block => chunk.set_block_light(lx, y as usize, lz, l as u8),
             }
+            self.light_dirty_chunks.insert(pos);
             self.packet_cache.borrow_mut().remove(&pos);
         }
     }
@@ -1684,7 +1826,35 @@ impl World {
             self.java_run_light_block(blk);
         }
         self.do_lighting_depth -= 1;
+        if self.do_lighting_depth == 0 && self.light_updates.is_empty() {
+            if self.light_updates.capacity() > 2048 {
+                self.light_updates.shrink_to(512);
+            }
+            if !self.light_dirty_chunks.is_empty() {
+                for pos in self.light_dirty_chunks.drain() {
+                    if let Some(chunk) = self.chunks.get_mut(&pos) {
+                        chunk.compact();
+                    }
+                }
+                if self.light_dirty_chunks.capacity() > 256 {
+                    self.light_dirty_chunks.shrink_to(64);
+                }
+            }
+        }
         flag
+    }
+
+    pub fn compact_all_chunks(&mut self) {
+        for chunk in self.chunks.values_mut() {
+            chunk.compact();
+        }
+        self.chunks.shrink_to_fit();
+        self.light_updates.shrink_to_fit();
+        self.light_dirty_chunks.shrink_to_fit();
+        self.scheduled_set.shrink_to_fit();
+        self.packet_cache.borrow_mut().clear();
+        self.packet_cache.borrow_mut().shrink_to_fit();
+        crate::util::trim_heap_memory();
     }
 
     /// `Block.remove` dispatch for the replaced block.
@@ -1692,6 +1862,41 @@ impl World {
         match id {
             blocks::LEAVES => self.mark_leaves_around(x, y, z, 1, false),
             blocks::LOG => self.mark_leaves_around(x, y, z, 4, true),
+            blocks::REDSTONE_WIRE => {
+                if !self.suppress_physics {
+                    self.on_wire_place_or_remove(x, y, z);
+                }
+            }
+            blocks::REDSTONE_TORCH_ON => {
+                self.notify_torch_neighbors(x, y, z, id);
+            }
+            blocks::LEVER | blocks::STONE_BUTTON => {
+                let meta = self.get_data(x, y, z);
+                if (meta & 8) > 0 {
+                    self.notify_attachment_neighbors(x, y, z, id, meta & 7);
+                }
+            }
+            blocks::STONE_PLATE | blocks::WOOD_PLATE => {
+                if self.get_data(x, y, z) > 0 {
+                    self.java_apply_physics(x, y, z, id as i32);
+                    self.java_apply_physics(x, y - 1, z, id as i32);
+                }
+            }
+            blocks::PISTON_HEAD => {
+                let meta = self.get_data(x, y, z);
+                let dir = (meta & 7) as usize;
+                if dir <= 5 {
+                    let bx = x - [0, 0, 0, 0, -1, 1][dir];
+                    let by = y - [-1, 1, 0, 0, 0, 0][dir];
+                    let bz = z - [0, 0, -1, 1, 0, 0][dir];
+                    let base = self.get_block(bx, by, bz);
+                    if (base == blocks::PISTON || base == blocks::STICKY_PISTON)
+                        && (self.get_data(bx, by, bz) & 8) != 0
+                    {
+                        self.java_set_type_id(bx, by, bz, 0);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1760,6 +1965,24 @@ impl World {
             blocks::SAND | blocks::GRAVEL => {
                 // BlockSand.c: schedule a fall check (delay 3).
                 self.java_schedule_tick(x, y, z, id, 3);
+            }
+            blocks::REDSTONE_WIRE => {
+                if !self.suppress_physics {
+                    self.on_wire_place_or_remove(x, y, z);
+                }
+            }
+            blocks::REDSTONE_TORCH_ON => {
+                self.notify_torch_neighbors(x, y, z, id);
+                self.java_schedule_tick(x, y, z, id, 2);
+            }
+            blocks::REDSTONE_TORCH_OFF => {
+                self.java_schedule_tick(x, y, z, id, 2);
+            }
+            blocks::REPEATER_OFF | blocks::REPEATER_ON => {
+                self.notify_torch_neighbors(x, y, z, id);
+            }
+            blocks::TNT if self.is_block_indirectly_powered(x, y, z) => {
+                self.ignite_tnt(x, y, z, false);
             }
             _ => {}
         }
@@ -2315,6 +2538,9 @@ impl World {
                 let meta = (((yaw * 4.0 / 360.0) + 0.5).floor() as i32 & 3) as u8;
                 let meta = (meta + 2) & 3;
                 self.java_set_data(x, y, z, meta);
+                if self.is_repeater_receiving_power(x, y, z, meta) {
+                    self.java_schedule_tick(x, y, z, block_id, 1);
+                }
             }
             blocks::PISTON | blocks::STICKY_PISTON => {
                 let meta = if pitch > 45.0 {
@@ -2330,6 +2556,7 @@ impl World {
                     }
                 };
                 self.java_set_data(x, y, z, meta);
+                self.update_piston_state(x, y, z, block_id);
             }
             blocks::STEP if y > 0 && self.get_block(x, y - 1, z) == blocks::STEP => {
                 // BlockStep.c: merge onto matching bottom slab
@@ -2601,6 +2828,162 @@ impl World {
             }
         }
         self.world_random = rng;
+    }
+
+    fn is_ray_hittable(id: u8, meta: u8, hit_liquids: bool) -> bool {
+        if id == blocks::AIR || id == blocks::FIRE || id == blocks::PORTAL {
+            return false;
+        }
+        if blocks::is_liquid(id) {
+            return hit_liquids && meta == 0;
+        }
+        true
+    }
+
+    /// Java `World.rayTrace(Vec3D, Vec3D, boolean)` — 3D voxel DDA raytrace.
+    pub fn ray_trace(
+        &self,
+        start: (f64, f64, f64),
+        end: (f64, f64, f64),
+        hit_liquids: bool,
+    ) -> Option<(i32, i32, i32, u8)> {
+        let (mut x0, mut y0, mut z0) = start;
+        let (x1, y1, z1) = end;
+        if x0.is_nan() || y0.is_nan() || z0.is_nan() || x1.is_nan() || y1.is_nan() || z1.is_nan() {
+            return None;
+        }
+
+        let target_x = x1.floor() as i32;
+        let target_y = y1.floor() as i32;
+        let target_z = z1.floor() as i32;
+        let mut cur_x = x0.floor() as i32;
+        let mut cur_y = y0.floor() as i32;
+        let mut cur_z = z0.floor() as i32;
+
+        let init_id = self.get_block(cur_x, cur_y, cur_z);
+        let init_meta = self.get_data(cur_x, cur_y, cur_z);
+        if Self::is_ray_hittable(init_id, init_meta, hit_liquids) {
+            return Some((cur_x, cur_y, cur_z, 1));
+        }
+
+        for _ in 0..200 {
+            if x0.is_nan() || y0.is_nan() || z0.is_nan() {
+                return None;
+            }
+            if cur_x == target_x && cur_y == target_y && cur_z == target_z {
+                return None;
+            }
+
+            let mut has_x = true;
+            let mut has_y = true;
+            let mut has_z = true;
+            let mut next_bx = 999.0;
+            let mut next_by = 999.0;
+            let mut next_bz = 999.0;
+
+            if target_x > cur_x {
+                next_bx = cur_x as f64 + 1.0;
+            } else if target_x < cur_x {
+                next_bx = cur_x as f64;
+            } else {
+                has_x = false;
+            }
+
+            if target_y > cur_y {
+                next_by = cur_y as f64 + 1.0;
+            } else if target_y < cur_y {
+                next_by = cur_y as f64;
+            } else {
+                has_y = false;
+            }
+
+            if target_z > cur_z {
+                next_bz = cur_z as f64 + 1.0;
+            } else if target_z < cur_z {
+                next_bz = cur_z as f64;
+            } else {
+                has_z = false;
+            }
+
+            let dx = x1 - x0;
+            let dy = y1 - y0;
+            let dz = z1 - z0;
+            let tx = if has_x { (next_bx - x0) / dx } else { 999.0 };
+            let ty = if has_y { (next_by - y0) / dy } else { 999.0 };
+            let tz = if has_z { (next_bz - z0) / dz } else { 999.0 };
+
+            let face: u8;
+            if tx < ty && tx < tz {
+                face = if target_x > cur_x { 4 } else { 5 };
+                x0 = next_bx;
+                y0 += dy * tx;
+                z0 += dz * tx;
+            } else if ty < tz {
+                face = if target_y > cur_y { 0 } else { 1 };
+                x0 += dx * ty;
+                y0 = next_by;
+                z0 += dz * ty;
+            } else {
+                face = if target_z > cur_z { 2 } else { 3 };
+                x0 += dx * tz;
+                y0 += dy * tz;
+                z0 = next_bz;
+            }
+
+            cur_x = x0.floor() as i32;
+            if face == 5 {
+                cur_x -= 1;
+            }
+            cur_y = y0.floor() as i32;
+            if face == 1 {
+                cur_y -= 1;
+            }
+            cur_z = z0.floor() as i32;
+            if face == 3 {
+                cur_z -= 1;
+            }
+
+            let id = self.get_block(cur_x, cur_y, cur_z);
+            let meta = self.get_data(cur_x, cur_y, cur_z);
+            if Self::is_ray_hittable(id, meta, hit_liquids) {
+                return Some((cur_x, cur_y, cur_z, face));
+            }
+        }
+
+        None
+    }
+
+    /// Raytrace from a player's eye position (`y + 1.62`) along `(yaw, pitch)` for `distance` blocks,
+    /// matching `ItemBoat.a` and `ItemBucket.a`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ray_trace_from_player(
+        &self,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        distance: f64,
+        hit_liquids: bool,
+    ) -> Option<(i32, i32, i32, u8)> {
+        let eye_y = y + 1.62;
+        let deg_to_rad = 0.017_453_292_f32;
+        let f3 = (-yaw * deg_to_rad - std::f32::consts::PI).cos();
+        let f4 = (-yaw * deg_to_rad - std::f32::consts::PI).sin();
+        let f5 = -(-pitch * deg_to_rad).cos();
+        let f6 = (-pitch * deg_to_rad).sin();
+        let dir_x = (f4 * f5) as f64;
+        let dir_y = f6 as f64;
+        let dir_z = (f3 * f5) as f64;
+        self.ray_trace(
+            (x, eye_y, z),
+            (
+                x + dir_x * distance,
+                eye_y + dir_y * distance,
+                z + dir_z * distance,
+            ),
+            hit_liquids,
+        )
     }
 }
 

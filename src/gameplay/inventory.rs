@@ -165,6 +165,19 @@ impl InventoryPlayer {
         false
     }
 
+    pub fn consume_item(&mut self, item_id: i16) -> bool {
+        for slot in &mut self.items {
+            if let Some(mut stack) = *slot {
+                if stack.id == item_id && stack.count > 0 {
+                    stack.count -= 1;
+                    *slot = if stack.count > 0 { Some(stack) } else { None };
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn damage_held_on_block_break(&mut self, block_id: u8) -> bool {
         let slot = self.held_slot.min(8);
         if let Some(mut stack) = self.items[slot] {

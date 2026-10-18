@@ -295,7 +295,15 @@ impl Chunk {
         crate::world::lighting::init_chunk_lighting(self);
     }
 
+    pub fn set_subchunk_sky_light_fill(&mut self, sub_idx: usize, fill: u8) {
+        if sub_idx < SUB_CHUNK_COUNT {
+            self.sub_chunks[sub_idx].sky_light.fill = fill & 15;
+            self.sub_chunks[sub_idx].sky_light.data = None;
+        }
+    }
+
     pub fn compact(&mut self) {
+        self.tile_entities.shrink_to_fit();
         for section in &mut self.sub_chunks {
             section.blocks.compact();
             section.metadata.compact();

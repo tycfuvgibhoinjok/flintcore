@@ -68,6 +68,9 @@ async fn read_loop(
         if consumed > 0 {
             buffer.drain(..consumed);
             consumed = 0;
+            if buffer.capacity() > 16384 && buffer.len() <= 4096 {
+                buffer.shrink_to(8192);
+            }
         }
         let read_count = read.read(&mut chunk).await?;
         if read_count == 0 {

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::entity::mob::{Mob, MobType};
 use crate::entity::player::Player;
+use crate::entity::projectile::{Minecart, Painting, PrimedTnt, Projectile, ProjectileKind};
 use crate::gameplay::items::ItemStack;
 use crate::net::ConnId;
 use crate::world::chunk::ChunkPos;
@@ -28,12 +30,51 @@ impl DroppedItem {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Boat {
+    pub entity_id: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub prev_x: f64,
+    pub prev_y: f64,
+    pub prev_z: f64,
+    pub mot_x: f64,
+    pub mot_y: f64,
+    pub mot_z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub damage: i32,
+    pub time_since_hit: i32,
+    pub rock_direction: i32,
+    pub passenger_id: Option<i32>,
+    pub on_ground: bool,
+    pub dead: bool,
+}
+
+impl Boat {
+    pub fn chunk_pos(&self) -> ChunkPos {
+        ChunkPos::new((self.x as i32) >> 4, (self.z as i32) >> 4)
+    }
+
+    /// Java `EntityBoat.m()`: passenger vertical offset `-0.3`.
+    pub fn mounted_y_offset(&self) -> f64 {
+        -0.30000001192092896
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct EntityStore {
     players: HashMap<i32, Player>,
     conn_to_entity: HashMap<ConnId, i32>,
     chunk_index: HashMap<ChunkPos, HashSet<i32>>,
     dropped_items: HashMap<i32, DroppedItem>,
+    boats: HashMap<i32, Boat>,
+    mobs: HashMap<i32, Mob>,
+    projectiles: HashMap<i32, Projectile>,
+    primed_tnts: HashMap<i32, PrimedTnt>,
+    minecarts: HashMap<i32, Minecart>,
+    paintings: HashMap<i32, Painting>,
     next_id: i32,
 }
 
@@ -44,6 +85,12 @@ impl EntityStore {
             conn_to_entity: HashMap::new(),
             chunk_index: HashMap::new(),
             dropped_items: HashMap::new(),
+            boats: HashMap::new(),
+            mobs: HashMap::new(),
+            projectiles: HashMap::new(),
+            primed_tnts: HashMap::new(),
+            minecarts: HashMap::new(),
+            paintings: HashMap::new(),
             next_id: 1,
         }
     }
@@ -223,6 +270,289 @@ impl EntityStore {
             }
         });
         removed
+    }
+
+    /// Spawn a new `EntityBoat` at `(x, y, z)`.
+    pub fn spawn_boat(&mut self, x: f64, y: f64, z: f64) -> i32 {
+        let entity_id = self.allocate_id();
+        let boat = Boat {
+            entity_id,
+            x,
+            y,
+            z,
+            prev_x: x,
+            prev_y: y,
+            prev_z: z,
+            mot_x: 0.0,
+            mot_y: 0.0,
+            mot_z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            damage: 0,
+            time_since_hit: 0,
+            rock_direction: 1,
+            passenger_id: None,
+            on_ground: false,
+            dead: false,
+        };
+        self.boats.insert(entity_id, boat);
+        entity_id
+    }
+
+    pub fn get_boat(&self, entity_id: i32) -> Option<&Boat> {
+        self.boats.get(&entity_id)
+    }
+
+    pub fn get_boat_mut(&mut self, entity_id: i32) -> Option<&mut Boat> {
+        self.boats.get_mut(&entity_id)
+    }
+
+    pub fn remove_boat(&mut self, entity_id: i32) -> Option<Boat> {
+        self.boats.remove(&entity_id)
+    }
+
+    pub fn iter_boats(&self) -> impl Iterator<Item = &Boat> {
+        self.boats.values()
+    }
+
+    pub fn iter_boats_mut(&mut self) -> impl Iterator<Item = &mut Boat> {
+        self.boats.values_mut()
+    }
+
+    // ---------------------------------------------------------------------
+    // Mobs
+    // ---------------------------------------------------------------------
+
+    pub fn spawn_mob(&mut self, mob_type: MobType, x: f64, y: f64, z: f64, seed: i64) -> i32 {
+        let entity_id = self.allocate_id();
+        let mob = Mob::new(entity_id, mob_type, x, y, z, seed);
+        self.mobs.insert(entity_id, mob);
+        entity_id
+    }
+
+    pub fn insert_mob(&mut self, mob: Mob) -> i32 {
+        let id = mob.entity_id;
+        self.mobs.insert(id, mob);
+        id
+    }
+
+    pub fn get_mob(&self, entity_id: i32) -> Option<&Mob> {
+        self.mobs.get(&entity_id)
+    }
+
+    pub fn get_mob_mut(&mut self, entity_id: i32) -> Option<&mut Mob> {
+        self.mobs.get_mut(&entity_id)
+    }
+
+    pub fn remove_mob(&mut self, entity_id: i32) -> Option<Mob> {
+        self.mobs.remove(&entity_id)
+    }
+
+    pub fn iter_mobs(&self) -> impl Iterator<Item = &Mob> {
+        self.mobs.values()
+    }
+
+    pub fn iter_mobs_mut(&mut self) -> impl Iterator<Item = &mut Mob> {
+        self.mobs.values_mut()
+    }
+
+    pub fn count_mob_categories(&self) -> (usize, usize, usize) {
+        let mut monsters = 0;
+        let mut animals = 0;
+        let mut water = 0;
+        for m in self.mobs.values() {
+            if m.dead {
+                continue;
+            }
+            if m.mob_type.is_monster() {
+                monsters += 1;
+            } else if m.mob_type.is_animal() {
+                animals += 1;
+            } else if m.mob_type.is_water_animal() {
+                water += 1;
+            }
+        }
+        (monsters, animals, water)
+    }
+
+    // ---------------------------------------------------------------------
+    // Projectiles, PrimedTnt, Minecarts, Paintings
+    // ---------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_projectile(
+        &mut self,
+        kind: ProjectileKind,
+        shooter_id: Option<i32>,
+        shooter_is_skeleton: bool,
+        from_player: bool,
+        x: f64,
+        y: f64,
+        z: f64,
+        mot_x: f64,
+        mot_y: f64,
+        mot_z: f64,
+    ) -> i32 {
+        let entity_id = self.allocate_id();
+        let proj = Projectile {
+            entity_id,
+            kind,
+            shooter_id,
+            shooter_is_skeleton,
+            x,
+            y,
+            z,
+            mot_x,
+            mot_y,
+            mot_z,
+            accel_x: mot_x * 0.1,
+            accel_y: mot_y * 0.1,
+            accel_z: mot_z * 0.1,
+            yaw: 0.0,
+            pitch: 0.0,
+            in_ground: false,
+            ticks_in_ground: 0,
+            ticks_in_air: 0,
+            catch_ticks: 0,
+            hooked_entity: None,
+            from_player,
+            dead: false,
+        };
+        self.projectiles.insert(entity_id, proj);
+        entity_id
+    }
+
+    pub fn get_projectile(&self, entity_id: i32) -> Option<&Projectile> {
+        self.projectiles.get(&entity_id)
+    }
+
+    pub fn get_projectile_mut(&mut self, entity_id: i32) -> Option<&mut Projectile> {
+        self.projectiles.get_mut(&entity_id)
+    }
+
+    pub fn remove_projectile(&mut self, entity_id: i32) -> Option<Projectile> {
+        self.projectiles.remove(&entity_id)
+    }
+
+    pub fn iter_projectiles(&self) -> impl Iterator<Item = &Projectile> {
+        self.projectiles.values()
+    }
+
+    pub fn iter_projectiles_mut(&mut self) -> impl Iterator<Item = &mut Projectile> {
+        self.projectiles.values_mut()
+    }
+
+    pub fn spawn_primed_tnt(&mut self, x: f64, y: f64, z: f64, fuse: i32) -> i32 {
+        let entity_id = self.allocate_id();
+        let angle = (entity_id as f64) * 1.1;
+        let tnt = PrimedTnt {
+            entity_id,
+            x,
+            y,
+            z,
+            mot_x: -angle.sin() * 0.02,
+            mot_y: 0.2,
+            mot_z: -angle.cos() * 0.02,
+            fuse,
+            on_ground: false,
+            dead: false,
+        };
+        self.primed_tnts.insert(entity_id, tnt);
+        entity_id
+    }
+
+    pub fn get_primed_tnt(&self, entity_id: i32) -> Option<&PrimedTnt> {
+        self.primed_tnts.get(&entity_id)
+    }
+
+    pub fn get_primed_tnt_mut(&mut self, entity_id: i32) -> Option<&mut PrimedTnt> {
+        self.primed_tnts.get_mut(&entity_id)
+    }
+
+    pub fn remove_primed_tnt(&mut self, entity_id: i32) -> Option<PrimedTnt> {
+        self.primed_tnts.remove(&entity_id)
+    }
+
+    pub fn iter_primed_tnts(&self) -> impl Iterator<Item = &PrimedTnt> {
+        self.primed_tnts.values()
+    }
+
+    pub fn iter_primed_tnts_mut(&mut self) -> impl Iterator<Item = &mut PrimedTnt> {
+        self.primed_tnts.values_mut()
+    }
+
+    pub fn spawn_minecart(&mut self, cart_type: u8, x: f64, y: f64, z: f64) -> i32 {
+        let entity_id = self.allocate_id();
+        let cart = Minecart {
+            entity_id,
+            cart_type,
+            x,
+            y,
+            z,
+            mot_x: 0.0,
+            mot_y: 0.0,
+            mot_z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            damage: 0,
+            time_since_hit: 0,
+            fuel: 0,
+            push_x: 0.0,
+            push_z: 0.0,
+            passenger_id: None,
+            cargo: [None; 27],
+            on_ground: false,
+            dead: false,
+        };
+        self.minecarts.insert(entity_id, cart);
+        entity_id
+    }
+
+    pub fn get_minecart(&self, entity_id: i32) -> Option<&Minecart> {
+        self.minecarts.get(&entity_id)
+    }
+
+    pub fn get_minecart_mut(&mut self, entity_id: i32) -> Option<&mut Minecart> {
+        self.minecarts.get_mut(&entity_id)
+    }
+
+    pub fn remove_minecart(&mut self, entity_id: i32) -> Option<Minecart> {
+        self.minecarts.remove(&entity_id)
+    }
+
+    pub fn iter_minecarts(&self) -> impl Iterator<Item = &Minecart> {
+        self.minecarts.values()
+    }
+
+    pub fn iter_minecarts_mut(&mut self) -> impl Iterator<Item = &mut Minecart> {
+        self.minecarts.values_mut()
+    }
+
+    pub fn spawn_painting(&mut self, title: String, x: i32, y: i32, z: i32, direction: i32) -> i32 {
+        let entity_id = self.allocate_id();
+        let p = Painting {
+            entity_id,
+            title,
+            x,
+            y,
+            z,
+            direction,
+            dead: false,
+        };
+        self.paintings.insert(entity_id, p);
+        entity_id
+    }
+
+    pub fn get_painting(&self, entity_id: i32) -> Option<&Painting> {
+        self.paintings.get(&entity_id)
+    }
+
+    pub fn remove_painting(&mut self, entity_id: i32) -> Option<Painting> {
+        self.paintings.remove(&entity_id)
+    }
+
+    pub fn iter_paintings(&self) -> impl Iterator<Item = &Painting> {
+        self.paintings.values()
     }
 }
 

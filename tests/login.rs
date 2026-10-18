@@ -1561,3 +1561,406 @@ async fn block_mining_spawns_pickup_and_collects() {
     timeout(Duration::from_secs(5), exchange).await.unwrap();
     harness.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_command_shows_online_players() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client1 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client1, "Alice").await;
+
+        let mut client2 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client2, "Bob").await;
+
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer.write_string("/list", 100).unwrap();
+        client1.write_all(writer.as_slice()).await.unwrap();
+
+        let mut got_list = false;
+        for _ in 0..40 {
+            let id = read_next_non_chunk_packet_id(&mut client1).await;
+            if id == 3 {
+                let msg = read_string(&mut client1).await;
+                if msg.starts_with("Connected players:") {
+                    assert_eq!(msg, "Connected players: Alice, Bob");
+                    got_list = true;
+                    break;
+                }
+            } else if id == 40 {
+                let _ = read_i32(&mut client1).await;
+                let mut meta = [0u8; 3];
+                client1.read_exact(&mut meta).await.unwrap();
+            }
+        }
+        assert!(got_list, "Should receive /list response with Alice and Bob");
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_username_login_is_rejected() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client1 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client1, "SameName").await;
+
+        // Second client tries to log in with "samename" (case-insensitive duplicate)
+        let mut client2 = TcpStream::connect(harness.address).await.unwrap();
+        client2.write_all(&handshake("samename")).await.unwrap();
+        client2.write_all(&login(14, "samename")).await.unwrap();
+
+        assert_eq!(read_u8(&mut client2).await, 2);
+        assert_eq!(read_string(&mut client2).await, "-");
+
+        assert_eq!(read_u8(&mut client2).await, 255);
+        let reason = read_string(&mut client2).await;
+        assert!(
+            reason.contains("already online"),
+            "Expected duplicate login kick, got: {reason}"
+        );
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respawn_re_spawns_players_for_each_other() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client1 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client1, "Hero1").await;
+
+        let mut client2 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client2, "Hero2").await;
+
+        // Wait for initial tracking tick
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Hero1 dies via /kill and then sends Packet9Respawn
+        let mut kill_writer = Writer::new();
+        kill_writer.write_u8(3);
+        kill_writer.write_string("/kill", 100).unwrap();
+        client1.write_all(kill_writer.as_slice()).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut respawn_writer = Writer::new();
+        respawn_writer.write_u8(9);
+        respawn_writer.write_i8(0);
+        client1.write_all(respawn_writer.as_slice()).await.unwrap();
+
+        // Hero2 must receive DestroyEntity(1) AND a fresh NamedEntitySpawn(1, "Hero1")!
+        let mut saw_destroy = false;
+        let mut saw_respawn_entity = false;
+        for _ in 0..80 {
+            let id = read_u8(&mut client2).await;
+            match id {
+                0 => {}
+                3 => {
+                    let _ = read_string(&mut client2).await;
+                }
+                5 => {
+                    let _ = (
+                        read_i32(&mut client2).await,
+                        read_i16(&mut client2).await,
+                        read_i16(&mut client2).await,
+                        read_i16(&mut client2).await,
+                    );
+                }
+                20 => {
+                    let eid = read_i32(&mut client2).await;
+                    let name = read_string(&mut client2).await;
+                    let _ = (
+                        read_i32(&mut client2).await,
+                        read_i32(&mut client2).await,
+                        read_i32(&mut client2).await,
+                        read_u8(&mut client2).await,
+                        read_u8(&mut client2).await,
+                        read_i16(&mut client2).await,
+                    );
+                    if eid == 1 && name == "Hero1" && saw_destroy {
+                        saw_respawn_entity = true;
+                        break;
+                    }
+                }
+                29 => {
+                    let eid = read_i32(&mut client2).await;
+                    if eid == 1 {
+                        saw_destroy = true;
+                    }
+                }
+                38 => {
+                    let _ = (read_i32(&mut client2).await, read_u8(&mut client2).await);
+                }
+                40 => {
+                    let _ = read_i32(&mut client2).await;
+                    let mut meta = [0u8; 3];
+                    client2.read_exact(&mut meta).await.unwrap();
+                }
+                50 => {
+                    let _ = (
+                        read_i32(&mut client2).await,
+                        read_i32(&mut client2).await,
+                        read_u8(&mut client2).await,
+                    );
+                }
+                51 => {
+                    let _ = (
+                        read_i32(&mut client2).await,
+                        read_i16(&mut client2).await,
+                        read_i32(&mut client2).await,
+                        read_u8(&mut client2).await,
+                        read_u8(&mut client2).await,
+                        read_u8(&mut client2).await,
+                    );
+                    let len = read_i32(&mut client2).await as usize;
+                    let mut comp = vec![0u8; len];
+                    client2.read_exact(&mut comp).await.unwrap();
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_destroy && saw_respawn_entity,
+            "Hero2 must see Hero1 DestroyEntity followed by NamedEntitySpawn on respawn"
+        );
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boat_placement_and_mounting() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "Sailor").await;
+
+        // Move Sailor outside spawn protection to (20.5, 70.0, 0.5)
+        let mut move_writer = Writer::new();
+        move_writer.write_u8(11);
+        move_writer.write_f64(20.5);
+        move_writer.write_f64(70.0);
+        move_writer.write_f64(71.62);
+        move_writer.write_f64(0.5);
+        move_writer.write_bool(true);
+        client.write_all(move_writer.as_slice()).await.unwrap();
+
+        // Place Boat (item 333) on block (20, 69, 0) face 1
+        let mut place_writer = Writer::new();
+        place_writer.write_u8(15);
+        place_writer.write_i32(20);
+        place_writer.write_u8(69);
+        place_writer.write_i32(0);
+        place_writer.write_u8(1);
+        place_writer.write_i16(333);
+        place_writer.write_u8(1);
+        place_writer.write_i16(0);
+        client.write_all(place_writer.as_slice()).await.unwrap();
+
+        let mut boat_entity_id = None;
+        for _ in 0..80 {
+            let id = read_u8(&mut client).await;
+            match id {
+                0 => {}
+                23 => {
+                    // VehicleSpawn!
+                    let eid = read_i32(&mut client).await;
+                    let vtype = read_u8(&mut client).await;
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                    );
+                    let thrower = read_i32(&mut client).await;
+                    if thrower > 0 {
+                        let _ = (
+                            read_i16(&mut client).await,
+                            read_i16(&mut client).await,
+                            read_i16(&mut client).await,
+                        );
+                    }
+                    assert_eq!(vtype, 1, "Boat VehicleSpawn type must be 1");
+                    boat_entity_id = Some(eid);
+                    break;
+                }
+                28 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i16(&mut client).await,
+                    );
+                }
+                50 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                51 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                    let len = read_i32(&mut client).await as usize;
+                    let mut comp = vec![0u8; len];
+                    client.read_exact(&mut comp).await.unwrap();
+                }
+                53 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                103 => {
+                    let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+                    let item = read_i16(&mut client).await;
+                    if item >= 0 {
+                        let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let boat_id = boat_entity_id.expect("Should receive VehicleSpawn (23) for placed boat");
+
+        // Right-click boat (UseEntity 7, attack = false) to mount it
+        let mut use_writer = Writer::new();
+        use_writer.write_u8(7);
+        use_writer.write_i32(1);
+        use_writer.write_i32(boat_id);
+        use_writer.write_bool(false);
+        client.write_all(use_writer.as_slice()).await.unwrap();
+
+        let mut got_attach = false;
+        for _ in 0..80 {
+            let id = read_u8(&mut client).await;
+            match id {
+                0 => {}
+                13 => {
+                    let _ = (
+                        read_f64(&mut client).await,
+                        read_f64(&mut client).await,
+                        read_f64(&mut client).await,
+                        read_f64(&mut client).await,
+                        read_f32(&mut client).await,
+                        read_f32(&mut client).await,
+                        read_bool(&mut client).await,
+                    );
+                }
+                18 => {
+                    let _ = (read_i32(&mut client).await, read_u8(&mut client).await);
+                }
+                28 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i16(&mut client).await,
+                    );
+                }
+                31 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                32 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                33 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                34 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                39 => {
+                    let rider = read_i32(&mut client).await;
+                    let vehicle = read_i32(&mut client).await;
+                    assert_eq!(rider, 1);
+                    assert_eq!(vehicle, boat_id);
+                    got_attach = true;
+                    break;
+                }
+                50 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                51 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_i16(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                    let len = read_i32(&mut client).await as usize;
+                    let mut comp = vec![0u8; len];
+                    client.read_exact(&mut comp).await.unwrap();
+                }
+                53 => {
+                    let _ = (
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_i32(&mut client).await,
+                        read_u8(&mut client).await,
+                        read_u8(&mut client).await,
+                    );
+                }
+                103 => {
+                    let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+                    let item = read_i16(&mut client).await;
+                    if item >= 0 {
+                        let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            got_attach,
+            "Should receive AttachEntity (39) when mounting boat"
+        );
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}

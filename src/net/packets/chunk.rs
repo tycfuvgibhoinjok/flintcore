@@ -42,11 +42,18 @@ pub struct MapChunk {
     pub compressed: Vec<u8>,
 }
 
+thread_local! {
+    static CHUNK_PAYLOAD_BUF: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(Vec::with_capacity(crate::world::chunk::PAYLOAD_LEN));
+}
+
 impl MapChunk {
     pub fn from_chunk(chunk: &Chunk) -> Result<Self> {
-        let mut payload = Vec::new();
-        chunk.write_payload(&mut payload);
-        let compressed = deflate_zlib(&payload, CHUNK_DEFLATE_LEVEL)?;
+        let compressed = CHUNK_PAYLOAD_BUF.with(|cell| {
+            let mut payload = cell.borrow_mut();
+            chunk.write_payload(&mut payload);
+            deflate_zlib(&payload, CHUNK_DEFLATE_LEVEL)
+        })?;
         Ok(Self {
             x: chunk.pos.x * 16,
             y: 0,

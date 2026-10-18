@@ -27,6 +27,7 @@ const NEIGHBORS: [(i32, i32, i32); 6] = [
 ];
 
 pub fn init_chunk_lighting(chunk: &mut Chunk) {
+    let mut max_height = 0usize;
     for x in 0..CHUNK_WIDTH {
         for z in 0..CHUNK_WIDTH {
             let mut height = CHUNK_HEIGHT as i32 - 1;
@@ -36,9 +37,28 @@ pub fn init_chunk_lighting(chunk: &mut Chunk) {
                 height -= 1;
             }
             chunk.height_map[(z << 4) | x] = height as u8;
+            if (height as usize) > max_height {
+                max_height = height as usize;
+            }
+        }
+    }
 
+    // Any sub-chunk completely at or above `max_height` has uniform sky_light = 15.
+    // Setting its fill directly avoids allocating `Box<[u8; 2048]>` for air subchunks.
+    let first_full_air_sub = max_height.div_ceil(16);
+    for sub in first_full_air_sub..(CHUNK_HEIGHT / 16) {
+        chunk.set_subchunk_sky_light_fill(sub, 15);
+    }
+
+    let top_y = (first_full_air_sub * 16).min(CHUNK_HEIGHT) as i32 - 1;
+    if top_y <= 0 {
+        return;
+    }
+
+    for x in 0..CHUNK_WIDTH {
+        for z in 0..CHUNK_WIDTH {
             let mut level = 15i32;
-            let mut y = CHUNK_HEIGHT as i32 - 1;
+            let mut y = top_y;
             loop {
                 level -= blocks::light_opacity(chunk.get_block(x, y as usize, z)) as i32;
                 if level > 0 {

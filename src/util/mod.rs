@@ -32,3 +32,18 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Return free heap pages from the allocator arenas back to the OS kernel on Linux (`glibc`).
+pub fn trim_heap_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: `malloc_trim(0)` is thread-safe in glibc and only releases unused
+        // top-of-heap / arena pages back to the kernel without invalidating live pointers.
+        unsafe {
+            let _ = malloc_trim(0);
+        }
+    }
+}

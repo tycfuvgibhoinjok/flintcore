@@ -313,10 +313,12 @@ impl World {
         let chunk = self.chunks.get_mut(&pos).unwrap();
         chunk.state = ChunkState::Populated;
         chunk.dirty = true;
-        chunk.compact();
         for dz in 0..=1 {
             for dx in 0..=1 {
                 let cpos = ChunkPos::new(pos.x + dx, pos.z + dz);
+                if let Some(c) = self.chunks.get_mut(&cpos) {
+                    c.compact();
+                }
                 self.packet_cache.borrow_mut().remove(&cpos);
                 if self.live.instances.contains_key(&cpos) {
                     let entry = self.live.dirty_chunks.entry(cpos).or_default();
@@ -551,6 +553,7 @@ impl World {
     /// chunks from `unloadQueue` without advancing world time or running
     /// scheduled ticks).
     pub fn live_unload_chunks(&mut self) {
+        let mut unloaded = 0usize;
         for _ in 0..50 {
             let Some(pos) = self.live.unload_queue.pop_front() else {
                 break;
@@ -567,11 +570,21 @@ impl World {
             self.chunks.remove(&pos);
             self.packet_cache.borrow_mut().remove(&pos);
             self.live.dirty_chunks.remove(&pos);
+            self.light_dirty_chunks.remove(&pos);
             if let Some((cx, cz, _)) = self.live.last_access.get() {
                 if cx == pos.x && cz == pos.z {
                     self.live.last_access.set(None);
                 }
             }
+            unloaded += 1;
+        }
+        if unloaded > 0 && self.live.unload_queue.is_empty() {
+            if self.chunks.capacity() > self.chunks.len() * 2 + 64 {
+                self.chunks.shrink_to_fit();
+            }
+            self.live.unload_queue.shrink_to_fit();
+            self.packet_cache.borrow_mut().shrink_to_fit();
+            crate::util::trim_heap_memory();
         }
     }
 

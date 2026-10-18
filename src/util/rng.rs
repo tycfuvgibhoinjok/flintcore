@@ -2,6 +2,7 @@ const MULTIPLIER: u64 = 0x5DEECE66D;
 const ADDEND: u64 = 0xB;
 const MASK: u64 = (1 << 48) - 1;
 
+#[derive(Debug, Clone)]
 pub struct JavaRandom {
     seed: u64,
 }

@@ -47,6 +47,25 @@ impl Biome {
         }
     }
 
+    pub fn from_id(id: u8) -> Self {
+        match id {
+            0 => Biome::Rainforest,
+            1 => Biome::Swampland,
+            2 => Biome::SeasonalForest,
+            3 => Biome::Forest,
+            4 => Biome::Savanna,
+            5 => Biome::Shrubland,
+            6 => Biome::Taiga,
+            7 => Biome::Desert,
+            8 => Biome::Plains,
+            9 => Biome::IceDesert,
+            10 => Biome::Tundra,
+            11 => Biome::Hell,
+            12 => Biome::Sky,
+            _ => Biome::Plains,
+        }
+    }
+
     pub fn top_block(self) -> u8 {
         match self {
             Biome::Desert | Biome::IceDesert => blocks::SAND,
