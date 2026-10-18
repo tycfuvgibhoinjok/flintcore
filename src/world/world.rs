@@ -659,6 +659,29 @@ impl World {
         Ok(())
     }
 
+    /// Java `ChunkProviderServer.saveChunks(false, null)` — save up to `max_chunks` dirty chunks per call.
+    pub fn save_chunks_incremental(&mut self, max_chunks: usize) -> Result<usize> {
+        let mut saved = 0usize;
+        if let Some(storage) = &self.storage {
+            let time = self.level_data.borrow().time;
+            for (&pos, chunk) in &mut self.chunks {
+                if chunk.dirty {
+                    let nbt = ChunkLoader::chunk_to_nbt(chunk, time);
+                    storage.borrow_mut().write_chunk(pos.x, pos.z, &nbt)?;
+                    chunk.dirty = false;
+                    saved += 1;
+                    if saved >= max_chunks {
+                        break;
+                    }
+                }
+            }
+            if saved > 0 {
+                self.level_data.borrow_mut().save_to_dir(&self.world_dir)?;
+            }
+        }
+        Ok(saved)
+    }
+
     pub fn generate_base_chunks_parallel(&mut self, positions: &[ChunkPos]) {
         let needed: Vec<ChunkPos> = positions
             .iter()
@@ -2835,7 +2858,7 @@ impl World {
                     self.packet_cache.borrow_mut().remove(&p);
                     if self.live.instances.contains_key(&p) {
                         let entry = self.live.dirty_chunks.entry(p).or_default();
-                        entry.count = 10;
+                        entry.full_resync = true;
                     }
                 }
             }

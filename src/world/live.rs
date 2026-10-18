@@ -34,6 +34,7 @@ use crate::world::world::{with_generator, World};
 pub struct DirtyChunk {
     pub blocks: [u16; 64],
     pub count: usize,
+    pub full_resync: bool,
 }
 
 impl Default for DirtyChunk {
@@ -41,6 +42,7 @@ impl Default for DirtyChunk {
         Self {
             blocks: [0; 64],
             count: 0,
+            full_resync: false,
         }
     }
 }
@@ -326,12 +328,13 @@ impl World {
             for dx in 0..=1 {
                 let cpos = ChunkPos::new(pos.x + dx, pos.z + dz);
                 if let Some(c) = self.chunks.get_mut(&cpos) {
+                    c.dirty = true;
                     c.compact();
                 }
                 self.packet_cache.borrow_mut().remove(&cpos);
                 if self.live.instances.contains_key(&cpos) {
                     let entry = self.live.dirty_chunks.entry(cpos).or_default();
-                    entry.count = 10;
+                    entry.full_resync = true;
                 }
             }
         }
@@ -469,11 +472,15 @@ impl World {
         self.packet_cache.borrow_mut().remove(&pos);
         if self.live.instances.contains_key(&pos) {
             let entry = self.live.dirty_chunks.entry(pos).or_default();
-            if entry.count < 64 {
-                let short1 = (((x & 15) as u16) << 12) | (((z & 15) as u16) << 8) | (y as u16);
-                if !entry.blocks[..entry.count].contains(&short1) {
-                    entry.blocks[entry.count] = short1;
-                    entry.count += 1;
+            if !entry.full_resync {
+                if entry.count < 64 {
+                    let short1 = (((x & 15) as u16) << 12) | (((z & 15) as u16) << 8) | (y as u16);
+                    if !entry.blocks[..entry.count].contains(&short1) {
+                        entry.blocks[entry.count] = short1;
+                        entry.count += 1;
+                    }
+                } else {
+                    entry.full_resync = true;
                 }
             }
         }
@@ -484,7 +491,7 @@ impl World {
         let dirty = std::mem::take(&mut self.live.dirty_chunks);
         let mut out = Vec::with_capacity(dirty.len());
         for (pos, entry) in dirty {
-            if entry.count > 0 {
+            if entry.full_resync || entry.count > 0 {
                 if let Some(watchers) = self.live.instances.get(&pos) {
                     out.push((pos, entry, watchers.iter().copied().collect()));
                 }
@@ -507,10 +514,12 @@ impl World {
     /// `PlayerManager.a(i, j, true)` + `PlayerInstance.a(player)`: create the
     /// instance (loading the chunk) if needed and register the player.
     fn instance_add(&mut self, pos: ChunkPos, id: u64) {
-        if !self.live.instances.contains_key(&pos) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.live.instances.entry(pos) {
+            e.insert(BTreeSet::new());
             // `new PlayerInstance(...)` loads through the provider.
             self.server_get_chunk_at(pos);
-            self.live.instances.insert(pos, BTreeSet::new());
+        } else if !self.chunks.contains_key(&pos) {
+            self.server_get_chunk_at(pos);
         }
         if self.live.instances.get_mut(&pos).unwrap().insert(id) {
             self.live.player_added.entry(id).or_default().push(pos);
@@ -719,5 +728,45 @@ mod tests {
         // `world.chunks` and `world.packet_cache` must stay strictly bounded to 25!
         assert_eq!(world.chunk_count(), 25);
         assert!(world.packet_cache.borrow().len() <= 25);
+    }
+
+    #[test]
+    fn border_chunk_population_marks_full_resync_for_tree_borders() {
+        let config = WorldConfig {
+            seed: 100,
+            save_enabled: false,
+            view_distance: 2,
+            ..Default::default()
+        };
+        let mut world = World::new(config);
+        world.live_enable();
+
+        world.live_player_join(1, 8.0, 8.0);
+        // Clear initial dirty records from join
+        let _ = world.take_dirty_chunks();
+
+        // At join around (0, 0) with view_distance = 2, chunk (2, 0) is on the +X border
+        // and is NOT populated yet because (3, 0) is not loaded.
+        assert_eq!(
+            world.get_chunk(ChunkPos::new(2, 0)).unwrap().state,
+            ChunkState::Generated
+        );
+
+        // Player walks East into chunk (1, 0) -> loads column x = 3, which populates (2, 0)
+        world.live_player_move(1, 24.0, 8.0);
+        assert_eq!(
+            world.get_chunk(ChunkPos::new(2, 0)).unwrap().state,
+            ChunkState::Populated
+        );
+
+        let dirty = world.take_dirty_chunks();
+        let resynced: std::collections::HashSet<ChunkPos> = dirty
+            .into_iter()
+            .filter(|(_, d, _)| d.full_resync)
+            .map(|(pos, _, _)| pos)
+            .collect();
+        // Both (2, 0) and (3, 0) must be marked full_resync so trees crossing chunk borders are never sliced!
+        assert!(resynced.contains(&ChunkPos::new(2, 0)));
+        assert!(resynced.contains(&ChunkPos::new(3, 0)));
     }
 }

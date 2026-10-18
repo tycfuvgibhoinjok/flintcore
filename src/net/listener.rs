@@ -20,7 +20,7 @@ pub async fn run(
         match listener.accept().await {
             Ok((stream, address)) => {
                 let id = next_id.fetch_add(1, Ordering::Relaxed);
-                let (sender, receiver) = mpsc::channel(config.network.outbound_capacity);
+                let (sender, receiver) = mpsc::unbounded_channel();
                 if inbound
                     .send(NetEvent::Connected {
                         id,

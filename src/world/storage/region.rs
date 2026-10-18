@@ -208,22 +208,15 @@ impl RegionFile {
             }
         };
 
-        // Write chunk data at target_sector
+        // Write chunk data at target_sector in a single contiguous syscall
         self.file
             .seek(SeekFrom::Start((target_sector * SECTOR_SIZE) as u64))?;
-        // Length field is payload_len + 1 (the version byte)
         let length_field = (payload_len + 1) as u32;
-        self.file.write_all(&length_field.to_be_bytes())?;
-        self.file.write_all(&[2u8])?; // Version 2 = ZLIB
-        self.file.write_all(&compressed)?;
-
-        // Sector padding
-        let written = 4 + 1 + payload_len;
-        let padding_needed = (sectors_needed * SECTOR_SIZE) - written;
-        if padding_needed > 0 {
-            let pad = vec![0u8; padding_needed];
-            self.file.write_all(&pad)?;
-        }
+        let mut sector_buf = vec![0u8; sectors_needed * SECTOR_SIZE];
+        sector_buf[0..4].copy_from_slice(&length_field.to_be_bytes());
+        sector_buf[4] = 2u8; // Version 2 = ZLIB
+        sector_buf[5..5 + payload_len].copy_from_slice(&compressed);
+        self.file.write_all(&sector_buf)?;
 
         // Update offset and timestamp
         let new_entry = ((target_sector as u32) << 8) | (sectors_needed as u32);

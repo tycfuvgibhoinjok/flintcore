@@ -6,7 +6,7 @@ pub mod protocol;
 
 use std::net::SocketAddr;
 
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::net::packets::Clientbound;
 
@@ -23,7 +23,7 @@ pub enum NetEvent {
     Connected {
         id: ConnId,
         address: SocketAddr,
-        sender: Sender<Outbound>,
+        sender: UnboundedSender<Outbound>,
     },
     Packet {
         id: ConnId,

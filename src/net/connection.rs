@@ -40,7 +40,7 @@ pub async fn serve(
     id: ConnId,
     stream: TcpStream,
     inbound: mpsc::Sender<NetEvent>,
-    outbound: mpsc::Receiver<Outbound>,
+    outbound: mpsc::UnboundedReceiver<Outbound>,
     config: Arc<Config>,
 ) {
     let _ = stream.set_nodelay(config.network.tcp_nodelay);
@@ -103,26 +103,47 @@ async fn read_loop(
     }
 }
 
-async fn write_loop(mut write: OwnedWriteHalf, mut outbound: mpsc::Receiver<Outbound>) {
-    let mut encoder = Writer::with_capacity(4096);
-    while let Some(message) = outbound.recv().await {
-        match message {
+async fn write_loop(mut write: OwnedWriteHalf, mut outbound: mpsc::UnboundedReceiver<Outbound>) {
+    let mut encoder = Writer::with_capacity(65536);
+    while let Some(first) = outbound.recv().await {
+        encoder.clear();
+        let mut should_close = false;
+        match first {
             Outbound::Packet(packet) => {
-                encoder.clear();
                 if packet.encode(&mut encoder).is_err() {
-                    break;
-                }
-                if write.write_all(encoder.as_slice()).await.is_err() {
-                    break;
-                }
-                if write.flush().await.is_err() {
                     break;
                 }
             }
             Outbound::Close => {
-                let _ = write.flush().await;
+                should_close = true;
+            }
+        }
+        while !should_close && encoder.as_slice().len() < 262_144 {
+            match outbound.try_recv() {
+                Ok(Outbound::Packet(packet)) => {
+                    if packet.encode(&mut encoder).is_err() {
+                        should_close = true;
+                        break;
+                    }
+                }
+                Ok(Outbound::Close) => {
+                    should_close = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        if !encoder.as_slice().is_empty() {
+            if write.write_all(encoder.as_slice()).await.is_err() {
                 break;
             }
+            if write.flush().await.is_err() {
+                break;
+            }
+        }
+        if should_close {
+            let _ = write.flush().await;
+            break;
         }
     }
     let _ = write.shutdown().await;

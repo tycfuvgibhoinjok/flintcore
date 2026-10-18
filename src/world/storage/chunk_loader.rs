@@ -25,29 +25,10 @@ impl ChunkLoader {
         let mut sky_light = vec![0u8; 16384];
         let mut block_light = vec![0u8; 16384];
 
-        for x in 0..CHUNK_WIDTH {
-            for z in 0..CHUNK_WIDTH {
-                for y in 0..CHUNK_HEIGHT {
-                    let mcr_idx = (x << 11) | (z << 7) | y;
-                    blocks[mcr_idx] = chunk.get_block(x, y, z);
-
-                    let nibble_idx = mcr_idx >> 1;
-                    let meta = chunk.get_metadata(x, y, z) & 15;
-                    let sky = chunk.get_sky_light(x, y, z) & 15;
-                    let blk = chunk.get_block_light(x, y, z) & 15;
-
-                    if y & 1 == 0 {
-                        data[nibble_idx] = (data[nibble_idx] & 0xF0) | meta;
-                        sky_light[nibble_idx] = (sky_light[nibble_idx] & 0xF0) | sky;
-                        block_light[nibble_idx] = (block_light[nibble_idx] & 0xF0) | blk;
-                    } else {
-                        data[nibble_idx] = (data[nibble_idx] & 0x0F) | (meta << 4);
-                        sky_light[nibble_idx] = (sky_light[nibble_idx] & 0x0F) | (sky << 4);
-                        block_light[nibble_idx] = (block_light[nibble_idx] & 0x0F) | (blk << 4);
-                    }
-                }
-            }
-        }
+        chunk.write_blocks_layer(&mut blocks);
+        chunk.write_nibble_layer(0, &mut data);
+        chunk.write_nibble_layer(1, &mut block_light);
+        chunk.write_nibble_layer(2, &mut sky_light);
 
         level.insert("Blocks", NbtTag::ByteArray(blocks));
         level.insert("Data", NbtTag::ByteArray(data));
@@ -110,27 +91,64 @@ impl ChunkLoader {
             .get_byte_array("BlockLight")
             .ok_or(Error::Malformed("missing BlockLight in chunk"))?;
 
+        // Pre-detect uniform full-sky (0xFF) subchunks to avoid allocating NibbleLayer boxes
+        let mut uniform_sky_15 = [false; 8];
+        if sky_light.len() >= 16384 {
+            for (sub, is_full) in uniform_sky_15.iter_mut().enumerate() {
+                let nibble_y_base = sub * 8;
+                let mut all_ff = true;
+                'check: for x in 0..CHUNK_WIDTH {
+                    for z in 0..CHUNK_WIDTH {
+                        let col_base = (((x << 11) | (z << 7)) >> 1) + nibble_y_base;
+                        if sky_light[col_base..col_base + 8] != [0xFF; 8] {
+                            all_ff = false;
+                            break 'check;
+                        }
+                    }
+                }
+                if all_ff {
+                    chunk.set_subchunk_sky_light_fill(sub, 15);
+                    *is_full = true;
+                }
+            }
+        }
+
         for x in 0..CHUNK_WIDTH {
             for z in 0..CHUNK_WIDTH {
                 for y in 0..CHUNK_HEIGHT {
                     let mcr_idx = (x << 11) | (z << 7) | y;
-                    chunk.set_block(x, y, z, blocks[mcr_idx]);
+                    let b = blocks[mcr_idx];
+                    if b != 0 {
+                        chunk.set_block(x, y, z, b);
+                    }
 
                     let nibble_idx = mcr_idx >> 1;
                     if nibble_idx < data.len() {
                         let byte = data[nibble_idx];
-                        let val = if y & 1 == 0 { byte & 15 } else { byte >> 4 };
-                        chunk.set_metadata(x, y, z, val);
+                        if byte != 0 {
+                            let val = if y & 1 == 0 { byte & 15 } else { byte >> 4 };
+                            if val != 0 {
+                                chunk.set_metadata(x, y, z, val);
+                            }
+                        }
                     }
-                    if nibble_idx < sky_light.len() {
+                    if !uniform_sky_15[y >> 4] && nibble_idx < sky_light.len() {
                         let byte = sky_light[nibble_idx];
-                        let val = if y & 1 == 0 { byte & 15 } else { byte >> 4 };
-                        chunk.set_sky_light(x, y, z, val);
+                        if byte != 0 {
+                            let val = if y & 1 == 0 { byte & 15 } else { byte >> 4 };
+                            if val != 0 {
+                                chunk.set_sky_light(x, y, z, val);
+                            }
+                        }
                     }
                     if nibble_idx < block_light.len() {
                         let byte = block_light[nibble_idx];
-                        let val = if y & 1 == 0 { byte & 15 } else { byte >> 4 };
-                        chunk.set_block_light(x, y, z, val);
+                        if byte != 0 {
+                            let val = if y & 1 == 0 { byte & 15 } else { byte >> 4 };
+                            if val != 0 {
+                                chunk.set_block_light(x, y, z, val);
+                            }
+                        }
                     }
                 }
             }

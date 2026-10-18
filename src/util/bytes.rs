@@ -135,8 +135,8 @@ impl Writer {
 
     pub fn clear(&mut self) {
         self.buffer.clear();
-        if self.buffer.capacity() > 16384 {
-            self.buffer.shrink_to(8192);
+        if self.buffer.capacity() > 131_072 {
+            self.buffer.shrink_to(65536);
         }
     }
 

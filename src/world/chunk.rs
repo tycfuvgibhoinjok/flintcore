@@ -312,68 +312,88 @@ impl Chunk {
         }
     }
 
+    pub fn write_nibble_layer(&self, kind: u8, out_slice: &mut [u8]) {
+        for (sub, section) in self.sub_chunks.iter().enumerate() {
+            let layer = match kind {
+                0 => &section.metadata,
+                1 => &section.block_light,
+                _ => &section.sky_light,
+            };
+            let nibble_y_base = sub * 8;
+            match &layer.data {
+                None => {
+                    let f = layer.fill & 15;
+                    if f != 0 {
+                        let packed = (f << 4) | f;
+                        for x in 0..CHUNK_WIDTH {
+                            for z in 0..CHUNK_WIDTH {
+                                let col_base = (((x << 11) | (z << 7)) >> 1) + nibble_y_base;
+                                out_slice[col_base..col_base + 8].fill(packed);
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    for x in 0..CHUNK_WIDTH {
+                        for z in 0..CHUNK_WIDTH {
+                            let col_base = (((x << 11) | (z << 7)) >> 1) + nibble_y_base;
+                            let zx = (z << 4) | x;
+                            for pair in 0..8 {
+                                let ly0 = pair * 2;
+                                let v0 = layer.get((ly0 << 8) | zx) & 15;
+                                let v1 = layer.get(((ly0 + 1) << 8) | zx) & 15;
+                                out_slice[col_base + pair] = v0 | (v1 << 4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn write_blocks_layer(&self, out_slice: &mut [u8]) {
+        for (sub, section) in self.sub_chunks.iter().enumerate() {
+            let y_base = sub * 16;
+            match &section.blocks.data {
+                None => {
+                    let f = section.blocks.fill;
+                    if f != 0 {
+                        for x in 0..CHUNK_WIDTH {
+                            for z in 0..CHUNK_WIDTH {
+                                let col_base = (x << 11) | (z << 7) | y_base;
+                                out_slice[col_base..col_base + 16].fill(f);
+                            }
+                        }
+                    }
+                }
+                Some(data) => {
+                    for x in 0..CHUNK_WIDTH {
+                        for z in 0..CHUNK_WIDTH {
+                            let col_base = (x << 11) | (z << 7) | y_base;
+                            let zx = (z << 4) | x;
+                            for ly in 0..16 {
+                                out_slice[col_base + ly] = data[(ly << 8) | zx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn write_payload(&self, out: &mut Vec<u8>) {
         out.clear();
-        out.reserve(PAYLOAD_LEN);
+        out.resize(PAYLOAD_LEN, 0);
+        let _ = wire_index(0, 0, 0);
 
-        for x in 0..CHUNK_WIDTH {
-            for z in 0..CHUNK_WIDTH {
-                for y in 0..CHUNK_HEIGHT {
-                    out.push(self.get_block(x, y, z));
-                }
-            }
-        }
-
-        let block_count = out.len();
-        out.resize(block_count + 3 * (CHUNK_VOLUME / 2), 0);
-        let mut nibble_cursor = block_count;
-
-        for x in 0..CHUNK_WIDTH {
-            for z in 0..CHUNK_WIDTH {
-                for y in 0..CHUNK_HEIGHT {
-                    let index = wire_index(x, y, z);
-                    let byte = &mut out[nibble_cursor + (index >> 1)];
-                    let value = self.get_metadata(x, y, z) & 15;
-                    if index & 1 == 0 {
-                        *byte = value;
-                    } else {
-                        *byte = (*byte & 15) | (value << 4);
-                    }
-                }
-            }
-        }
-        nibble_cursor += CHUNK_VOLUME / 2;
-
-        for x in 0..CHUNK_WIDTH {
-            for z in 0..CHUNK_WIDTH {
-                for y in 0..CHUNK_HEIGHT {
-                    let index = wire_index(x, y, z);
-                    let byte = &mut out[nibble_cursor + (index >> 1)];
-                    let value = self.get_block_light(x, y, z) & 15;
-                    if index & 1 == 0 {
-                        *byte = value;
-                    } else {
-                        *byte = (*byte & 15) | (value << 4);
-                    }
-                }
-            }
-        }
-        nibble_cursor += CHUNK_VOLUME / 2;
-
-        for x in 0..CHUNK_WIDTH {
-            for z in 0..CHUNK_WIDTH {
-                for y in 0..CHUNK_HEIGHT {
-                    let index = wire_index(x, y, z);
-                    let byte = &mut out[nibble_cursor + (index >> 1)];
-                    let value = self.get_sky_light(x, y, z) & 15;
-                    if index & 1 == 0 {
-                        *byte = value;
-                    } else {
-                        *byte = (*byte & 15) | (value << 4);
-                    }
-                }
-            }
-        }
+        self.write_blocks_layer(&mut out[0..CHUNK_VOLUME]);
+        let half = CHUNK_VOLUME / 2;
+        self.write_nibble_layer(0, &mut out[CHUNK_VOLUME..CHUNK_VOLUME + half]);
+        self.write_nibble_layer(1, &mut out[CHUNK_VOLUME + half..CHUNK_VOLUME + 2 * half]);
+        self.write_nibble_layer(
+            2,
+            &mut out[CHUNK_VOLUME + 2 * half..CHUNK_VOLUME + 3 * half],
+        );
     }
 }
 
