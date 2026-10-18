@@ -53,11 +53,39 @@ pub struct Server {
 
 impl Server {
     pub fn new(
-        config: Config,
+        mut config: Config,
         inbound: mpsc::Receiver<NetEvent>,
         running: Arc<AtomicBool>,
     ) -> Self {
-        let world = World::new(config.world.clone());
+        let mut world = World::new(config.world.clone());
+        if config.world.save_enabled {
+            world.live_enable();
+            if world.is_fresh_world() {
+                let rng_seed = std::env::var("FLINTCORE_SPAWN_RNG_SEED")
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as i64)
+                            .unwrap_or(config.world.seed)
+                    });
+                let (sx, sz) = world.live_find_spawn(rng_seed);
+                config.world.spawn_x = sx;
+                config.world.spawn_y = 64;
+                config.world.spawn_z = sz;
+            } else {
+                let (sx, sy, sz) = world.spawn_point();
+                config.world.spawn_x = sx;
+                config.world.spawn_y = sy;
+                config.world.spawn_z = sz;
+            }
+            log::info(&format!(
+                "Preparing start region for level 0 (Seed: {})",
+                world.seed()
+            ));
+            world.live_prepare_spawn_region();
+        }
         let player_store = crate::world::storage::PlayerStore::new(world.world_dir());
         let view_distance = config.world.view_distance;
         Self {
@@ -119,7 +147,11 @@ impl Server {
 
     fn tick(&mut self, ticks: u64) {
         self.current_tick = ticks;
-        self.world.increment_time();
+        if self.world.live_is_active() {
+            self.world.live_tick();
+        } else {
+            self.world.increment_time();
+        }
         self.drain_inbound();
 
         // Auto-save every 6000 ticks (5 minutes)
@@ -234,6 +266,9 @@ impl Server {
     fn remove_and_handle_disconnect(&mut self, id: ConnId) {
         if let Some(conn) = self.connections.remove(&id) {
             if let Some(player) = self.entities.remove_by_conn(id) {
+                if self.world.live_is_active() {
+                    self.world.live_player_quit(id);
+                }
                 // Save player persistence
                 if self.config.world.save_enabled {
                     let _ = self.player_store.save_player(&player);
@@ -407,6 +442,12 @@ impl Server {
 
         if fall_damage > 0 {
             self.damage_player_direct(entity_id, fall_damage, "hit the ground too hard");
+        }
+
+        if self.world.live_is_active() {
+            if let Some(player) = self.entities.get_by_conn(id) {
+                self.world.live_player_move(id, player.x, player.z);
+            }
         }
 
         // Distance check for chunk visibility updates
@@ -1023,9 +1064,12 @@ impl Server {
             let p = self.entities.get_by_conn(id).unwrap();
             (p.x, p.y, p.z, p.yaw, p.pitch)
         };
+        if self.world.live_is_active() {
+            self.world.live_player_join(id, player_x, player_z);
+        }
         let center = ChunkPos::new(
-            (player_x.floor() as i32) >> 4,
-            (player_z.floor() as i32) >> 4,
+            (player_x as i32) >> 4,
+            (player_z as i32) >> 4,
         );
         let view_distance = self.config.world.view_distance;
 
@@ -1067,7 +1111,11 @@ impl Server {
         for dz in -immediate_radius..=immediate_radius {
             for dx in -immediate_radius..=immediate_radius {
                 let pos = ChunkPos::new(center.x + dx, center.z + dz);
-                self.world.populate_chunk(pos);
+                if self.world.live_is_active() {
+                    self.world.server_get_chunk_at(pos);
+                } else {
+                    self.world.populate_chunk(pos);
+                }
                 if let Ok((pre, map)) = self.world.prepare_chunk_packets(pos) {
                     self.send(id, Clientbound::PreChunk(pre));
                     self.send(id, Clientbound::MapChunk(map));
@@ -1117,21 +1165,27 @@ impl Server {
             };
 
             for (i, pos) in chunks_to_send.iter().enumerate() {
-                let is_pop = self
-                    .world
-                    .get_chunk(*pos)
-                    .is_some_and(|c| c.state == crate::world::chunk::ChunkState::Populated);
-                if !is_pop {
-                    if populated_this_tick >= 1 {
-                        if let Some(player) = self.entities.get_by_conn_mut(id) {
-                            for remaining in chunks_to_send[i..].iter().rev() {
-                                player.chunk_queue.insert(0, *remaining);
-                            }
-                        }
-                        break;
+                if self.world.live_is_active() {
+                    if !self.world.is_chunk_loaded(*pos) {
+                        self.world.server_get_chunk_at(*pos);
                     }
-                    self.world.populate_chunk(*pos);
-                    populated_this_tick += 1;
+                } else {
+                    let is_pop = self
+                        .world
+                        .get_chunk(*pos)
+                        .is_some_and(|c| c.state == crate::world::chunk::ChunkState::Populated);
+                    if !is_pop {
+                        if populated_this_tick >= 1 {
+                            if let Some(player) = self.entities.get_by_conn_mut(id) {
+                                for remaining in chunks_to_send[i..].iter().rev() {
+                                    player.chunk_queue.insert(0, *remaining);
+                                }
+                            }
+                            break;
+                        }
+                        self.world.populate_chunk(*pos);
+                        populated_this_tick += 1;
+                    }
                 }
 
                 if let Ok((pre, map)) = self.world.prepare_chunk_packets(*pos) {

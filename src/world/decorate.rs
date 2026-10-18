@@ -343,10 +343,10 @@ pub fn generate_minable(
     size: i32,
 ) -> bool {
     let f = random.next_f32() * std::f32::consts::PI;
-    let d0 = (i + 8) as f32 as f64 + math::sin(f) as f64 * size as f64 / 8.0;
-    let d1 = (i + 8) as f32 as f64 - math::sin(f) as f64 * size as f64 / 8.0;
-    let d2 = (k + 8) as f32 as f64 + math::cos(f) as f64 * size as f64 / 8.0;
-    let d3 = (k + 8) as f32 as f64 - math::cos(f) as f64 * size as f64 / 8.0;
+    let d0 = ((i + 8) as f32 + math::sin(f) * size as f32 / 8.0) as f64;
+    let d1 = ((i + 8) as f32 - math::sin(f) * size as f32 / 8.0) as f64;
+    let d2 = ((k + 8) as f32 + math::cos(f) * size as f32 / 8.0) as f64;
+    let d3 = ((k + 8) as f32 - math::cos(f) * size as f32 / 8.0) as f64;
     let d4 = (j + random.next_i32_bound(3) + 2) as f64;
     let d5 = (j + random.next_i32_bound(3) + 2) as f64;
 
@@ -401,10 +401,10 @@ pub fn generate_clay(
         return false;
     }
     let f = random.next_f32() * std::f32::consts::PI;
-    let d0 = (i + 8) as f32 as f64 + math::sin(f) as f64 * size as f64 / 8.0;
-    let d1 = (i + 8) as f32 as f64 - math::sin(f) as f64 * size as f64 / 8.0;
-    let d2 = (k + 8) as f32 as f64 + math::cos(f) as f64 * size as f64 / 8.0;
-    let d3 = (k + 8) as f32 as f64 - math::cos(f) as f64 * size as f64 / 8.0;
+    let d0 = ((i + 8) as f32 + math::sin(f) * size as f32 / 8.0) as f64;
+    let d1 = ((i + 8) as f32 - math::sin(f) * size as f32 / 8.0) as f64;
+    let d2 = ((k + 8) as f32 + math::cos(f) * size as f32 / 8.0) as f64;
+    let d3 = ((k + 8) as f32 - math::cos(f) * size as f32 / 8.0) as f64;
     let d4 = (j + random.next_i32_bound(3) + 2) as f64;
     let d5 = (j + random.next_i32_bound(3) + 2) as f64;
 

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -173,7 +173,7 @@ macro_rules! trace_down {
     };
 }
 
-fn with_generator<R>(seed: i64, f: impl FnOnce(&mut Generator) -> R) -> R {
+pub(crate) fn with_generator<R>(seed: i64, f: impl FnOnce(&mut Generator) -> R) -> R {
     GENERATOR.with(|cell| {
         let mut opt = cell.borrow_mut();
         if opt.as_ref().map(|(s, _)| *s) != Some(seed) {
@@ -187,11 +187,11 @@ fn with_generator<R>(seed: i64, f: impl FnOnce(&mut Generator) -> R) -> R {
 pub struct World {
     config: WorldConfig,
     world_dir: PathBuf,
-    chunks: HashMap<ChunkPos, Chunk>,
-    packet_cache: RefCell<HashMap<ChunkPos, (PreChunk, MapChunk)>>,
+    pub(crate) chunks: HashMap<ChunkPos, Chunk>,
+    pub(crate) packet_cache: RefCell<HashMap<ChunkPos, (PreChunk, MapChunk)>>,
     chunk_mgr: RefCell<WorldChunkManager>,
     storage: Option<RefCell<RegionFileCache>>,
-    level_data: RefCell<LevelData>,
+    pub(crate) level_data: RefCell<LevelData>,
     _session_lock: Option<SessionLock>,
     suppress_physics: bool,
     /// Java `World.a`: while true, `World.c`/`World.d` executes scheduled
@@ -201,18 +201,159 @@ pub struct World {
     /// Java `World.random` (a fresh `java.util.Random`) — only reachable during
     /// instant-tick cascades (lava flow randomness). Kept here so the port
     /// mirrors the reference implementation.
-    world_random: JavaRandom,
+    pub(crate) world_random: JavaRandom,
     /// `BlockFlowing.b` — the per-direction flow flags returned by `j()`. In
     /// Java this is a mutable field on the shared `BlockFlowing` singleton:
     /// nested cascade ticks call `j()` again and overwrite it, and the outer
     /// flow loop then reads the clobbered flags. Indexed by [lava][direction].
     fluid_sides: [[bool; 4]; 2],
+    /// Live/server choreography state (spawn search, populate triggers,
+    /// player framing, unloads) — see `world::live`.
+    pub(crate) live: crate::world::live::LiveState,
+    /// True when no `level.dat` was found at load time: the server runs the
+    /// Java spawn search for such worlds.
+    fresh_world: bool,
+    /// Java `WorldData.f()` — the world time in ticks. Scheduled block ticks
+    /// are stamped with `time + delay` and the processor only runs entries
+    /// whose time has arrived.
+    pub(crate) live_time: i64,
+    /// Java `World.E` — scheduled block ticks ordered by (time, insertion seq).
+    pub(crate) scheduled: BTreeSet<ScheduledTick>,
+    /// Java `World.F` — dedup set keyed by `(x, y, z, id)` (not by time).
+    pub(crate) scheduled_set: HashSet<(i32, i32, i32, u8)>,
+    /// Java `NextTickListEntry.f` — the global insertion counter.
+    pub(crate) scheduled_seq: u64,
+    /// Java `World.C` — pending `MetadataChunkBlock` light updates.
+    pub(crate) light_updates: Vec<MetadataChunkBlock>,
+    /// Java `World.A` — recursion depth counter for `World.a(EnumSkyBlock, ...)`.
+    pub(crate) light_schedule_depth: i32,
+    /// Java `World.M` — recursion depth counter for `World.doLighting()`.
+    pub(crate) do_lighting_depth: i32,
+    /// Java `EntityFallingSand` instances in `World.entityList`.
+    pub(crate) falling_sands: Vec<FallingSand>,
+}
+
+/// Active `EntityFallingSand` instance ticked by `World.cleanUp()`.
+#[derive(Clone, Debug)]
+pub(crate) struct FallingSand {
+    pub x: i32,
+    pub z: i32,
+    pub loc_y: f64,
+    pub mot_y: f64,
+    pub id: u8,
+    pub ticks: i32,
+    pub dead: bool,
+}
+
+/// Java `MetadataChunkBlock` — one queued light-propagation box in `World.C`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MetadataChunkBlock {
+    pub kind: LightType,
+    pub b: i32,
+    pub c: i32,
+    pub d: i32,
+    pub e: i32,
+    pub f: i32,
+    pub g: i32,
+}
+
+impl MetadataChunkBlock {
+    /// Java `MetadataChunkBlock.a(int i, int j, int k, int l, int i1, int j1)`.
+    pub fn try_merge(
+        &mut self,
+        mut i: i32,
+        mut j: i32,
+        mut k: i32,
+        mut l: i32,
+        mut i1: i32,
+        mut j1: i32,
+    ) -> bool {
+        if i >= self.b && j >= self.c && k >= self.d && l <= self.e && i1 <= self.f && j1 <= self.g
+        {
+            return true;
+        }
+        let b0 = 1;
+        if i >= self.b - b0
+            && j >= self.c - b0
+            && k >= self.d - b0
+            && l <= self.e + b0
+            && i1 <= self.f + b0
+            && j1 <= self.g + b0
+        {
+            let k1 = self.e - self.b;
+            let l1 = self.f - self.c;
+            let i2 = self.g - self.d;
+            if i > self.b {
+                i = self.b;
+            }
+            if j > self.c {
+                j = self.c;
+            }
+            if k > self.d {
+                k = self.d;
+            }
+            if l < self.e {
+                l = self.e;
+            }
+            if i1 < self.f {
+                i1 = self.f;
+            }
+            if j1 < self.g {
+                j1 = self.g;
+            }
+            let j2 = l - i;
+            let k2 = i1 - j;
+            let l2 = j1 - k;
+            let i3 = k1 * l1 * i2;
+            let j3 = j2 * k2 * l2;
+            if j3 - i3 <= 2 {
+                self.b = i;
+                self.c = j;
+                self.d = k;
+                self.e = l;
+                self.f = i1;
+                self.g = j1;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// One entry of `World.E` (`NextTickListEntry`). Ordering mirrors
+/// `compareTo`: primary time, then the insertion counter.
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduledTick {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub id: u8,
+    pub time: i64,
+    pub seq: u64,
+}
+
+impl PartialEq for ScheduledTick {
+    fn eq(&self, other: &Self) -> bool {
+        self.time == other.time && self.seq == other.seq
+    }
+}
+impl Eq for ScheduledTick {}
+impl PartialOrd for ScheduledTick {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScheduledTick {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.time, self.seq).cmp(&(other.time, other.seq))
+    }
 }
 
 impl World {
     pub fn new(mut config: WorldConfig) -> Self {
         let world_dir = PathBuf::from(&config.level_name);
 
+        let mut fresh_world = false;
         let (_session_lock, storage, level_data) = if config.save_enabled {
             let lock = SessionLock::acquire(&world_dir).ok();
             let loaded = LevelData::load_from_dir(&world_dir).ok().flatten();
@@ -223,6 +364,7 @@ impl World {
                 config.spawn_z = lvl.spawn_z;
                 lvl
             } else {
+                fresh_world = true;
                 LevelData {
                     seed: config.seed,
                     spawn_x: config.spawn_x,
@@ -235,6 +377,7 @@ impl World {
             let cache = RegionFileCache::new(&world_dir);
             (lock, Some(RefCell::new(cache)), RefCell::new(level))
         } else {
+            fresh_world = true;
             let level = LevelData {
                 seed: config.seed,
                 spawn_x: config.spawn_x,
@@ -247,6 +390,8 @@ impl World {
         };
 
         let chunk_mgr = RefCell::new(WorldChunkManager::new(config.seed));
+        let live = crate::world::live::LiveState::new(config.view_distance);
+        let initial_time = level_data.borrow().time;
 
         Self {
             config,
@@ -261,7 +406,23 @@ impl World {
             insta_tick: false,
             world_random: JavaRandom::new(0),
             fluid_sides: [[false; 4]; 2],
+            live,
+            fresh_world,
+            live_time: initial_time,
+            scheduled: BTreeSet::new(),
+            scheduled_set: HashSet::new(),
+            scheduled_seq: 0,
+            light_updates: Vec::new(),
+            light_schedule_depth: 0,
+            do_lighting_depth: 0,
+            falling_sands: Vec::new(),
         }
+    }
+
+    /// True when the world was created rather than loaded (`level.dat` was
+    /// absent): the server performs the Java spawn search for such worlds.
+    pub fn is_fresh_world(&self) -> bool {
+        self.fresh_world
     }
 
     pub fn config(&self) -> &WorldConfig {
@@ -297,7 +458,11 @@ impl World {
     pub fn safe_spawn_point(&mut self) -> (i32, i32, i32) {
         let (x, default_y, z) = self.spawn_point();
         let chunk_pos = ChunkPos::new(x >> 4, z >> 4);
-        self.populate_chunk(chunk_pos);
+        if self.live.active {
+            self.server_get_chunk_at(chunk_pos);
+        } else {
+            self.populate_chunk(chunk_pos);
+        }
         let ground = self.highest_solid_y(x, z);
         let y = if ground > 0 {
             ground
@@ -374,6 +539,73 @@ impl World {
             chunk.dirty = true;
         }
         self.packet_cache.borrow_mut().remove(&pos);
+    }
+
+    /// Base-generate one chunk through the shared generator context. Java
+    /// base generation writes through `Chunk.a(...)`, which sets `o = true`
+    /// (dirty), so the chunk is flushed by the world save even when it is
+    /// never populated (spawn-search candidates, prep edges).
+    pub(crate) fn generate_base_chunk(&mut self, pos: ChunkPos) -> Chunk {
+        let seed = self.config.seed;
+        let mut chunk = with_generator(seed, |gen| gen.generate_base(pos.x, pos.z));
+        if self.live.active {
+            // `Chunk.initLighting` runs inside `ChunkProviderGenerate.getOrCreateChunk`
+            // before the chunk is inserted into `ChunkProviderServer.chunks`:
+            // its `this.c(j, k)` loop queues sky-light updates against already
+            // loaded neighbor columns.
+            for j in 0..16usize {
+                for k in 0..16usize {
+                    let h = chunk.height_map[(k << 4) | j] as i32;
+                    let wx = pos.x * 16 + j as i32;
+                    let wz = pos.z * 16 + k as i32;
+                    self.chunk_relight_neighbor(wx - 1, wz, h);
+                    self.chunk_relight_neighbor(wx + 1, wz, h);
+                    self.chunk_relight_neighbor(wx, wz - 1, h);
+                    self.chunk_relight_neighbor(wx, wz + 1, h);
+                }
+            }
+        }
+        chunk.dirty = true;
+        chunk
+    }
+
+    /// Try to load a chunk from the region storage; `None` when absent or
+    /// when saving is disabled.
+    pub(crate) fn try_load_chunk_from_storage(&mut self, pos: ChunkPos) -> Option<Chunk> {
+        let storage = self.storage.as_ref()?;
+        match storage.borrow_mut().read_chunk(pos.x, pos.z) {
+            Ok(Some(nbt)) => ChunkLoader::chunk_from_nbt(&nbt).ok(),
+            _ => None,
+        }
+    }
+
+    /// Save one chunk to storage right away (used by chunk unloading).
+    pub(crate) fn write_chunk_to_storage(&mut self, pos: ChunkPos) -> Result<()> {
+        let Some(storage) = &self.storage else {
+            return Ok(());
+        };
+        let Some(chunk) = self.chunks.get(&pos) else {
+            return Ok(());
+        };
+        if !chunk.dirty {
+            return Ok(());
+        }
+        let time = self.level_data.borrow().time;
+        let nbt = ChunkLoader::chunk_to_nbt(chunk, time);
+        storage.borrow_mut().write_chunk(pos.x, pos.z, &nbt)?;
+        self.chunks.get_mut(&pos).unwrap().dirty = false;
+        Ok(())
+    }
+
+    /// Java `WorldData.setSpawn` plus the in-memory `config` copy.
+    pub(crate) fn set_spawn_xyz(&mut self, x: i32, y: i32, z: i32) {
+        self.config.spawn_x = x;
+        self.config.spawn_y = y;
+        self.config.spawn_z = z;
+        let mut level = self.level_data.borrow_mut();
+        level.spawn_x = x;
+        level.spawn_y = y;
+        level.spawn_z = z;
     }
 
     pub fn save_all(&mut self) -> Result<()> {
@@ -468,6 +700,10 @@ impl World {
             return blocks::AIR;
         }
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        if self.live.active && self.live_resolve_read(pos) {
+            // EmptyChunk.getTypeId -> 0.
+            return blocks::AIR;
+        }
         if let Some(chunk) = self.chunks.get(&pos) {
             chunk.get_block((x & 15) as usize, y as usize, (z & 15) as usize)
         } else {
@@ -480,6 +716,10 @@ impl World {
             return 0;
         }
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        if self.live.active && self.live_resolve_read(pos) {
+            // EmptyChunk.getData -> 0.
+            return 0;
+        }
         if let Some(chunk) = self.chunks.get(&pos) {
             chunk.get_metadata((x & 15) as usize, y as usize, (z & 15) as usize)
         } else {
@@ -504,12 +744,18 @@ impl World {
         let pos = ChunkPos::new(x >> 4, z >> 4);
         let lx = (x & 15) as usize;
         let lz = (z & 15) as usize;
+        let live_active = self.live.active;
+        if live_active && self.live_resolve_write(pos) {
+            // EmptyChunk.a(): the write is accepted (returns true), the caller
+            // still runs its `World.update` physics, and no data changes.
+            return true;
+        }
         let (old_id, old_height) = match self.chunks.get(&pos) {
             Some(chunk) => (
                 chunk.get_block(lx, y as usize, lz),
                 chunk.height_map[(lz << 4) | lx] as i32,
             ),
-            None => return false,
+            None => return live_active,
         };
         if old_id == id {
             return false;
@@ -541,6 +787,12 @@ impl World {
             self.chunk_height_update(pos.x, pos.z, lx, y, lz);
         }
 
+        if live_active {
+            self.java_schedule_light(LightType::Sky, x, y, z, x, y, z);
+            self.java_schedule_light(LightType::Block, x, y, z, x, y, z);
+            self.chunk_relight_neighbors_at(pos.x, pos.z, lx, lz);
+        }
+
         if id != 0 {
             self.block_on_place(id, x, y, z);
         }
@@ -562,13 +814,18 @@ impl World {
         let pos = ChunkPos::new(x >> 4, z >> 4);
         let lx = (x & 15) as usize;
         let lz = (z & 15) as usize;
+        let live_active = self.live.active;
+        if live_active && self.live_resolve_write(pos) {
+            // EmptyChunk.a(): accepted silently; the physics pass still runs.
+            return true;
+        }
         let (old_id, old_data, old_height) = match self.chunks.get(&pos) {
             Some(chunk) => (
                 chunk.get_block(lx, y as usize, lz),
                 chunk.get_metadata(lx, y as usize, lz),
                 chunk.height_map[(lz << 4) | lx] as i32,
             ),
-            None => return false,
+            None => return live_active,
         };
         if old_id == id && old_data == data {
             return false;
@@ -595,18 +852,31 @@ impl World {
             self.chunk_height_update(pos.x, pos.z, lx, y, lz);
         }
 
+        if live_active {
+            self.java_schedule_light(LightType::Sky, x, y, z, x, y, z);
+            self.java_schedule_light(LightType::Block, x, y, z, x, y, z);
+            self.chunk_relight_neighbors_at(pos.x, pos.z, lx, lz);
+        }
+
         if id != 0 {
             self.block_on_place(id, x, y, z);
         }
         true
     }
 
-    /// Java `World.setRawData(i, j, k, l)`: metadata write only.
+    /// Java `World.setRawData(i, j, k, l)`: metadata write only. Java returns
+    /// true for every in-range target — including an `EmptyChunk` — so the
+    /// caller's physics pass always runs.
     pub fn java_set_raw_data(&mut self, x: i32, y: i32, z: i32, data: u8) -> bool {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return false;
         }
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        let live_active = self.live.active;
+        if live_active && self.live_resolve_write(pos) {
+            // EmptyChunk.b(): silently accepted, `setRawData` still returns true.
+            return true;
+        }
         if let Some(chunk) = self.chunks.get_mut(&pos) {
             let old = chunk.get_metadata((x & 15) as usize, y as usize, (z & 15) as usize);
             trace_b!(x, y, z, old, data);
@@ -615,7 +885,7 @@ impl World {
             self.packet_cache.borrow_mut().remove(&pos);
             true
         } else {
-            false
+            live_active
         }
     }
 
@@ -706,27 +976,82 @@ impl World {
                     self.java_set_type_id(x, y, z, 0);
                 }
             }
-            // BlockSand/BlockGravel schedule a tick (instant only while
-            // `insta_tick` is set; otherwise the tick is queued and never runs).
-            blocks::SAND | blocks::GRAVEL => self.java_schedule_tick(x, y, z, id),
+            blocks::SNOW => {
+                let below = self.get_block(x, y - 1, z);
+                if below == 0 || !blocks::is_opaque_cube(below) || !blocks::is_solid(below) {
+                    self.java_set_type_id(x, y, z, 0);
+                }
+            }
+            // BlockSand/BlockGravel schedule a tick (delay `BlockSand.c()` = 3).
+            blocks::SAND | blocks::GRAVEL => self.java_schedule_tick(x, y, z, id, 3),
             _ => {}
         }
     }
 
-    /// Java `World.c(i, j, k, l, i1)`: schedule a block tick. During
-    /// generation the queued branch never executes; while `insta_tick`
-    /// (Java `World.a`) is set the tick runs immediately and recursively.
-    fn java_schedule_tick(&mut self, x: i32, y: i32, z: i32, id: u8) {
-        if !self.insta_tick {
+    /// Java `World.c(i, j, k, l, i1)`: schedule a block tick. While `insta_tick`
+    /// (Java `World.a`) is set the tick runs immediately and recursively; in
+    /// the server tick loop (`World.a(boolean)`) queued entries run when their
+    /// time arrives. The queue branch drops entries outside loaded chunks.
+    fn java_schedule_tick(&mut self, x: i32, y: i32, z: i32, id: u8, delay: i64) {
+        // `NextTickListEntry` is constructed (and the global sequence counter
+        // consumed) before any branch checks.
+        let seq = self.scheduled_seq;
+        self.scheduled_seq += 1;
+
+        if self.insta_tick {
+            // `World.a(i - 8, j - 8, k - 8, i + 8, j + 8, k + 8)` guard.
+            if !self.chunks_area_loaded(x - 8, y - 8, z - 8, x + 8, y + 8, z + 8) {
+                return;
+            }
+            let cur = self.get_block(x, y, z);
+            if cur == id && cur > 0 {
+                self.java_dispatch_tick(x, y, z, cur);
+            }
             return;
         }
-        // `World.a(i - 8, j - 8, k - 8, i + 8, j + 8, k + 8)` guard.
+
         if !self.chunks_area_loaded(x - 8, y - 8, z - 8, x + 8, y + 8, z + 8) {
             return;
         }
-        let cur = self.get_block(x, y, z);
-        if cur == id && cur > 0 {
-            self.java_dispatch_tick(x, y, z, cur);
+        let time = if id > 0 { delay + self.live_time } else { 0 };
+        let key = (x, y, z, id);
+        if !self.scheduled_set.contains(&key) {
+            self.scheduled_set.insert(key);
+            self.scheduled
+                .insert(ScheduledTick { x, y, z, id, time, seq });
+        }
+    }
+
+    /// Java `World.a(boolean)` — process scheduled ticks. Up to 1000 entries
+    /// per call; with `flag == false` processing stops at the first entry
+    /// whose time is still in the future. Entries outside loaded chunks are
+    /// dropped (`World.a` pops them before the chunk check).
+    pub fn java_process_scheduled(&mut self, flag: bool) {
+        let cap = self.scheduled.len().min(1000);
+        for _ in 0..cap {
+            let Some(first) = self.scheduled.iter().next().cloned() else {
+                break;
+            };
+            if !flag && first.time > self.live_time {
+                break;
+            }
+            self.scheduled.remove(&first);
+            self.scheduled_set
+                .remove(&(first.x, first.y, first.z, first.id));
+            if !self.chunks_area_loaded(
+                first.x - 8,
+                first.y - 8,
+                first.z - 8,
+                first.x + 8,
+                first.y + 8,
+                first.z + 8,
+            ) {
+                continue;
+            }
+            let cur = self.get_block(first.x, first.y, first.z);
+            if cur == first.id && cur > 0 {
+                self.java_dispatch_tick(first.x, first.y, first.z, cur);
+            }
         }
     }
 
@@ -754,10 +1079,33 @@ impl World {
         blocks::is_water(id) || blocks::is_lava(id)
     }
 
-    /// `BlockSand.g` with `BlockSand.instaFall == true` (set for the whole
-    /// populate): the sand/gravel teleports down without spawning an entity.
+    /// `BlockSand.g`: while `instaFall` (`self.insta_tick`) is true or the ±32
+    /// area is not fully loaded, sand/gravel teleports down immediately; during
+    /// server ticks (`!self.insta_tick`) with the ±32 area loaded, Poseidon
+    /// clears the source block (`sand-gravel-duping-fix`) and spawns an
+    /// `EntityFallingSand` ticked in `cleanUp()`.
     fn java_sand_fall(&mut self, x: i32, y: i32, z: i32, id: u8) {
         if !self.sand_can_fall_through(x, y - 1, z) || y < 0 {
+            return;
+        }
+        let b0 = 32;
+        if self.live.active
+            && !self.insta_tick
+            && self.chunks_area_loaded(x - b0, y - b0, z - b0, x + b0, y + b0, z + b0)
+        {
+            self.java_set_type_id(x, y, z, 0);
+            if self.chunks.contains_key(&ChunkPos::new(x >> 4, z >> 4)) {
+                let _ = self.live_resolve_read(ChunkPos::new(x >> 4, z >> 4));
+                self.falling_sands.push(FallingSand {
+                    x,
+                    z,
+                    loc_y: y as f64 + 0.5,
+                    mot_y: 0.0,
+                    id,
+                    ticks: 0,
+                    dead: false,
+                });
+            }
             return;
         }
         self.java_set_type_id(x, y, z, 0);
@@ -767,6 +1115,78 @@ impl World {
         }
         if j > 0 {
             self.java_set_type_id(x, j, z, id);
+        }
+    }
+
+    /// Java `World.cleanUp()` entity pass for `EntityFallingSand`.
+    pub fn java_tick_falling_sands(&mut self) {
+        let half_h = (0.98_f32 / 2.0_f32) as f64;
+        let height_box = 0.98_f32 as f64;
+        let mut i = 0;
+        while i < self.falling_sands.len() {
+            let mut ent = self.falling_sands[i].clone();
+            if !ent.dead
+                && self.chunks_area_loaded(ent.x - 32, 0, ent.z - 32, ent.x + 32, 128, ent.z + 32)
+            {
+                if ent.id == 0 {
+                    ent.dead = true;
+                } else {
+                    ent.ticks += 1;
+                    ent.mot_y -= 0.03999999910593033_f64;
+                    let d6 = ent.mot_y;
+                    let mut d1 = d6;
+                    let mut min_y = ent.loc_y - half_h;
+                    let max_y = min_y + height_box;
+                    let y_lo = (min_y + d1).floor() as i32;
+                    let y_hi = (max_y + 1.0).floor() as i32;
+                    for by in y_lo..y_hi {
+                        if (0..128).contains(&by) {
+                            let bid = self.get_block(ent.x, by, ent.z);
+                            if bid != 0 && !self.sand_can_fall_through(ent.x, by, ent.z) {
+                                let block_top = (by + 1) as f64;
+                                if min_y >= block_top {
+                                    let diff = block_top - min_y;
+                                    if diff > d1 {
+                                        d1 = diff;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    min_y += d1;
+                    ent.loc_y = min_y + half_h;
+                    let on_ground = d6 != d1 && d6 < 0.0;
+                    if d6 != d1 {
+                        ent.mot_y = 0.0;
+                    }
+                    ent.mot_y *= 0.9800000190734863_f64;
+                    let j = ent.loc_y.floor() as i32;
+                    if self.get_block(ent.x, j, ent.z) == ent.id {
+                        self.java_set_type_id(ent.x, j, ent.z, 0);
+                    }
+                    if on_ground {
+                        ent.mot_y *= -0.5;
+                        ent.dead = true;
+                        let cur = self.get_block(ent.x, j, ent.z);
+                        let can_build = cur == 0
+                            || blocks::is_water(cur)
+                            || blocks::is_lava(cur)
+                            || cur == blocks::FIRE
+                            || cur == blocks::SNOW;
+                        if can_build && !self.sand_can_fall_through(ent.x, j - 1, ent.z) {
+                            self.java_set_type_id(ent.x, j, ent.z, ent.id);
+                        }
+                    } else if ent.ticks > 100 {
+                        ent.dead = true;
+                    }
+                }
+            }
+            if ent.dead {
+                self.falling_sands.remove(i);
+            } else {
+                self.falling_sands[i] = ent;
+                i += 1;
+            }
         }
     }
 
@@ -804,7 +1224,8 @@ impl World {
         // The raw write runs `Block.byId[id - 1].c` (fizz + schedule inside
         // BlockFlowing.c), then `BlockStationary.i` schedules again explicitly.
         self.java_set_raw_type_id_and_data(x, y, z, id - 1, data);
-        self.java_schedule_tick(x, y, z, id - 1);
+        let delay = if id == blocks::STATIONARY_WATER { 5 } else { 30 };
+        self.java_schedule_tick(x, y, z, id - 1, delay);
         self.suppress_physics = false;
     }
 
@@ -874,11 +1295,22 @@ impl World {
         }
         let y = y.min(CHUNK_HEIGHT as i32 - 1);
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        if self.live.active && self.live_resolve_read(pos) {
+            return 0;
+        }
         match self.chunks.get(&pos) {
             Some(chunk) => {
                 chunk.get_block_light_value((x & 15) as usize, y as usize, (z & 15) as usize, 0)
             }
-            None => 15,
+            // EmptyChunk light reads are 0; offline the code never reaches an
+            // absent chunk, so the historical 15 stays for the offline path.
+            None => {
+                if self.live.active {
+                    0
+                } else {
+                    15
+                }
+            }
         }
     }
 
@@ -886,9 +1318,12 @@ impl World {
     /// `Chunk.c(i, j, k)`: the block is at or above the height map.
     fn can_see_sky(&self, x: i32, y: i32, z: i32) -> bool {
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        if self.live.active && self.live_resolve_read(pos) {
+            return false;
+        }
         match self.chunks.get(&pos) {
             Some(chunk) => y >= chunk.get_height((x & 15) as usize, (z & 15) as usize) as i32,
-            None => true,
+            None => !self.live.active,
         }
     }
 
@@ -909,17 +1344,25 @@ impl World {
         }
         if i1 != l {
             trace_g!(cx * 16 + lx as i32, cz * 16 + lz as i32, l, i1);
+            let k1 = cx * 16 + lx as i32;
+            let l1 = cz * 16 + lz as i32;
             chunk.height_map[(lz << 4) | lx] = i1 as u8;
             if i1 < l {
                 for i2 in i1..l {
                     chunk.set_sky_light(lx, i2 as usize, lz, 15);
                 }
             } else {
+                if self.live.active {
+                    self.java_schedule_light(LightType::Sky, k1, l, l1, k1, i1, l1);
+                }
+                let chunk = self.chunks.get_mut(&pos).unwrap();
                 for i2 in l..i1 {
                     chunk.set_sky_light(lx, i2 as usize, lz, 0);
                 }
             }
+            let chunk = self.chunks.get_mut(&pos).unwrap();
             let mut i2 = 15i32;
+            let j2 = i1;
             let mut y1 = i1;
             while y1 > 0 && i2 > 0 {
                 y1 -= 1;
@@ -933,8 +1376,294 @@ impl World {
                 }
                 chunk.set_sky_light(lx, y1 as usize, lz, i2 as u8);
             }
+            while y1 > 0 && blocks::light_opacity(chunk.get_block(lx, (y1 - 1) as usize, lz)) == 0
+            {
+                y1 -= 1;
+            }
             chunk.dirty = true;
+            if self.live.active && y1 != j2 {
+                self.java_schedule_light(LightType::Sky, k1 - 1, y1, l1 - 1, k1 + 1, j2, l1 + 1);
+            }
         }
+    }
+
+    /// Java `Chunk.c(int i, int j)`.
+    fn chunk_relight_neighbors_at(&mut self, cx: i32, cz: i32, lx: usize, lz: usize) {
+        let Some(chunk) = self.chunks.get(&ChunkPos::new(cx, cz)) else {
+            return;
+        };
+        let k = chunk.height_map[(lz << 4) | lx] as i32;
+        let l = cx * 16 + lx as i32;
+        let i1 = cz * 16 + lz as i32;
+        self.chunk_relight_neighbor(l - 1, i1, k);
+        self.chunk_relight_neighbor(l + 1, i1, k);
+        self.chunk_relight_neighbor(l, i1 - 1, k);
+        self.chunk_relight_neighbor(l, i1 + 1, k);
+    }
+
+    /// Java `Chunk.f(int i, int j, int k)`.
+    fn chunk_relight_neighbor(&mut self, x: i32, z: i32, k: i32) {
+        let l = self.java_highest_block_y_at(x, z);
+        if l > k {
+            self.java_schedule_light(LightType::Sky, x, k, z, x, l, z);
+        } else if l < k {
+            self.java_schedule_light(LightType::Sky, x, l, z, x, k, z);
+        }
+    }
+
+    /// Java `World.getHighestBlockYAt(int i, int j)` (lines 562-574).
+    fn java_highest_block_y_at(&self, x: i32, z: i32) -> i32 {
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        if !self.chunks.contains_key(&pos) {
+            return 0;
+        }
+        if self.live.active && self.live_resolve_read(pos) {
+            return 0;
+        }
+        self.chunks
+            .get(&pos)
+            .map(|c| c.get_height((x & 15) as usize, (z & 15) as usize) as i32)
+            .unwrap_or(0)
+    }
+
+    /// Java `World.m(int i, int j, int k)` (lines 542-560).
+    fn java_can_see_sky(&self, x: i32, y: i32, z: i32) -> bool {
+        if y < 0 {
+            return false;
+        }
+        if y >= CHUNK_HEIGHT as i32 {
+            return true;
+        }
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        if !self.chunks.contains_key(&pos) {
+            return false;
+        }
+        if self.live.active && self.live_resolve_read(pos) {
+            return false;
+        }
+        self.chunks
+            .get(&pos)
+            .map(|c| c.can_block_see_sky((x & 15) as usize, y as usize, (z & 15) as usize))
+            .unwrap_or(false)
+    }
+
+    /// Java `World.a(EnumSkyBlock, int i, int j, int k)` (lines 598-621).
+    fn java_get_saved_light(&self, kind: LightType, x: i32, mut y: i32, z: i32) -> i32 {
+        if y < 0 {
+            y = 0;
+        }
+        if y >= CHUNK_HEIGHT as i32 {
+            y = CHUNK_HEIGHT as i32 - 1;
+        }
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        if !self.chunks.contains_key(&pos) {
+            return 0;
+        }
+        if self.live.active && self.live_resolve_read(pos) {
+            return 0;
+        }
+        let Some(chunk) = self.chunks.get(&pos) else {
+            return 0;
+        };
+        let lx = (x & 15) as usize;
+        let lz = (z & 15) as usize;
+        match kind {
+            LightType::Sky => chunk.get_sky_light(lx, y as usize, lz) as i32,
+            LightType::Block => chunk.get_block_light(lx, y as usize, lz) as i32,
+        }
+    }
+
+    /// Java `World.b(EnumSkyBlock, int i, int j, int k, int l)` (lines 623-639).
+    fn java_set_saved_light(&mut self, kind: LightType, x: i32, y: i32, z: i32, l: i32) {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return;
+        }
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        if !self.chunks.contains_key(&pos) {
+            return;
+        }
+        if self.live.active && self.live_resolve_read(pos) {
+            return;
+        }
+        if let Some(chunk) = self.chunks.get_mut(&pos) {
+            let lx = (x & 15) as usize;
+            let lz = (z & 15) as usize;
+            chunk.dirty = true;
+            match kind {
+                LightType::Sky => chunk.set_sky_light(lx, y as usize, lz, l as u8),
+                LightType::Block => chunk.set_block_light(lx, y as usize, lz, l as u8),
+            }
+        }
+    }
+
+    /// Java `World.a(EnumSkyBlock, int i, int j, int k, int l, int i1, int j1, boolean flag)`
+    /// (lines 1652-1700).
+    pub(crate) fn java_schedule_light(
+        &mut self,
+        kind: LightType,
+        i: i32,
+        j: i32,
+        k: i32,
+        l: i32,
+        i1: i32,
+        j1: i32,
+    ) {
+        self.light_schedule_depth += 1;
+        if self.light_schedule_depth < 50 {
+            let k1 = (l + i) / 2;
+            let l1 = (j1 + k) / 2;
+            let mid_pos = ChunkPos::new(k1 >> 4, l1 >> 4);
+            if self.chunks.contains_key(&mid_pos) && !self.live_resolve_read(mid_pos) {
+                let i2 = self.light_updates.len();
+                let j2 = 5.min(i2);
+                let mut merged = false;
+                for k2 in 0..j2 {
+                    let idx = i2 - k2 - 1;
+                    if self.light_updates[idx].kind == kind
+                        && self.light_updates[idx].try_merge(i, j, k, l, i1, j1)
+                    {
+                        merged = true;
+                        break;
+                    }
+                }
+                if !merged {
+                    self.light_updates.push(MetadataChunkBlock {
+                        kind,
+                        b: i,
+                        c: j,
+                        d: k,
+                        e: l,
+                        f: i1,
+                        g: j1,
+                    });
+                    if self.light_updates.len() > 1_000_000 {
+                        self.light_updates.clear();
+                    }
+                }
+            }
+        }
+        self.light_schedule_depth -= 1;
+    }
+
+    /// Java `World.a(EnumSkyBlock, int i, int j, int k, int l)` (lines 576-596).
+    fn java_check_neighbor_light(&mut self, kind: LightType, i: i32, j: i32, k: i32, mut l: i32) {
+        if !(0..CHUNK_HEIGHT as i32).contains(&j) {
+            return;
+        }
+        if !self.chunks.contains_key(&ChunkPos::new(i >> 4, k >> 4)) {
+            return;
+        }
+        match kind {
+            LightType::Sky => {
+                if self.java_can_see_sky(i, j, k) {
+                    l = 15;
+                }
+            }
+            LightType::Block => {
+                let i1 = self.get_block(i, j, k);
+                let em = blocks::light_emission(i1) as i32;
+                if em > l {
+                    l = em;
+                }
+            }
+        }
+        if self.java_get_saved_light(kind, i, j, k) != l {
+            self.java_schedule_light(kind, i, j, k, i, j, k);
+        }
+    }
+
+    /// Java `MetadataChunkBlock.a(World world)` (lines 23-160).
+    fn java_run_light_block(&mut self, mut blk: MetadataChunkBlock) {
+        let i = blk.e - blk.b + 1;
+        let j = blk.f - blk.c + 1;
+        let k = blk.g - blk.d + 1;
+        let l = i * j * k;
+        if l > 32768 {
+            return;
+        }
+        for k1 in blk.b..=blk.e {
+            for l1 in blk.d..=blk.g {
+                let mut flag2 = self.chunks_area_loaded(k1 - 1, -1, l1 - 1, k1 + 1, 1, l1 + 1);
+                if flag2 && self.live_resolve_read(ChunkPos::new(k1 >> 4, l1 >> 4)) {
+                    flag2 = false;
+                }
+                if flag2 {
+                    if blk.c < 0 {
+                        blk.c = 0;
+                    }
+                    if blk.f >= 128 {
+                        blk.f = 127;
+                    }
+                    for k2 in blk.c..=blk.f {
+                        let l2 = self.java_get_saved_light(blk.kind, k1, k2, l1);
+                        let i3 = self.get_block(k1, k2, l1);
+                        let mut j3 = blocks::light_opacity(i3) as i32;
+                        if j3 == 0 {
+                            j3 = 1;
+                        }
+                        let k3 = match blk.kind {
+                            LightType::Sky => {
+                                if self.java_can_see_sky(k1, k2, l1) {
+                                    15
+                                } else {
+                                    0
+                                }
+                            }
+                            LightType::Block => blocks::light_emission(i3) as i32,
+                        };
+                        let i4 = if j3 >= 15 && k3 == 0 {
+                            0
+                        } else {
+                            let l3 = self.java_get_saved_light(blk.kind, k1 - 1, k2, l1);
+                            let j4 = self.java_get_saved_light(blk.kind, k1 + 1, k2, l1);
+                            let k4 = self.java_get_saved_light(blk.kind, k1, k2 - 1, l1);
+                            let l4 = self.java_get_saved_light(blk.kind, k1, k2 + 1, l1);
+                            let i5 = self.java_get_saved_light(blk.kind, k1, k2, l1 - 1);
+                            let j5 = self.java_get_saved_light(blk.kind, k1, k2, l1 + 1);
+                            let m = l3.max(j4).max(k4).max(l4).max(i5).max(j5);
+                            (m - j3).max(0).max(k3)
+                        };
+                        if l2 != i4 {
+                            self.java_set_saved_light(blk.kind, k1, k2, l1, i4);
+                            let l3 = (i4 - 1).max(0);
+                            self.java_check_neighbor_light(blk.kind, k1 - 1, k2, l1, l3);
+                            self.java_check_neighbor_light(blk.kind, k1, k2 - 1, l1, l3);
+                            self.java_check_neighbor_light(blk.kind, k1, k2, l1 - 1, l3);
+                            if k1 + 1 >= blk.e {
+                                self.java_check_neighbor_light(blk.kind, k1 + 1, k2, l1, l3);
+                            }
+                            if k2 + 1 >= blk.f {
+                                self.java_check_neighbor_light(blk.kind, k1, k2 + 1, l1, l3);
+                            }
+                            if l1 + 1 >= blk.g {
+                                self.java_check_neighbor_light(blk.kind, k1, k2, l1 + 1, l3);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Java `World.doLighting()` (lines 1618-1645).
+    pub fn java_do_lighting(&mut self) -> bool {
+        if self.do_lighting_depth >= 50 {
+            return false;
+        }
+        self.do_lighting_depth += 1;
+        let mut i = 500i32;
+        let mut flag = false;
+        while !self.light_updates.is_empty() {
+            i -= 1;
+            if i <= 0 {
+                flag = true;
+                break;
+            }
+            let blk = self.light_updates.pop().unwrap();
+            self.java_run_light_block(blk);
+        }
+        self.do_lighting_depth -= 1;
+        flag
     }
 
     /// `Block.remove` dispatch for the replaced block.
@@ -999,7 +1728,8 @@ impl World {
                 // block is still flowing.
                 self.fluid_fizz(x, y, z, id);
                 if self.get_block(x, y, z) == id {
-                    self.java_schedule_tick(x, y, z, id);
+                    let delay = if id == blocks::WATER { 5 } else { 30 };
+                    self.java_schedule_tick(x, y, z, id, delay);
                 }
             }
             blocks::STATIONARY_WATER | blocks::STATIONARY_LAVA => {
@@ -1007,8 +1737,8 @@ impl World {
                 self.fluid_fizz(x, y, z, id);
             }
             blocks::SAND | blocks::GRAVEL => {
-                // BlockSand.c: schedule a fall check.
-                self.java_schedule_tick(x, y, z, id);
+                // BlockSand.c: schedule a fall check (delay 3).
+                self.java_schedule_tick(x, y, z, id, 3);
             }
             _ => {}
         }
@@ -1228,7 +1958,8 @@ impl World {
                     self.java_set_type_id(x, y, z, 0);
                 } else {
                     self.java_set_data(x, y, z, i1 as u8);
-                    self.java_schedule_tick(x, y, z, this_id);
+                    let delay = if lava { 30 } else { 5 };
+                    self.java_schedule_tick(x, y, z, this_id, delay);
                     self.java_apply_physics(x, y, z, this_id as i32);
                 }
             } else if flag {
@@ -1323,6 +2054,12 @@ impl GenWorld for World {
 
     fn highest_block_y(&self, x: i32, z: i32) -> i32 {
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        if !self.chunks.contains_key(&pos) {
+            return 0;
+        }
+        if self.live.active && self.live_resolve_read(pos) {
+            return 0;
+        }
         if let Some(chunk) = self.chunks.get(&pos) {
             chunk.get_height((x & 15) as usize, (z & 15) as usize) as i32
         } else {
@@ -1338,8 +2075,16 @@ impl GenWorld for World {
             return 15;
         }
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        if !self.chunks.contains_key(&pos) {
+            return if self.live.active { 0 } else { 15 };
+        }
+        if self.live.active && self.live_resolve_read(pos) {
+            return 0;
+        }
         if let Some(chunk) = self.chunks.get(&pos) {
             chunk.get_sky_light((x & 15) as usize, y as usize, (z & 15) as usize) as i32
+        } else if self.live.active {
+            0
         } else {
             15
         }
@@ -1353,8 +2098,13 @@ impl GenWorld for World {
             return 15;
         }
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        if self.live.active && self.live_resolve_read(pos) {
+            return 0;
+        }
         if let Some(chunk) = self.chunks.get(&pos) {
             chunk.get_block_light_value((x & 15) as usize, y as usize, (z & 15) as usize, 0)
+        } else if self.live.active {
+            0
         } else {
             15
         }
@@ -1365,10 +2115,13 @@ impl GenWorld for World {
             return false;
         }
         let pos = ChunkPos::new(x >> 4, z >> 4);
+        if self.live.active && self.live_resolve_read(pos) {
+            return false;
+        }
         if let Some(chunk) = self.chunks.get(&pos) {
             chunk.can_block_see_sky((x & 15) as usize, y as usize, (z & 15) as usize)
         } else {
-            true
+            !self.live.active
         }
     }
 
