@@ -897,7 +897,58 @@ impl World {
         self.get_tile_entity(x, y, z).is_none()
     }
 
+    /// Java `BlockPiston.c(World, i, j, k, EntityHuman)` (`BlockPiston.java:225-241`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_piston_orientation(
+        x: i32,
+        y: i32,
+        z: i32,
+        player_x: f64,
+        player_feet_y: f64,
+        player_z: f64,
+        yaw: f32,
+    ) -> u8 {
+        if (player_x as f32 - x as f32).abs() < 2.0 && (player_z as f32 - z as f32).abs() < 2.0 {
+            let d0 = player_feet_y + 1.82;
+            if d0 - (y as f64) > 2.0 {
+                return 1;
+            }
+            if (y as f64) - d0 > 0.0 {
+                return 0;
+            }
+        }
+        let l = (((yaw * 4.0 / 360.0) as f64 + 0.5).floor() as i32) & 3;
+        match l {
+            0 => 2,
+            1 => 5,
+            2 => 3,
+            _ => 4,
+        }
+    }
+
+    pub fn flush_pending_piston_syncs(&mut self) {
+        if self.pending_piston_syncs.is_empty() {
+            return;
+        }
+        let now = self.live_time;
+        let mut ready = Vec::new();
+        self.pending_piston_syncs.retain(|&(t, x, y, z)| {
+            if now >= t {
+                ready.push((x, y, z));
+                false
+            } else {
+                true
+            }
+        });
+        for (x, y, z) in ready {
+            self.flag_dirty(x, y, z);
+        }
+    }
+
     pub fn update_piston_state(&mut self, x: i32, y: i32, z: i32, piston_id: u8) {
+        if self.piston_updating {
+            return;
+        }
         let meta = self.get_data(x, y, z);
         let dir = (meta & 7) as usize;
         if dir > 5 {
@@ -908,8 +959,10 @@ impl World {
         let is_sticky = piston_id == blocks::STICKY_PISTON;
 
         if powered && !is_extended {
-            if self.try_extend_piston(x, y, z, dir, is_sticky) {
-                self.java_set_data(x, y, z, (dir as u8) | 8);
+            self.piston_updating = true;
+            let extended = self.try_extend_piston(x, y, z, dir, is_sticky);
+            self.piston_updating = false;
+            if extended {
                 self.world_events.push(WorldEvent::PlayNote {
                     x,
                     y: y as i16,
@@ -919,8 +972,12 @@ impl World {
                 });
             }
         } else if !powered && is_extended {
+            self.piston_updating = true;
+            self.java_set_raw_data(x, y, z, dir as u8);
             self.retract_piston(x, y, z, dir, is_sticky);
-            self.java_set_data(x, y, z, dir as u8);
+            self.piston_updating = false;
+            let sync_time = self.live_time + 2;
+            self.pending_piston_syncs.push((sync_time, x, y, z));
             self.world_events.push(WorldEvent::PlayNote {
                 x,
                 y: y as i16,
@@ -978,6 +1035,11 @@ impl World {
             count += 1;
         }
 
+        // Set base metadata bit 8 BEFORE moving blocks (`BlockPiston.java:85`)
+        self.java_set_raw_data(x, y, z, (dir as u8) | 8);
+        let sync_time = self.live_time + 2;
+        self.pending_piston_syncs.push((sync_time, x, y, z));
+
         // Shift pushed blocks from back to front by 1 block
         for step in (0..count).rev() {
             let sx = x + dx * (step as i32 + 1);
@@ -988,12 +1050,19 @@ impl World {
             let tz = sz + dz;
             let bid = self.get_block(sx, sy, sz);
             let bmeta = self.get_data(sx, sy, sz);
-            self.java_set_type_id_and_data(tx, ty, tz, bid, bmeta);
+            self.java_set_raw_type_id_and_data(tx, ty, tz, bid, bmeta);
+            self.java_apply_physics(tx, ty, tz, bid as i32);
+            self.pending_piston_syncs.push((sync_time, tx, ty, tz));
         }
 
         // Place Piston Extension (34) at (x + dx, y + dy, z + dz)
         let ext_meta = (dir as u8) | if is_sticky { 8 } else { 0 };
-        self.java_set_type_id_and_data(x + dx, y + dy, z + dz, blocks::PISTON_HEAD, ext_meta);
+        let hx = x + dx;
+        let hy = y + dy;
+        let hz = z + dz;
+        self.java_set_raw_type_id_and_data(hx, hy, hz, blocks::PISTON_HEAD, ext_meta);
+        self.java_apply_physics(hx, hy, hz, blocks::PISTON_HEAD as i32);
+        self.pending_piston_syncs.push((sync_time, hx, hy, hz));
         true
     }
 
@@ -1004,9 +1073,12 @@ impl World {
         let hx = x + dx;
         let hy = y + dy;
         let hz = z + dz;
+        let sync_time = self.live_time + 2;
 
         if self.get_block(hx, hy, hz) == blocks::PISTON_HEAD {
-            self.java_set_type_id(hx, hy, hz, blocks::AIR);
+            self.java_set_raw_type_id_and_data(hx, hy, hz, blocks::AIR, 0);
+            self.java_apply_physics(hx, hy, hz, blocks::PISTON_HEAD as i32);
+            self.pending_piston_syncs.push((sync_time, hx, hy, hz));
         }
 
         if is_sticky {
@@ -1023,25 +1095,608 @@ impl World {
                         || pull_id == blocks::STICKY_PISTON)
                 {
                     self.java_set_type_id(px, py, pz, blocks::AIR);
-                    self.java_set_type_id_and_data(hx, hy, hz, pull_id, pull_meta);
+                    self.java_set_raw_type_id_and_data(hx, hy, hz, pull_id, pull_meta);
+                    self.java_apply_physics(hx, hy, hz, pull_id as i32);
+                    self.pending_piston_syncs.push((sync_time, px, py, pz));
+                    self.pending_piston_syncs.push((sync_time, hx, hy, hz));
                 }
             }
         }
     }
 
     // ---------------------------------------------------------------------
-    // Rails (66 / 27 / 28)
+    // Rails (`BlockMinecartTrack.java` & `MinecartTrackLogic.java`: 66 / 27 / 28)
     // ---------------------------------------------------------------------
 
-    pub fn update_powered_rail(&mut self, x: i32, y: i32, z: i32) {
-        let meta = self.get_data(x, y, z);
-        let was_powered = (meta & 8) != 0;
-        let powered = self.is_block_indirectly_powered(x, y, z);
-        if was_powered != powered {
-            let new_meta = if powered { meta | 8 } else { meta & 7 };
-            self.java_set_data(x, y, z, new_meta);
-            self.java_apply_physics(x, y - 1, z, blocks::POWERED_RAIL as i32);
+    pub fn is_rail_block(id: u8) -> bool {
+        matches!(
+            id,
+            blocks::RAIL | blocks::POWERED_RAIL | blocks::DETECTOR_RAIL
+        )
+    }
+
+    pub fn is_rail_at(&self, x: i32, y: i32, z: i32) -> bool {
+        Self::is_rail_block(self.get_block(x, y, z))
+    }
+
+    fn has_rail_in_column(&self, x: i32, y: i32, z: i32) -> bool {
+        self.is_rail_at(x, y, z) || self.is_rail_at(x, y + 1, z) || self.is_rail_at(x, y - 1, z)
+    }
+
+    fn find_rail_in_column(&self, x: i32, y: i32, z: i32) -> Option<(i32, i32, i32)> {
+        if self.is_rail_at(x, y, z) {
+            Some((x, y, z))
+        } else if self.is_rail_at(x, y + 1, z) {
+            Some((x, y + 1, z))
+        } else if self.is_rail_at(x, y - 1, z) {
+            Some((x, y - 1, z))
+        } else {
+            None
         }
+    }
+
+    /// Java `MinecartTrackLogic.a(int meta)` — return the 2 connected `(x, y, z)` endpoints for a rail.
+    pub fn rail_connected_endpoints(x: i32, y: i32, z: i32, shape: u8) -> [(i32, i32, i32); 2] {
+        match shape {
+            0 => [(x, y, z - 1), (x, y, z + 1)],
+            1 => [(x - 1, y, z), (x + 1, y, z)],
+            2 => [(x - 1, y, z), (x + 1, y + 1, z)],
+            3 => [(x - 1, y + 1, z), (x + 1, y, z)],
+            4 => [(x, y + 1, z - 1), (x, y, z + 1)],
+            5 => [(x, y, z - 1), (x, y + 1, z + 1)],
+            6 => [(x + 1, y, z), (x, y, z + 1)],
+            7 => [(x - 1, y, z), (x, y, z + 1)],
+            8 => [(x - 1, y, z), (x, y, z - 1)],
+            9 => [(x + 1, y, z), (x, y, z - 1)],
+            _ => [(x, y, z - 1), (x, y, z + 1)],
+        }
+    }
+
+    /// Java `MinecartTrackLogic.a(boolean powered, boolean initialPlace)` (`MinecartTrackLogic.java:230-353`).
+    pub fn update_rail_track(&mut self, x: i32, y: i32, z: i32, initial_place: bool) {
+        let id = self.get_block(x, y, z);
+        if !Self::is_rail_block(id) {
+            return;
+        }
+        let is_special = id == blocks::POWERED_RAIL || id == blocks::DETECTOR_RAIL;
+        let powered = self.is_block_indirectly_powered(x, y, z);
+
+        let f_north = self.can_rail_connect_to(x, y, z - 1, x, z);
+        let f_south = self.can_rail_connect_to(x, y, z + 1, x, z);
+        let f_west = self.can_rail_connect_to(x - 1, y, z, x, z);
+        let f_east = self.can_rail_connect_to(x + 1, y, z, x, z);
+
+        let mut shape: i32 = -1;
+        if (f_north || f_south) && !f_west && !f_east {
+            shape = 0;
+        }
+        if (f_west || f_east) && !f_north && !f_south {
+            shape = 1;
+        }
+        if !is_special {
+            if f_south && f_east && !f_north && !f_west {
+                shape = 6;
+            }
+            if f_south && f_west && !f_north && !f_east {
+                shape = 7;
+            }
+            if f_north && f_west && !f_south && !f_east {
+                shape = 8;
+            }
+            if f_north && f_east && !f_south && !f_west {
+                shape = 9;
+            }
+        }
+        if shape == -1 {
+            if f_north || f_south {
+                shape = 0;
+            }
+            if f_west || f_east {
+                shape = 1;
+            }
+            if !is_special {
+                if powered {
+                    if f_south && f_east {
+                        shape = 6;
+                    }
+                    if f_west && f_south {
+                        shape = 7;
+                    }
+                    if f_east && f_north {
+                        shape = 9;
+                    }
+                    if f_north && f_west {
+                        shape = 8;
+                    }
+                } else {
+                    if f_north && f_west {
+                        shape = 8;
+                    }
+                    if f_east && f_north {
+                        shape = 9;
+                    }
+                    if f_west && f_south {
+                        shape = 7;
+                    }
+                    if f_south && f_east {
+                        shape = 6;
+                    }
+                }
+            }
+        }
+
+        if shape == 0 {
+            if self.is_rail_at(x, y + 1, z - 1) {
+                shape = 4;
+            }
+            if self.is_rail_at(x, y + 1, z + 1) {
+                shape = 5;
+            }
+        }
+        if shape == 1 {
+            if self.is_rail_at(x + 1, y + 1, z) {
+                shape = 2;
+            }
+            if self.is_rail_at(x - 1, y + 1, z) {
+                shape = 3;
+            }
+        }
+        if shape < 0 {
+            shape = 0;
+        }
+
+        let new_meta = if is_special {
+            (self.get_data(x, y, z) & 8) | (shape as u8)
+        } else {
+            shape as u8
+        };
+
+        if initial_place || self.get_data(x, y, z) != new_meta {
+            self.java_set_data(x, y, z, new_meta);
+            let endpoints = Self::rail_connected_endpoints(x, y, z, shape as u8);
+            for (ex, ey, ez) in endpoints {
+                if let Some((nx, ny, nz)) = self.find_rail_in_column(ex, ey, ez) {
+                    self.connect_neighbor_rail_toward(nx, ny, nz, x, y, z);
+                }
+            }
+        }
+    }
+
+    fn active_rail_connections(&self, rx: i32, ry: i32, rz: i32) -> Vec<(i32, i32, i32)> {
+        let id = self.get_block(rx, ry, rz);
+        let raw_meta = self.get_data(rx, ry, rz);
+        let shape = if id == blocks::POWERED_RAIL || id == blocks::DETECTOR_RAIL {
+            raw_meta & 7
+        } else {
+            raw_meta
+        };
+        let endpoints = Self::rail_connected_endpoints(rx, ry, rz, shape);
+        let mut active = Vec::with_capacity(2);
+        for (ex, ey, ez) in endpoints {
+            if let Some((nx, ny, nz)) = self.find_rail_in_column(ex, ey, ez) {
+                let nid = self.get_block(nx, ny, nz);
+                let nmeta = self.get_data(nx, ny, nz);
+                let nshape = if nid == blocks::POWERED_RAIL || nid == blocks::DETECTOR_RAIL {
+                    nmeta & 7
+                } else {
+                    nmeta
+                };
+                let n_ends = Self::rail_connected_endpoints(nx, ny, nz, nshape);
+                if n_ends.iter().any(|&(tx, _, tz)| tx == rx && tz == rz) {
+                    active.push((nx, ny, nz));
+                }
+            }
+        }
+        active
+    }
+
+    fn can_rail_connect_to(&self, cx: i32, cy: i32, cz: i32, from_x: i32, from_z: i32) -> bool {
+        let Some((rx, ry, rz)) = self.find_rail_in_column(cx, cy, cz) else {
+            return false;
+        };
+        let active = self.active_rail_connections(rx, ry, rz);
+        if active
+            .iter()
+            .any(|&(ax, _, az)| ax == from_x && az == from_z)
+        {
+            return true;
+        }
+        active.len() < 2
+    }
+
+    /// Java `MinecartTrackLogic.d(MinecartTrackLogic)` (`MinecartTrackLogic.java:152-217`).
+    fn connect_neighbor_rail_toward(
+        &mut self,
+        rx: i32,
+        ry: i32,
+        rz: i32,
+        target_x: i32,
+        target_y: i32,
+        target_z: i32,
+    ) {
+        let mut active = self.active_rail_connections(rx, ry, rz);
+        if !active
+            .iter()
+            .any(|&(ax, _, az)| ax == target_x && az == target_z)
+        {
+            if active.len() >= 2 {
+                return;
+            }
+            active.push((target_x, target_y, target_z));
+        }
+
+        let id = self.get_block(rx, ry, rz);
+        let is_special = id == blocks::POWERED_RAIL || id == blocks::DETECTOR_RAIL;
+
+        let f_north = active.iter().any(|&(ax, _, az)| ax == rx && az == rz - 1);
+        let f_south = active.iter().any(|&(ax, _, az)| ax == rx && az == rz + 1);
+        let f_west = active.iter().any(|&(ax, _, az)| ax == rx - 1 && az == rz);
+        let f_east = active.iter().any(|&(ax, _, az)| ax == rx + 1 && az == rz);
+
+        let mut shape: i32 = -1;
+        if f_north || f_south {
+            shape = 0;
+        }
+        if f_west || f_east {
+            shape = 1;
+        }
+        if !is_special {
+            if f_south && f_east && !f_north && !f_west {
+                shape = 6;
+            }
+            if f_south && f_west && !f_north && !f_east {
+                shape = 7;
+            }
+            if f_north && f_west && !f_south && !f_east {
+                shape = 8;
+            }
+            if f_north && f_east && !f_south && !f_west {
+                shape = 9;
+            }
+        }
+        if shape == 0 {
+            if self.is_rail_at(rx, ry + 1, rz - 1) {
+                shape = 4;
+            }
+            if self.is_rail_at(rx, ry + 1, rz + 1) {
+                shape = 5;
+            }
+        }
+        if shape == 1 {
+            if self.is_rail_at(rx + 1, ry + 1, rz) {
+                shape = 2;
+            }
+            if self.is_rail_at(rx - 1, ry + 1, rz) {
+                shape = 3;
+            }
+        }
+        if shape < 0 {
+            shape = 0;
+        }
+        let new_meta = if is_special {
+            (self.get_data(rx, ry, rz) & 8) | (shape as u8)
+        } else {
+            shape as u8
+        };
+        self.java_set_data(rx, ry, rz, new_meta);
+    }
+
+    /// Java `BlockMinecartTrack.doPhysics` (`BlockMinecartTrack.java:82-140`).
+    pub fn do_physics_rail(&mut self, x: i32, y: i32, z: i32, id: u8, neighbor_id: i32) {
+        let meta = self.get_data(x, y, z);
+        let is_special = id == blocks::POWERED_RAIL || id == blocks::DETECTOR_RAIL;
+        let shape = if is_special { meta & 7 } else { meta };
+
+        let mut invalid = !self.is_solid_normal_at(x, y - 1, z);
+        if shape == 2 && !self.is_solid_normal_at(x + 1, y, z) {
+            invalid = true;
+        }
+        if shape == 3 && !self.is_solid_normal_at(x - 1, y, z) {
+            invalid = true;
+        }
+        if shape == 4 && !self.is_solid_normal_at(x, y, z - 1) {
+            invalid = true;
+        }
+        if shape == 5 && !self.is_solid_normal_at(x, y, z + 1) {
+            invalid = true;
+        }
+
+        if invalid {
+            self.world_events.push(WorldEvent::DropItem {
+                x: x as f64,
+                y: y as f64,
+                z: z as f64,
+                item: ItemStack::new(id as i16, 1, 0),
+            });
+            self.java_set_type_id(x, y, z, blocks::AIR);
+        } else if id == blocks::POWERED_RAIL {
+            let powered = self.is_block_indirectly_powered(x, y, z)
+                || self.is_block_indirectly_powered(x, y + 1, z)
+                || self.powered_rail_chain(x, y, z, meta, true, 0)
+                || self.powered_rail_chain(x, y, z, meta, false, 0);
+            let mut changed = false;
+            if powered && (meta & 8) == 0 {
+                self.java_set_data(x, y, z, shape | 8);
+                changed = true;
+            } else if !powered && (meta & 8) != 0 {
+                self.java_set_data(x, y, z, shape);
+                changed = true;
+            }
+            if changed {
+                self.java_apply_physics(x, y - 1, z, id as i32);
+                if (2..=5).contains(&shape) {
+                    self.java_apply_physics(x, y + 1, z, id as i32);
+                }
+            }
+        } else if neighbor_id > 0 && self.is_power_source_block(neighbor_id as u8) && !is_special {
+            let count = usize::from(self.has_rail_in_column(x, y, z - 1))
+                + usize::from(self.has_rail_in_column(x, y, z + 1))
+                + usize::from(self.has_rail_in_column(x - 1, y, z))
+                + usize::from(self.has_rail_in_column(x + 1, y, z));
+            if count == 3 {
+                self.update_rail_track(x, y, z, false);
+            }
+        }
+    }
+
+    fn powered_rail_chain(
+        &self,
+        mut x: i32,
+        mut y: i32,
+        mut z: i32,
+        meta: u8,
+        forward: bool,
+        depth: usize,
+    ) -> bool {
+        if depth >= 8 {
+            return false;
+        }
+        let mut shape = meta & 7;
+        let mut check_down = true;
+        match shape {
+            0 => {
+                if forward {
+                    z += 1;
+                } else {
+                    z -= 1;
+                }
+            }
+            1 => {
+                if forward {
+                    x -= 1;
+                } else {
+                    x += 1;
+                }
+            }
+            2 => {
+                if forward {
+                    x -= 1;
+                } else {
+                    x += 1;
+                    y += 1;
+                    check_down = false;
+                }
+                shape = 1;
+            }
+            3 => {
+                if forward {
+                    x -= 1;
+                    y += 1;
+                    check_down = false;
+                } else {
+                    x += 1;
+                }
+                shape = 1;
+            }
+            4 => {
+                if forward {
+                    z += 1;
+                } else {
+                    z -= 1;
+                    y += 1;
+                    check_down = false;
+                }
+                shape = 0;
+            }
+            5 => {
+                if forward {
+                    z += 1;
+                    y += 1;
+                    check_down = false;
+                } else {
+                    z -= 1;
+                }
+                shape = 0;
+            }
+            _ => {}
+        }
+        if self.powered_rail_step(x, y, z, forward, depth, shape) {
+            return true;
+        }
+        check_down && self.powered_rail_step(x, y - 1, z, forward, depth, shape)
+    }
+
+    fn powered_rail_step(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        forward: bool,
+        depth: usize,
+        prev_shape: u8,
+    ) -> bool {
+        if self.get_block(x, y, z) != blocks::POWERED_RAIL {
+            return false;
+        }
+        let meta = self.get_data(x, y, z);
+        let shape = meta & 7;
+        if prev_shape == 1 && (shape == 0 || shape == 4 || shape == 5) {
+            return false;
+        }
+        if prev_shape == 0 && (shape == 1 || shape == 2 || shape == 3) {
+            return false;
+        }
+        if (meta & 8) != 0 {
+            if self.is_block_indirectly_powered(x, y, z)
+                || self.is_block_indirectly_powered(x, y + 1, z)
+            {
+                return true;
+            }
+            return self.powered_rail_chain(x, y, z, meta, forward, depth + 1);
+        }
+        false
+    }
+
+    // ---------------------------------------------------------------------
+    // Fire (`BlockFire.java`: ID 51)
+    // ---------------------------------------------------------------------
+
+    /// Java `BlockFire.a[]` — chance to encourage fire spread.
+    pub fn fire_encourage_chance(id: u8) -> i32 {
+        match id {
+            blocks::WOOD_PLANKS | blocks::FENCE | blocks::WOOD_STAIRS | blocks::LOG => 5,
+            blocks::TNT => 15,
+            blocks::LEAVES | blocks::BOOKSHELF | blocks::WOOL => 30,
+            blocks::TALL_GRASS => 60,
+            _ => 0,
+        }
+    }
+
+    /// Java `BlockFire.b[]` — ability for block to be consumed by fire.
+    pub fn fire_burn_ability(id: u8) -> i32 {
+        match id {
+            blocks::LOG => 5,
+            blocks::WOOD_PLANKS | blocks::FENCE | blocks::WOOD_STAIRS | blocks::BOOKSHELF => 20,
+            blocks::LEAVES | blocks::WOOL => 60,
+            blocks::TNT | blocks::TALL_GRASS => 100,
+            _ => 0,
+        }
+    }
+
+    /// Java `BlockFire.g(World, i, j, k)`: does any of the 6 neighbors have `a[id] > 0`?
+    pub fn has_flammable_neighbor(&self, x: i32, y: i32, z: i32) -> bool {
+        Self::fire_encourage_chance(self.get_block(x + 1, y, z)) > 0
+            || Self::fire_encourage_chance(self.get_block(x - 1, y, z)) > 0
+            || Self::fire_encourage_chance(self.get_block(x, y - 1, z)) > 0
+            || Self::fire_encourage_chance(self.get_block(x, y + 1, z)) > 0
+            || Self::fire_encourage_chance(self.get_block(x, y, z - 1)) > 0
+            || Self::fire_encourage_chance(self.get_block(x, y, z + 1)) > 0
+    }
+
+    fn max_neighbor_fire_encourage(&self, x: i32, y: i32, z: i32) -> i32 {
+        if self.get_block(x, y, z) != blocks::AIR {
+            return 0;
+        }
+        let mut m = 0;
+        for (nx, ny, nz) in [
+            (x + 1, y, z),
+            (x - 1, y, z),
+            (x, y - 1, z),
+            (x, y + 1, z),
+            (x, y, z - 1),
+            (x, y, z + 1),
+        ] {
+            m = m.max(Self::fire_encourage_chance(self.get_block(nx, ny, nz)));
+        }
+        m
+    }
+
+    /// Java `BlockFire.a(World, i, j, k, bound, Random, age)` (`BlockFire.java:154-186`).
+    fn try_burn_neighbor_block(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        bound: i32,
+        age: i32,
+        rng: &mut JavaRandom,
+    ) {
+        if !(0..128).contains(&y) {
+            return;
+        }
+        let target_id = self.get_block(x, y, z);
+        let ability = Self::fire_burn_ability(target_id);
+        if rng.next_i32_bound(bound) < ability {
+            let is_tnt = target_id == blocks::TNT;
+            if rng.next_i32_bound(age + 10) < 5 {
+                let new_age = (age + rng.next_i32_bound(5) / 4).min(15) as u8;
+                self.java_set_type_id_and_data(x, y, z, blocks::FIRE, new_age);
+            } else {
+                self.java_set_type_id(x, y, z, blocks::AIR);
+            }
+            if is_tnt {
+                self.ignite_tnt(x, y, z, false);
+            }
+        }
+    }
+
+    /// Java `BlockFire.a(World, i, j, k, Random)` (`BlockFire.java:61-152`).
+    pub fn tick_fire(&mut self, x: i32, y: i32, z: i32) {
+        let on_netherrack = y > 0 && self.get_block(x, y - 1, z) == blocks::NETHERRACK;
+        if !self.is_solid_normal_at(x, y - 1, z) && !self.has_flammable_neighbor(x, y, z) {
+            self.java_set_type_id(x, y, z, blocks::AIR);
+            return;
+        }
+
+        let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+        let age = self.get_data(x, y, z) as i32;
+        if age < 15 {
+            let next_age = (age + rng.next_i32_bound(3) / 2).min(15) as u8;
+            self.java_set_raw_data(x, y, z, next_age);
+        }
+
+        self.java_schedule_tick(x, y, z, blocks::FIRE, 40);
+
+        if !on_netherrack && !self.has_flammable_neighbor(x, y, z) {
+            if !self.is_solid_normal_at(x, y - 1, z) || age > 3 {
+                self.java_set_type_id(x, y, z, blocks::AIR);
+            }
+            self.tick_random = rng;
+            return;
+        }
+
+        if !on_netherrack
+            && Self::fire_encourage_chance(self.get_block(x, y - 1, z)) == 0
+            && age == 15
+            && rng.next_i32_bound(4) == 0
+        {
+            self.java_set_type_id(x, y, z, blocks::AIR);
+            self.tick_random = rng;
+            return;
+        }
+
+        self.try_burn_neighbor_block(x + 1, y, z, 300, age, &mut rng);
+        self.try_burn_neighbor_block(x - 1, y, z, 300, age, &mut rng);
+        self.try_burn_neighbor_block(x, y - 1, z, 250, age, &mut rng);
+        self.try_burn_neighbor_block(x, y + 1, z, 250, age, &mut rng);
+        self.try_burn_neighbor_block(x, y, z - 1, 300, age, &mut rng);
+        self.try_burn_neighbor_block(x, y, z + 1, 300, age, &mut rng);
+
+        for ix in (x - 1)..=(x + 1) {
+            for iz in (z - 1)..=(z + 1) {
+                for iy in (y - 1)..=(y + 4) {
+                    if !(1..127).contains(&iy) || (ix == x && iy == y && iz == z) {
+                        continue;
+                    }
+                    let mut chance_bound = 100;
+                    if iy > y + 1 {
+                        chance_bound += (iy - (y + 1)) * 100;
+                    }
+                    let enc = self.max_neighbor_fire_encourage(ix, iy, iz);
+                    if enc > 0 {
+                        let spread_threshold = (enc + 40) / (age + 30);
+                        if spread_threshold > 0
+                            && rng.next_i32_bound(chance_bound) <= spread_threshold
+                        {
+                            let new_age = (age + rng.next_i32_bound(5) / 4).min(15) as u8;
+                            self.java_set_type_id_and_data(ix, iy, iz, blocks::FIRE, new_age);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.tick_random = rng;
     }
 
     // ---------------------------------------------------------------------
@@ -1202,10 +1857,9 @@ impl World {
                         self.java_set_type_id(wx, y, wz, blocks::REDSTONE_ORE);
                     }
                     blocks::FIRE => {
-                        let below = self.get_block(wx, y - 1, wz);
-                        if below != blocks::NETHERRACK && rng.next_i32_bound(4) == 0 {
-                            self.java_set_type_id(wx, y, wz, blocks::AIR);
-                        }
+                        self.tick_random = rng;
+                        self.tick_fire(wx, y, wz);
+                        rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
                     }
                     blocks::LEAVES => {
                         let meta = self.get_data(wx, y, wz);
@@ -1347,5 +2001,73 @@ mod tests {
             "Sticky piston should pull cobblestone back to (6, 64, 5)"
         );
         assert_eq!(world.get_block(7, 64, 5), blocks::AIR);
+        assert_eq!(world.get_block(5, 64, 5), blocks::STICKY_PISTON);
+    }
+
+    #[test]
+    fn piston_never_deletes_itself_when_breaking_power_source_or_retracting() {
+        let mut world = make_flat_world();
+        // Piston facing UP (dir = 1) at (5, 64, 5) with a Lever on top of it at (5, 65, 5)
+        world.java_set_type_id_and_data(5, 64, 5, blocks::PISTON, 1);
+        world.java_set_type_id_and_data(5, 65, 5, blocks::LEVER, 13);
+        world.notify_attachment_neighbors(5, 65, 5, blocks::LEVER, 5);
+
+        // Even after breaking its own lever at (5, 65, 5) and retracting, the piston base at (5, 64, 5) MUST remain intact!
+        assert_eq!(world.get_block(5, 64, 5), blocks::PISTON);
+
+        // Also test DOWN-facing piston (dir = 0) at (8, 66, 8) extending and retracting
+        world.java_set_type_id_and_data(8, 66, 8, blocks::PISTON, 0);
+        world.java_set_type_id_and_data(8, 66, 7, blocks::REDSTONE_TORCH_ON, 5);
+        assert_eq!(world.get_block(8, 66, 8), blocks::PISTON);
+        assert_eq!(world.get_block(8, 65, 8), blocks::PISTON_HEAD);
+
+        world.java_set_type_id(8, 66, 7, blocks::AIR);
+        assert_eq!(world.get_block(8, 66, 8), blocks::PISTON);
+        assert_eq!(world.get_block(8, 65, 8), blocks::AIR);
+    }
+
+    #[test]
+    fn rails_connect_along_both_axes_and_form_curves() {
+        let mut world = make_flat_world();
+        // Place two rails along X axis: (4, 64, 4) and (5, 64, 4)
+        world.java_set_type_id(4, 64, 4, blocks::RAIL);
+        world.java_set_type_id(5, 64, 4, blocks::RAIL);
+        assert_eq!(
+            world.get_data(4, 64, 4),
+            1,
+            "Rail should orient along X axis (meta = 1)"
+        );
+        assert_eq!(
+            world.get_data(5, 64, 4),
+            1,
+            "Second rail should orient along X axis (meta = 1)"
+        );
+
+        // Place a third rail at (5, 64, 5) (south of (5, 64, 4)) to form a corner at (5, 64, 4)
+        world.java_set_type_id(5, 64, 5, blocks::RAIL);
+        assert_eq!(
+            world.get_data(5, 64, 4),
+            7,
+            "Corner rail with west and south neighbors should curve to meta = 7"
+        );
+    }
+
+    #[test]
+    fn fire_spreads_and_burns_flammable_blocks() {
+        let mut world = make_flat_world();
+        world.java_set_type_id(10, 64, 10, blocks::WOOD_PLANKS);
+        world.java_set_type_id(10, 65, 10, blocks::FIRE);
+
+        let mut changed = false;
+        for _ in 0..40 {
+            if world.get_block(10, 65, 10) == blocks::FIRE {
+                world.tick_fire(10, 65, 10);
+            }
+            if world.get_block(10, 64, 10) != blocks::WOOD_PLANKS {
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "Fire should eventually burn adjacent wood planks");
     }
 }

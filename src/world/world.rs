@@ -237,6 +237,10 @@ pub struct World {
     pub(crate) falling_sands: Vec<FallingSand>,
     /// Java `BlockRedstoneWire.a` — false while evaluating wire indirect power.
     pub(crate) wire_can_provide_power: bool,
+    /// Java `BlockPiston.b` — true while a piston is extending or retracting.
+    pub(crate) piston_updating: bool,
+    /// Pending 2-tick piston block confirmations (`(tick_time, x, y, z)`).
+    pub(crate) pending_piston_syncs: Vec<(i64, i32, i32, i32)>,
     /// Java `BlockRedstoneTorch.b` — burnout toggle history.
     pub(crate) torch_burnout_list: Vec<crate::world::redstone::RedstoneUpdateInfo>,
     /// Events emitted by redstone/pistons/dispensers/random ticks for `Server`.
@@ -433,6 +437,8 @@ impl World {
             light_dirty_chunks: HashSet::new(),
             falling_sands: Vec::new(),
             wire_can_provide_power: true,
+            piston_updating: false,
+            pending_piston_syncs: Vec::new(),
             torch_burnout_list: Vec::new(),
             world_events: Vec::new(),
             random_tick_lcg: (world_seed as i32)
@@ -805,7 +811,12 @@ impl World {
         // `Block.remove(old)` runs before the data reset, so a removal callback
         // (leaves/log marking) still sees the previous metadata of this block.
         if old_id != 0 {
-            self.block_remove(old_id, x, y, z);
+            let old_data = self
+                .chunks
+                .get(&pos)
+                .map(|c| c.get_metadata(lx, y as usize, lz))
+                .unwrap_or(0);
+            self.block_remove(old_id, old_data, x, y, z);
         }
         {
             let chunk = self.chunks.get_mut(&pos).unwrap();
@@ -874,7 +885,7 @@ impl World {
         self.packet_cache.borrow_mut().remove(&pos);
 
         if old_id != 0 {
-            self.block_remove(old_id, x, y, z);
+            self.block_remove(old_id, old_data, x, y, z);
         }
 
         if blocks::light_opacity(id) != 0 {
@@ -1087,20 +1098,24 @@ impl World {
                 }
             }
             blocks::PISTON | blocks::STICKY_PISTON => {
-                self.update_piston_state(x, y, z, id);
+                if !self.piston_updating {
+                    self.update_piston_state(x, y, z, id);
+                }
             }
             blocks::PISTON_HEAD => {
-                let meta = self.get_data(x, y, z);
-                let dir = (meta & 7) as usize;
-                if dir <= 5 {
-                    let bx = x - [0, 0, 0, 0, -1, 1][dir];
-                    let by = y - [-1, 1, 0, 0, 0, 0][dir];
-                    let bz = z - [0, 0, -1, 1, 0, 0][dir];
-                    let base_id = self.get_block(bx, by, bz);
-                    if base_id != blocks::PISTON && base_id != blocks::STICKY_PISTON {
-                        self.java_set_type_id(x, y, z, 0);
-                    } else {
-                        self.java_neighbor_physics(bx, by, bz, l);
+                if !self.piston_updating {
+                    let meta = self.get_data(x, y, z);
+                    let dir = (meta & 7) as usize;
+                    if dir <= 5 {
+                        let bx = x - [0, 0, 0, 0, -1, 1][dir];
+                        let by = y - [-1, 1, 0, 0, 0, 0][dir];
+                        let bz = z - [0, 0, -1, 1, 0, 0][dir];
+                        let base_id = self.get_block(bx, by, bz);
+                        if base_id != blocks::PISTON && base_id != blocks::STICKY_PISTON {
+                            self.java_set_type_id(x, y, z, 0);
+                        } else {
+                            self.java_neighbor_physics(bx, by, bz, l);
+                        }
                     }
                 }
             }
@@ -1112,8 +1127,14 @@ impl World {
                     self.ignite_tnt(x, y, z, false);
                 }
             }
-            blocks::POWERED_RAIL => {
-                self.update_powered_rail(x, y, z);
+            blocks::RAIL | blocks::POWERED_RAIL | blocks::DETECTOR_RAIL => {
+                self.do_physics_rail(x, y, z, id, l);
+            }
+            blocks::FIRE
+                if !self.is_solid_normal_at(x, y - 1, z)
+                    && !self.has_flammable_neighbor(x, y, z) =>
+            {
+                self.java_set_type_id(x, y, z, 0);
             }
             _ => {}
         }
@@ -1222,6 +1243,7 @@ impl World {
                 }
             }
             blocks::DISPENSER => self.tick_dispenser(x, y, z),
+            blocks::FIRE => self.tick_fire(x, y, z),
             _ => {}
         }
     }
@@ -1826,22 +1848,26 @@ impl World {
             self.java_run_light_block(blk);
         }
         self.do_lighting_depth -= 1;
-        if self.do_lighting_depth == 0 && self.light_updates.is_empty() {
-            if self.light_updates.capacity() > 2048 {
-                self.light_updates.shrink_to(512);
-            }
-            if !self.light_dirty_chunks.is_empty() {
-                for pos in self.light_dirty_chunks.drain() {
-                    if let Some(chunk) = self.chunks.get_mut(&pos) {
-                        chunk.compact();
-                    }
-                }
-                if self.light_dirty_chunks.capacity() > 256 {
-                    self.light_dirty_chunks.shrink_to(64);
-                }
-            }
+        if self.do_lighting_depth == 0
+            && self.light_updates.is_empty()
+            && self.light_updates.capacity() > 2048
+        {
+            self.light_updates.shrink_to(512);
         }
         flag
+    }
+
+    pub fn compact_dirty_light_chunks(&mut self) {
+        if self.light_updates.is_empty() && !self.light_dirty_chunks.is_empty() {
+            for pos in self.light_dirty_chunks.drain() {
+                if let Some(chunk) = self.chunks.get_mut(&pos) {
+                    chunk.compact();
+                }
+            }
+            if self.light_dirty_chunks.capacity() > 256 {
+                self.light_dirty_chunks.shrink_to(64);
+            }
+        }
     }
 
     pub fn compact_all_chunks(&mut self) {
@@ -1858,7 +1884,7 @@ impl World {
     }
 
     /// `Block.remove` dispatch for the replaced block.
-    fn block_remove(&mut self, id: u8, x: i32, y: i32, z: i32) {
+    fn block_remove(&mut self, id: u8, old_data: u8, x: i32, y: i32, z: i32) {
         match id {
             blocks::LEAVES => self.mark_leaves_around(x, y, z, 1, false),
             blocks::LOG => self.mark_leaves_around(x, y, z, 4, true),
@@ -1871,20 +1897,18 @@ impl World {
                 self.notify_torch_neighbors(x, y, z, id);
             }
             blocks::LEVER | blocks::STONE_BUTTON => {
-                let meta = self.get_data(x, y, z);
-                if (meta & 8) > 0 {
-                    self.notify_attachment_neighbors(x, y, z, id, meta & 7);
+                if (old_data & 8) > 0 {
+                    self.notify_attachment_neighbors(x, y, z, id, old_data & 7);
                 }
             }
             blocks::STONE_PLATE | blocks::WOOD_PLATE => {
-                if self.get_data(x, y, z) > 0 {
+                if old_data > 0 {
                     self.java_apply_physics(x, y, z, id as i32);
                     self.java_apply_physics(x, y - 1, z, id as i32);
                 }
             }
-            blocks::PISTON_HEAD => {
-                let meta = self.get_data(x, y, z);
-                let dir = (meta & 7) as usize;
+            blocks::PISTON_HEAD if !self.piston_updating => {
+                let dir = (old_data & 7) as usize;
                 if dir <= 5 {
                     let bx = x - [0, 0, 0, 0, -1, 1][dir];
                     let by = y - [-1, 1, 0, 0, 0, 0][dir];
@@ -1893,6 +1917,13 @@ impl World {
                     if (base == blocks::PISTON || base == blocks::STICKY_PISTON)
                         && (self.get_data(bx, by, bz) & 8) != 0
                     {
+                        self.world_events
+                            .push(crate::world::redstone::WorldEvent::DropItem {
+                                x: bx as f64,
+                                y: by as f64,
+                                z: bz as f64,
+                                item: crate::gameplay::items::ItemStack::new(base as i16, 1, 0),
+                            });
                         self.java_set_type_id(bx, by, bz, 0);
                     }
                 }
@@ -1983,6 +2014,21 @@ impl World {
             }
             blocks::TNT if self.is_block_indirectly_powered(x, y, z) => {
                 self.ignite_tnt(x, y, z, false);
+            }
+            blocks::RAIL | blocks::POWERED_RAIL | blocks::DETECTOR_RAIL => {
+                if !self.suppress_physics {
+                    self.update_rail_track(x, y, z, true);
+                    if id == blocks::POWERED_RAIL {
+                        self.do_physics_rail(x, y, z, id, id as i32);
+                    }
+                }
+            }
+            blocks::FIRE => {
+                if !self.is_solid_normal_at(x, y - 1, z) && !self.has_flammable_neighbor(x, y, z) {
+                    self.java_set_type_id(x, y, z, 0);
+                } else {
+                    self.java_schedule_tick(x, y, z, blocks::FIRE, 40);
+                }
             }
             _ => {}
         }
@@ -2416,7 +2462,7 @@ impl World {
         z: i32,
         face: u8,
         yaw: f32,
-        pitch: f32,
+        _pitch: f32,
     ) {
         use crate::gameplay::tile::TileEntity;
         let facing_4 = (((yaw * 4.0 / 360.0) + 0.5).floor() as i32) & 3;
@@ -2497,6 +2543,9 @@ impl World {
             blocks::JUKEBOX => {
                 self.set_world_tile_entity(TileEntity::new_record_player(x, y, z));
             }
+            blocks::MOB_SPAWNER => {
+                self.set_world_tile_entity(TileEntity::new_spawner(x, y, z, "Pig".to_string()));
+            }
             blocks::PUMPKIN | blocks::JACK_O_LANTERN => {
                 let meta = (((yaw * 4.0 / 360.0) + 2.5).floor() as i32 & 3) as u8;
                 self.java_set_data(x, y, z, meta);
@@ -2543,17 +2592,11 @@ impl World {
                 }
             }
             blocks::PISTON | blocks::STICKY_PISTON => {
-                let meta = if pitch > 45.0 {
-                    1
-                } else if pitch < -45.0 {
-                    0
-                } else {
-                    match facing_4 {
-                        0 => 2,
-                        1 => 5,
-                        2 => 3,
-                        _ => 4,
-                    }
+                let meta = match facing_4 {
+                    0 => 2,
+                    1 => 5,
+                    2 => 3,
+                    _ => 4,
                 };
                 self.java_set_data(x, y, z, meta);
                 self.update_piston_state(x, y, z, block_id);

@@ -283,15 +283,26 @@ impl EntityTrackerEntry {
     }
 
     pub fn make_tnt_spawn_packets(&self, tnt: &PrimedTnt) -> Vec<Clientbound> {
-        vec![Clientbound::VehicleSpawn(VehicleSpawn {
-            entity_id: tnt.entity_id,
-            vehicle_type: 50,
-            x: self.encoded_x,
-            y: self.encoded_y,
-            z: self.encoded_z,
-            thrower_id: 0,
-            velocity: None,
-        })]
+        let vx = (tnt.mot_x.clamp(-3.9, 3.9) * 8000.0) as i16;
+        let vy = (tnt.mot_y.clamp(-3.9, 3.9) * 8000.0) as i16;
+        let vz = (tnt.mot_z.clamp(-3.9, 3.9) * 8000.0) as i16;
+        vec![
+            Clientbound::VehicleSpawn(VehicleSpawn {
+                entity_id: tnt.entity_id,
+                vehicle_type: 50,
+                x: self.encoded_x,
+                y: self.encoded_y,
+                z: self.encoded_z,
+                thrower_id: 0,
+                velocity: None,
+            }),
+            Clientbound::EntityVelocity(EntityVelocity {
+                entity_id: tnt.entity_id,
+                mot_x: vx,
+                mot_y: vy,
+                mot_z: vz,
+            }),
+        ]
     }
 
     pub fn make_minecart_spawn_packets(&self, cart: &Minecart) -> Vec<Clientbound> {
@@ -1395,6 +1406,7 @@ impl EntityTracker {
         let vel_delta_sq = dvx * dvx + dvy * dvy + dvz * dvz;
         if vel_delta_sq > 0.0004
             || (vel_delta_sq > 0.0 && mot_x == 0.0 && mot_y == 0.0 && mot_z == 0.0)
+            || entry.teleport_ticks >= 10
         {
             entry.last_mot_x = mot_x;
             entry.last_mot_y = mot_y;
@@ -1412,7 +1424,35 @@ impl EntityTracker {
                 });
             }
         }
-        Self::emit_pos_rot_update(entry, entity_id, x, y, z, yaw, pitch, outbound);
+        if entry.teleport_ticks >= 10 {
+            entry.teleport_ticks = 0;
+            let new_x = (x * 32.0).floor() as i32;
+            let new_y = (y * 32.0).floor() as i32;
+            let new_z = (z * 32.0).floor() as i32;
+            let new_yaw = pack_angle(yaw);
+            let new_pitch = pack_angle(pitch);
+            entry.encoded_x = new_x;
+            entry.encoded_y = new_y;
+            entry.encoded_z = new_z;
+            entry.encoded_yaw = new_yaw;
+            entry.encoded_pitch = new_pitch;
+            let tp = Clientbound::EntityTeleport(EntityTeleport {
+                entity_id,
+                x: new_x,
+                y: new_y,
+                z: new_z,
+                yaw: new_yaw,
+                pitch: new_pitch,
+            });
+            for &viewer_id in &entry.tracked_players {
+                outbound.push(OutboundTrackingPacket {
+                    recipient_id: viewer_id,
+                    packet: tp.clone(),
+                });
+            }
+        } else {
+            Self::emit_pos_rot_update(entry, entity_id, x, y, z, yaw, pitch, outbound);
+        }
     }
 }
 

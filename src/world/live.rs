@@ -30,10 +30,19 @@ use crate::util::rng::JavaRandom;
 use crate::world::chunk::{ChunkPos, ChunkState};
 use crate::world::world::{with_generator, World};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DirtyChunk {
-    pub blocks: [u16; 10],
+    pub blocks: [u16; 64],
     pub count: usize,
+}
+
+impl Default for DirtyChunk {
+    fn default() -> Self {
+        Self {
+            blocks: [0; 64],
+            count: 0,
+        }
+    }
 }
 
 /// Shared state for the live/server choreography.
@@ -460,7 +469,7 @@ impl World {
         self.packet_cache.borrow_mut().remove(&pos);
         if self.live.instances.contains_key(&pos) {
             let entry = self.live.dirty_chunks.entry(pos).or_default();
-            if entry.count < 10 {
+            if entry.count < 64 {
                 let short1 = (((x & 15) as u16) << 12) | (((z & 15) as u16) << 8) | (y as u16);
                 if !entry.blocks[..entry.count].contains(&short1) {
                     entry.blocks[entry.count] = short1;

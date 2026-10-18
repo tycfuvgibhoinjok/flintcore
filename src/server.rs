@@ -250,6 +250,7 @@ impl Server {
         for player in self.entities.iter_players_mut() {
             player.tick();
         }
+        self.tick_player_environmental_damage();
         self.tick_deferred_digging();
         self.tick_pressure_plates_and_beds();
 
@@ -257,6 +258,7 @@ impl Server {
         if ticks % 20 == 0 && self.world.live_is_active() {
             self.tick_mob_spawner();
         }
+        self.tick_mob_spawners();
 
         // Tick boats, mobs, projectiles, primed TNTs, minecarts, and dropped items
         self.tick_boats();
@@ -266,6 +268,16 @@ impl Server {
         self.tick_minecarts();
         self.tick_dropped_items();
         self.process_world_events();
+        self.world.flush_pending_piston_syncs();
+
+        for _ in 0..5 {
+            if !self.world.java_do_lighting() {
+                break;
+            }
+        }
+        if ticks % 200 == 0 {
+            self.world.compact_dirty_light_chunks();
+        }
 
         self.stream_chunks();
         self.flush_dirty_chunks();
@@ -584,8 +596,17 @@ impl Server {
                 }
             } else if let Some((yaw, pitch)) = rot {
                 if let Some(player) = self.entities.get_by_conn_mut(id) {
+                    player.mot_x = 0.0;
+                    player.mot_z = 0.0;
                     player.yaw = yaw;
                     player.pitch = pitch;
+                    player.on_ground = on_ground;
+                }
+                return;
+            } else {
+                if let Some(player) = self.entities.get_by_conn_mut(id) {
+                    player.mot_x = 0.0;
+                    player.mot_z = 0.0;
                     player.on_ground = on_ground;
                 }
                 return;
@@ -1503,7 +1524,21 @@ impl Server {
         } else {
             old_meta
         };
-        if items::can_harvest_block(held_item, old_block) {
+        // BlockTNT.postBreak (`BlockTNT.java:41-52`): ignite when metadata bit 0 is set, else drop TNT block
+        if old_block == blocks::TNT {
+            if (old_meta & 1) != 0 || held_item.is_some_and(|s| s.id == items::FLINT_AND_STEEL) {
+                self.world.ignite_tnt(x, y, z, false);
+                self.process_world_events();
+            } else {
+                self.spawn_dropped_item_random(
+                    x as f64,
+                    y as f64,
+                    z as f64,
+                    ItemStack::new(blocks::TNT as i16, 1, 0),
+                    10,
+                );
+            }
+        } else if items::can_harvest_block(held_item, old_block) {
             let mut rng = std::mem::replace(
                 &mut self.world.world_random,
                 crate::util::rng::JavaRandom::new(0),
@@ -1568,6 +1603,16 @@ impl Server {
                 self.world
                     .java_set_type_id(x, y, z, blocks::LIT_REDSTONE_ORE);
                 self.send_block_change_to_observers(x, y, z);
+            }
+            blocks::TNT => {
+                let holding_flint = self
+                    .entities
+                    .get_by_conn(id)
+                    .and_then(|p| p.inventory.item_in_hand())
+                    .is_some_and(|s| s.id == items::FLINT_AND_STEEL);
+                if holding_flint {
+                    self.world.java_set_raw_data(x, y, z, 1);
+                }
             }
             _ => {}
         }
@@ -2308,8 +2353,9 @@ impl Server {
             items::FLINT_AND_STEEL => {
                 if clicked_block == blocks::TNT {
                     self.world.ignite_tnt(cx, cy, cz, false);
-                    self.process_world_events();
                     self.send_block_change_to_observers(cx, cy, cz);
+                    self.send_block_change_to_observers(tx, ty, tz);
+                    self.process_world_events();
                 } else if self.world.get_block(tx, ty, tz) == blocks::AIR {
                     self.world.java_set_type_id(tx, ty, tz, blocks::FIRE);
                     self.send_block_change_to_observers(tx, ty, tz);
@@ -2462,11 +2508,23 @@ impl Server {
                     && self.world.can_place_block_at(block_id, tx, ty, tz, face)
                     && !self.block_intersects_any_player(block_id, tx, ty, tz)
                 {
-                    let meta = items::filter_block_data(stack.id, stack.damage);
+                    let is_piston = block_id == blocks::PISTON || block_id == blocks::STICKY_PISTON;
+                    let meta = if is_piston {
+                        World::compute_piston_orientation(
+                            tx, ty, tz, player_x, player_y, player_z, yaw,
+                        )
+                    } else {
+                        items::filter_block_data(stack.id, stack.damage)
+                    };
                     self.world
                         .java_set_type_id_and_data(tx, ty, tz, block_id, meta);
-                    self.world
-                        .post_place_block(block_id, tx, ty, tz, face, yaw, pitch);
+                    if is_piston {
+                        self.world.update_piston_state(tx, ty, tz, block_id);
+                    } else {
+                        self.world
+                            .post_place_block(block_id, tx, ty, tz, face, yaw, pitch);
+                    }
+                    self.process_world_events();
                     self.send_block_change_to_observers(tx, ty, tz);
                     if ty > 0 {
                         self.send_block_change_to_observers(tx, ty - 1, tz);
@@ -2769,9 +2827,38 @@ impl Server {
         }
     }
 
+    fn boat_aabb_collides_solid(&self, x: f64, y: f64, z: f64) -> bool {
+        let min_x = (x - 0.7).floor() as i32;
+        let max_x = (x + 0.7).floor() as i32;
+        let min_y = (y - 0.25).floor() as i32;
+        let max_y = (y + 0.25).floor() as i32;
+        let min_z = (z - 0.7).floor() as i32;
+        let max_z = (z + 0.7).floor() as i32;
+
+        for bx in min_x..=max_x {
+            for by in min_y..=max_y {
+                for bz in min_z..=max_z {
+                    let bid = self.world.get_block(bx, by, bz);
+                    if blocks::is_solid(bid) && !blocks::is_water(bid) && bid != blocks::SNOW {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn tick_boats(&mut self) {
         let boat_ids: Vec<i32> = self.entities.iter_boats().map(|b| b.entity_id).collect();
+        if boat_ids.is_empty() {
+            return;
+        }
         let mut crashed_boats = Vec::new();
+        let players_pos: Vec<(i32, f64, f64, f64, bool)> = self
+            .entities
+            .iter_players()
+            .map(|p| (p.entity_id, p.x, p.y, p.z, p.dead))
+            .collect();
 
         for boat_id in boat_ids {
             let passenger_vel = self
@@ -2799,136 +2886,185 @@ impl Server {
                 }
             }
 
+            let Some(mut boat_snap) = self.entities.get_boat(boat_id).cloned() else {
+                continue;
+            };
+            if boat_snap.time_since_hit > 0 {
+                boat_snap.time_since_hit -= 1;
+            }
+            if boat_snap.damage > 0 {
+                boat_snap.damage -= 1;
+            }
+            boat_snap.prev_x = boat_snap.x;
+            boat_snap.prev_y = boat_snap.y;
+            boat_snap.prev_z = boat_snap.z;
+
+            // 5-slice water buoyancy check (`EntityBoat.java:166-177`)
+            let min_y = boat_snap.y - 0.3;
+            let max_y = boat_snap.y + 0.3;
+            let mut d0 = 0.0f64;
+            for i in 0..5 {
+                let y1 = min_y + (max_y - min_y) * (i as f64) / 5.0 - 0.125;
+                let by = y1.floor() as i32;
+                let bx = boat_snap.x.floor() as i32;
+                let bz = boat_snap.z.floor() as i32;
+                if blocks::is_water(self.world.get_block(bx, by, bz)) {
+                    d0 += 0.2;
+                }
+            }
+
+            if d0 < 1.0 {
+                let d3 = d0 * 2.0 - 1.0;
+                boat_snap.mot_y += 0.03999999910593033 * d3;
+            } else {
+                if boat_snap.mot_y < 0.0 {
+                    boat_snap.mot_y /= 2.0;
+                }
+                boat_snap.mot_y += 0.007000000216066837;
+            }
+
+            if let Some((pmx, pmz)) = passenger_vel {
+                boat_snap.mot_x += pmx * 0.2;
+                boat_snap.mot_z += pmz * 0.2;
+            }
+
+            // Entity collision pushing (`Entity.collide` / `EntityBoat.java:349-360`)
+            for &(pid, px, py, pz, pdead) in &players_pos {
+                if pdead || Some(pid) == boat_snap.passenger_id {
+                    continue;
+                }
+                let dx = boat_snap.x - px;
+                let dz = boat_snap.z - pz;
+                if dx.abs() < 1.25 && dz.abs() < 1.25 && (boat_snap.y - py).abs() < 1.5 {
+                    let d2 = dx.abs().max(dz.abs());
+                    if d2 >= 0.01 {
+                        let d2_sqrt = d2.sqrt();
+                        let d3 = (1.0 / d2_sqrt).min(1.0);
+                        let push_x = (dx / d2_sqrt) * d3 * 0.05;
+                        let push_z = (dz / d2_sqrt) * d3 * 0.05;
+                        boat_snap.mot_x += push_x;
+                        boat_snap.mot_z += push_z;
+                    }
+                }
+            }
+
+            let max_speed = 0.4;
+            boat_snap.mot_x = boat_snap.mot_x.clamp(-max_speed, max_speed);
+            boat_snap.mot_z = boat_snap.mot_z.clamp(-max_speed, max_speed);
+
+            let below_probe_y = (boat_snap.y - 0.35).floor() as i32;
+            let below_probe_id = self.world.get_block(
+                boat_snap.x.floor() as i32,
+                below_probe_y,
+                boat_snap.z.floor() as i32,
+            );
+            if d0 == 0.0
+                && (boat_snap.on_ground
+                    || (blocks::is_solid(below_probe_id) && !blocks::is_water(below_probe_id)))
+            {
+                boat_snap.mot_x *= 0.5;
+                boat_snap.mot_y *= 0.5;
+                boat_snap.mot_z *= 0.5;
+            }
+
+            let pre_move_speed =
+                (boat_snap.mot_x * boat_snap.mot_x + boat_snap.mot_z * boat_snap.mot_z).sqrt();
+            let next_x = boat_snap.x + boat_snap.mot_x;
+            let next_y = boat_snap.y + boat_snap.mot_y;
+            let next_z = boat_snap.z + boat_snap.mot_z;
+
+            let mut horiz_collided = false;
+            if !self.boat_aabb_collides_solid(next_x, boat_snap.y, boat_snap.z) {
+                boat_snap.x = next_x;
+            } else {
+                horiz_collided = true;
+                boat_snap.mot_x = 0.0;
+            }
+
+            if !self.boat_aabb_collides_solid(boat_snap.x, boat_snap.y, next_z) {
+                boat_snap.z = next_z;
+            } else {
+                horiz_collided = true;
+                boat_snap.mot_z = 0.0;
+            }
+
+            let below_y = (next_y - 0.3).floor() as i32;
+            let below_id = self.world.get_block(
+                boat_snap.x.floor() as i32,
+                below_y,
+                boat_snap.z.floor() as i32,
+            );
+            if boat_snap.mot_y < 0.0
+                && ((blocks::is_solid(below_id) && !blocks::is_water(below_id))
+                    || self.boat_aabb_collides_solid(boat_snap.x, next_y, boat_snap.z))
+            {
+                boat_snap.y = (below_y + 1) as f64 + 0.3;
+                boat_snap.mot_y = 0.0;
+                boat_snap.on_ground = true;
+            } else {
+                boat_snap.y = next_y;
+                boat_snap.on_ground = false;
+            }
+
+            if horiz_collided && pre_move_speed > 0.15 {
+                boat_snap.dead = true;
+                crashed_boats.push((
+                    boat_id,
+                    boat_snap.x,
+                    boat_snap.y,
+                    boat_snap.z,
+                    boat_snap.passenger_id,
+                ));
+            } else {
+                if boat_snap.on_ground && d0 == 0.0 {
+                    boat_snap.mot_x *= 0.5;
+                    boat_snap.mot_z *= 0.5;
+                }
+                boat_snap.mot_x *= 0.9900000095367432;
+                boat_snap.mot_y *= 0.949999988079071;
+                boat_snap.mot_z *= 0.9900000095367432;
+            }
+
+            boat_snap.pitch = 0.0;
+            let dx = boat_snap.prev_x - boat_snap.x;
+            let dz = boat_snap.prev_z - boat_snap.z;
+            if dx * dx + dz * dz > 0.001 {
+                let target_yaw = (dz.atan2(dx) * 180.0 / std::f64::consts::PI) as f32;
+                let mut diff = target_yaw - boat_snap.yaw;
+                while diff >= 180.0 {
+                    diff -= 360.0;
+                }
+                while diff < -180.0 {
+                    diff += 360.0;
+                }
+                diff = diff.clamp(-20.0, 20.0);
+                boat_snap.yaw += diff;
+            }
+
+            // Clear snow layers touched by boat (`EntityBoat.java:362-370`)
+            for l in 0..4 {
+                let sx = (boat_snap.x + ((l % 2) as f64 - 0.5) * 0.8).floor() as i32;
+                let sy = boat_snap.y.floor() as i32;
+                let sz = (boat_snap.z + ((l / 2) as f64 - 0.5) * 0.8).floor() as i32;
+                if self.world.get_block(sx, sy, sz) == blocks::SNOW {
+                    self.world.java_set_type_id(sx, sy, sz, blocks::AIR);
+                }
+            }
+
             let mut passenger_sync = None;
-            if let Some(boat) = self.entities.get_boat_mut(boat_id) {
-                if boat.time_since_hit > 0 {
-                    boat.time_since_hit -= 1;
-                }
-                if boat.damage > 0 {
-                    boat.damage -= 1;
-                }
-                boat.prev_x = boat.x;
-                boat.prev_y = boat.y;
-                boat.prev_z = boat.z;
-
-                // 5-slice water buoyancy check (`EntityBoat.java:166-177`)
-                let min_y = boat.y - 0.3;
-                let max_y = boat.y + 0.3;
-                let mut d0 = 0.0f64;
-                for i in 0..5 {
-                    let y1 = min_y + (max_y - min_y) * (i as f64) / 5.0 - 0.125;
-                    let by = y1.floor() as i32;
-                    let bx = boat.x.floor() as i32;
-                    let bz = boat.z.floor() as i32;
-                    if blocks::is_water(self.world.get_block(bx, by, bz)) {
-                        d0 += 0.2;
-                    }
-                }
-
-                if d0 < 1.0 {
-                    let d3 = d0 * 2.0 - 1.0;
-                    boat.mot_y += 0.03999999910593033 * d3;
-                } else {
-                    if boat.mot_y < 0.0 {
-                        boat.mot_y /= 2.0;
-                    }
-                    boat.mot_y += 0.007000000216066837;
-                }
-
-                if let Some((pmx, pmz)) = passenger_vel {
-                    boat.mot_x += pmx * 0.2;
-                    boat.mot_z += pmz * 0.2;
-                }
-
-                let max_speed = 0.4;
-                boat.mot_x = boat.mot_x.clamp(-max_speed, max_speed);
-                boat.mot_z = boat.mot_z.clamp(-max_speed, max_speed);
-
-                if boat.on_ground {
-                    boat.mot_x *= 0.5;
-                    boat.mot_y *= 0.5;
-                    boat.mot_z *= 0.5;
-                }
-
-                let next_x = boat.x + boat.mot_x;
-                let next_y = boat.y + boat.mot_y;
-                let next_z = boat.z + boat.mot_z;
-
-                let mut horiz_collided = false;
-                let check_y = boat.y.floor() as i32;
-                let next_bx = next_x.floor() as i32;
-                let next_bz = next_z.floor() as i32;
-
-                if !blocks::is_solid(
-                    self.world
-                        .get_block(next_bx, check_y, boat.z.floor() as i32),
-                ) {
-                    boat.x = next_x;
-                } else {
-                    horiz_collided = true;
-                    boat.mot_x = 0.0;
-                }
-
-                if !blocks::is_solid(
-                    self.world
-                        .get_block(boat.x.floor() as i32, check_y, next_bz),
-                ) {
-                    boat.z = next_z;
-                } else {
-                    horiz_collided = true;
-                    boat.mot_z = 0.0;
-                }
-
-                let below_y = (next_y - 0.3).floor() as i32;
-                let below_id =
-                    self.world
-                        .get_block(boat.x.floor() as i32, below_y, boat.z.floor() as i32);
-                if boat.mot_y < 0.0 && blocks::is_solid(below_id) && !blocks::is_water(below_id) {
-                    boat.y = (below_y + 1) as f64 + 0.3;
-                    boat.mot_y = 0.0;
-                    boat.on_ground = true;
-                } else {
-                    boat.y = next_y;
-                    boat.on_ground = false;
-                }
-
-                let speed = (boat.mot_x * boat.mot_x + boat.mot_z * boat.mot_z).sqrt();
-                if horiz_collided && speed > 0.15 {
-                    boat.dead = true;
-                    crashed_boats.push((boat_id, boat.x, boat.y, boat.z, boat.passenger_id));
-                } else {
-                    boat.mot_x *= 0.9900000095367432;
-                    boat.mot_y *= 0.949999988079071;
-                    boat.mot_z *= 0.9900000095367432;
-                }
-
-                boat.pitch = 0.0;
-                let dx = boat.prev_x - boat.x;
-                let dz = boat.prev_z - boat.z;
-                if dx * dx + dz * dz > 0.001 {
-                    let target_yaw = (dz.atan2(dx) * 180.0 / std::f64::consts::PI) as f32;
-                    let mut diff = target_yaw - boat.yaw;
-                    while diff >= 180.0 {
-                        diff -= 360.0;
-                    }
-                    while diff < -180.0 {
-                        diff += 360.0;
-                    }
-                    diff = diff.clamp(-20.0, 20.0);
-                    boat.yaw += diff;
-                }
-
-                if let Some(pid) = boat.passenger_id {
-                    let rad = (boat.yaw as f64) * std::f64::consts::PI / 180.0;
-                    let ox = rad.cos() * 0.4;
-                    let oz = rad.sin() * 0.4;
-                    passenger_sync = Some((
-                        pid,
-                        boat.x + ox,
-                        boat.y + boat.mounted_y_offset() + 1.12,
-                        boat.z + oz,
-                    ));
-                }
+            if let Some(pid) = boat_snap.passenger_id {
+                let rad = (boat_snap.yaw as f64) * std::f64::consts::PI / 180.0;
+                let ox = rad.cos() * 0.4;
+                let oz = rad.sin() * 0.4;
+                passenger_sync = Some((
+                    pid,
+                    boat_snap.x + ox,
+                    boat_snap.y + boat_snap.mounted_y_offset() + 1.12,
+                    boat_snap.z + oz,
+                ));
+            }
+            if let Some(b) = self.entities.get_boat_mut(boat_id) {
+                *b = boat_snap;
             }
 
             if let Some((pid, px, py, pz)) = passenger_sync {
@@ -3023,6 +3159,215 @@ impl Server {
                     vehicle_id: id,
                 }));
             }
+        }
+    }
+
+    /// Java `Entity.m_()` / `EntityLiving.m_()` — fire and lava contact + burn tick damage for players.
+    fn tick_player_environmental_damage(&mut self) {
+        let player_ids: Vec<i32> = self.entities.iter_players().map(|p| p.entity_id).collect();
+        let mut damages: Vec<(i32, i16, &'static str)> = Vec::new();
+
+        for pid in player_ids {
+            let Some((px, py, pz, dead, cur_fire)) = self
+                .entities
+                .get_player(pid)
+                .map(|p| (p.x, p.y, p.z, p.dead, p.fire_ticks))
+            else {
+                continue;
+            };
+            if dead {
+                continue;
+            }
+
+            let min_x = (px - 0.3).floor() as i32;
+            let max_x = (px + 0.3).floor() as i32;
+            let min_y = py.floor() as i32;
+            let max_y = (py + 1.79).floor() as i32;
+            let min_z = (pz - 0.3).floor() as i32;
+            let max_z = (pz + 0.3).floor() as i32;
+
+            let mut in_water = false;
+            let mut in_lava = false;
+            let mut in_fire = false;
+
+            for bx in min_x..=max_x {
+                for by in min_y..=max_y {
+                    for bz in min_z..=max_z {
+                        let bid = self.world.get_block(bx, by, bz);
+                        if blocks::is_water(bid) {
+                            in_water = true;
+                        } else if blocks::is_lava(bid) {
+                            in_lava = true;
+                        } else if bid == blocks::FIRE {
+                            in_fire = true;
+                        }
+                    }
+                }
+            }
+
+            if in_water {
+                if let Some(p) = self.entities.get_player_mut(pid) {
+                    p.fire_ticks = 0;
+                }
+                continue;
+            }
+
+            if in_lava {
+                if let Some(p) = self.entities.get_player_mut(pid) {
+                    p.fire_ticks = 600;
+                }
+                damages.push((pid, 4, "tried to swim in lava"));
+                continue;
+            }
+
+            if in_fire {
+                let mut new_fire = cur_fire + 1;
+                if cur_fire == 0 {
+                    new_fire = 160;
+                    damages.push((pid, 1, "went up in flames"));
+                }
+                if let Some(p) = self.entities.get_player_mut(pid) {
+                    p.fire_ticks = new_fire.max(160);
+                }
+            } else if cur_fire > 0 && cur_fire % 20 == 0 {
+                damages.push((pid, 1, "burned to death"));
+            }
+        }
+
+        for (pid, dmg, reason) in damages {
+            self.damage_player_direct(pid, dmg, reason);
+        }
+    }
+
+    /// Java `TileEntityMobSpawner.g_()` (`TileEntityMobSpawner.java:31-123`) — tick all loaded mob spawner tile entities.
+    fn tick_mob_spawners(&mut self) {
+        let player_positions: Vec<(f64, f64, f64)> = self
+            .entities
+            .iter_players()
+            .filter(|p| !p.dead)
+            .map(|p| (p.x, p.y, p.z))
+            .collect();
+        if player_positions.is_empty() {
+            return;
+        }
+
+        // Collect loaded spawner positions
+        let mut spawners = Vec::new();
+        for chunk in self.world.chunks.values() {
+            for te in &chunk.tile_entities {
+                if let TileEntityKind::MobSpawner { entity_id, delay } = &te.kind {
+                    let sx = te.x as f64 + 0.5;
+                    let sy = te.y as f64 + 0.5;
+                    let sz = te.z as f64 + 0.5;
+                    let player_near = player_positions.iter().any(|&(px, py, pz)| {
+                        (px - sx).powi(2) + (py - sy).powi(2) + (pz - sz).powi(2) <= 256.0
+                    });
+                    if player_near {
+                        spawners.push((te.x, te.y, te.z, entity_id.clone(), *delay));
+                    }
+                }
+            }
+        }
+
+        if spawners.is_empty() {
+            return;
+        }
+
+        let sky_sub = world_sky_subtracted(self.world.world_time());
+        let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
+        let mut to_spawn = Vec::new();
+        let mut delay_updates = Vec::new();
+
+        for (sx, sy, sz, entity_id, mut delay) in spawners {
+            if delay == -1 {
+                delay = (200 + rng.next_i32_bound(600)) as i16;
+            }
+            if delay > 0 {
+                delay -= 1;
+                delay_updates.push((sx, sy, sz, delay));
+                continue;
+            }
+
+            let mob_type = MobType::from_nbt_id(&entity_id).unwrap_or(MobType::Pig);
+            let nearby_same = self
+                .entities
+                .iter_mobs()
+                .filter(|m| {
+                    !m.dead
+                        && m.mob_type == mob_type
+                        && (m.x - (sx as f64 + 0.5)).abs() <= 8.5
+                        && (m.y - (sy as f64 + 0.5)).abs() <= 4.5
+                        && (m.z - (sz as f64 + 0.5)).abs() <= 8.5
+                })
+                .count();
+
+            if nearby_same >= 6 {
+                delay = (200 + rng.next_i32_bound(600)) as i16;
+                delay_updates.push((sx, sy, sz, delay));
+                continue;
+            }
+
+            let mut spawned_any = false;
+            for _ in 0..4 {
+                let mx = sx as f64 + (rng.next_f64() - rng.next_f64()) * 4.0;
+                let my = (sy + rng.next_i32_bound(3) - 1) as f64;
+                let mz = sz as f64 + (rng.next_f64() - rng.next_f64()) * 4.0;
+
+                let bx = mx.floor() as i32;
+                let by = my.floor() as i32;
+                let bz = mz.floor() as i32;
+                if !(1..126).contains(&by) {
+                    continue;
+                }
+                let b0 = self.world.get_block(bx, by, bz);
+                let b1 = self.world.get_block(bx, by + 1, bz);
+                if blocks::is_solid(b0)
+                    || blocks::is_liquid(b0)
+                    || blocks::is_solid(b1)
+                    || blocks::is_liquid(b1)
+                {
+                    continue;
+                }
+
+                let can_spawn = if mob_type.is_monster() {
+                    chunk_light_at(&self.world, bx, by, bz, sky_sub) <= 7
+                } else {
+                    // For animal/Pig spawners (including player-placed spawners), allow spawning on any solid floor or grass
+                    blocks::is_solid(self.world.get_block(bx, by - 1, bz))
+                        || self.world.get_block(sx, sy - 1, sz) != blocks::AIR
+                };
+
+                if can_spawn {
+                    to_spawn.push((mob_type, mx, my, mz, sx, sy, sz));
+                    spawned_any = true;
+                }
+            }
+
+            if spawned_any {
+                delay = (200 + rng.next_i32_bound(600)) as i16;
+            }
+            delay_updates.push((sx, sy, sz, delay));
+        }
+
+        self.world.tick_random = rng;
+
+        for (sx, sy, sz, new_delay) in delay_updates {
+            if let Some(te) = self.world.get_tile_entity_mut(sx, sy, sz) {
+                if let TileEntityKind::MobSpawner { delay, .. } = &mut te.kind {
+                    *delay = new_delay;
+                }
+            }
+        }
+
+        for (mob_type, mx, my, mz, sx, sy, sz) in to_spawn {
+            let _ = self.spawn_mob_at(mob_type, mx, my, mz);
+            self.broadcast(Clientbound::LevelSound(LevelSound {
+                effect_id: 2004,
+                x: sx,
+                y: sy.clamp(0, 127) as u8,
+                z: sz,
+                data: 0,
+            }));
         }
     }
 
@@ -3798,10 +4143,16 @@ impl Server {
                 let bx = mob.x.floor() as i32;
                 let by = mob.y.floor() as i32;
                 let bz = mob.z.floor() as i32;
-                mob.in_water = blocks::is_water(self.world.get_block(bx, by, bz));
-                if blocks::is_lava(self.world.get_block(bx, by, bz)) && !mob.fire_proof() {
-                    mob.fire_ticks = 300;
+                let cur_block = self.world.get_block(bx, by, bz);
+                mob.in_water = blocks::is_water(cur_block);
+                if blocks::is_lava(cur_block) && !mob.fire_proof() {
+                    mob.fire_ticks = 600;
                     burned_mobs.push(mob_id);
+                } else if cur_block == blocks::FIRE && !mob.fire_proof() {
+                    if mob.fire_ticks == 0 {
+                        burned_mobs.push(mob_id);
+                    }
+                    mob.fire_ticks = mob.fire_ticks.max(160);
                 }
 
                 // Chicken egg timer (`EntityChicken.v()`)
@@ -4978,7 +5329,13 @@ impl Server {
                     blocks::RAIL | blocks::POWERED_RAIL | blocks::DETECTOR_RAIL
                 ) {
                     let meta = self.world.get_data(bx, by, bz);
-                    cart.y = by as f64 + 0.1;
+                    let shape =
+                        if block_id == blocks::POWERED_RAIL || block_id == blocks::DETECTOR_RAIL {
+                            meta & 7
+                        } else {
+                            meta
+                        };
+                    cart.y = by as f64 + 0.1 + if (2..=5).contains(&shape) { 0.5 } else { 0.0 };
                     if let Some((pmx, pmz)) = passenger_vel {
                         cart.mot_x += pmx * 0.1;
                         cart.mot_z += pmz * 0.1;
@@ -4990,6 +5347,56 @@ impl Server {
                             cart.mot_x += (cart.push_x / d) * 0.04;
                             cart.mot_z += (cart.push_z / d) * 0.04;
                         }
+                    }
+                    // Slope gravity (`EntityMinecart.java:244-260`)
+                    match shape {
+                        2 => cart.mot_x -= 0.0078125,
+                        3 => cart.mot_x += 0.0078125,
+                        4 => cart.mot_z += 0.0078125,
+                        5 => cart.mot_z -= 0.0078125,
+                        _ => {}
+                    }
+                    // Curved track redirection (`6..=9`)
+                    match shape {
+                        6 => {
+                            if cart.mot_x < 0.0 {
+                                cart.mot_z = -cart.mot_x;
+                                cart.mot_x = 0.0;
+                            } else if cart.mot_z < 0.0 {
+                                cart.mot_x = -cart.mot_z;
+                                cart.mot_z = 0.0;
+                            }
+                        }
+                        7 => {
+                            if cart.mot_x > 0.0 {
+                                cart.mot_z = cart.mot_x;
+                                cart.mot_x = 0.0;
+                            } else if cart.mot_z < 0.0 {
+                                cart.mot_x = cart.mot_z;
+                                cart.mot_z = 0.0;
+                            }
+                        }
+                        8 => {
+                            if cart.mot_x > 0.0 {
+                                cart.mot_z = -cart.mot_x;
+                                cart.mot_x = 0.0;
+                            } else if cart.mot_z > 0.0 {
+                                cart.mot_x = -cart.mot_z;
+                                cart.mot_z = 0.0;
+                            }
+                        }
+                        9 => {
+                            if cart.mot_x < 0.0 {
+                                cart.mot_z = cart.mot_x;
+                                cart.mot_x = 0.0;
+                            } else if cart.mot_z > 0.0 {
+                                cart.mot_x = cart.mot_z;
+                                cart.mot_z = 0.0;
+                            }
+                        }
+                        0 | 4 | 5 => cart.mot_x = 0.0,
+                        1..=3 => cart.mot_z = 0.0,
+                        _ => {}
                     }
                     if block_id == blocks::POWERED_RAIL {
                         if (meta & 8) != 0 {
@@ -5009,6 +5416,14 @@ impl Server {
                     cart.mot_z = cart.mot_z.clamp(-0.4, 0.4) * 0.99;
                     cart.x += cart.mot_x;
                     cart.z += cart.mot_z;
+                    // Step up/down onto connected slope rail
+                    let nbx = cart.x.floor() as i32;
+                    let nbz = cart.z.floor() as i32;
+                    if (nbx != bx || nbz != bz) && self.world.is_rail_at(nbx, by + 1, nbz) {
+                        cart.y = (by + 1) as f64 + 0.1;
+                    } else if (nbx != bx || nbz != bz) && self.world.is_rail_at(nbx, by - 1, nbz) {
+                        cart.y = (by - 1) as f64 + 0.1;
+                    }
                 } else {
                     cart.mot_y -= 0.04;
                     cart.x += cart.mot_x;
@@ -5184,6 +5599,10 @@ impl Server {
                     );
                 }
                 WorldEvent::SpawnPrimedTnt { x, y, z, fuse } => {
+                    let bx = x.floor() as i32;
+                    let by = y.floor() as i32;
+                    let bz = z.floor() as i32;
+                    self.send_block_change_to_observers(bx, by, bz);
                     self.spawn_primed_tnt_at(x, y, z, fuse);
                 }
                 WorldEvent::PlayNote {
@@ -5319,10 +5738,11 @@ impl Server {
         }
 
         // Apply block destruction and 30% drop rate
+        // Java `Packet60Explosion.java:36-38, 55-57` uses `(int) this.a` (truncation toward zero), NOT floor!
         let mut records = Vec::with_capacity(destroyed_blocks.len());
-        let base_x = ex.floor() as i32;
-        let base_y = ey.floor() as i32;
-        let base_z = ez.floor() as i32;
+        let base_x = ex as i32;
+        let base_y = ey as i32;
+        let base_z = ez as i32;
         let mut drops_to_spawn = Vec::new();
         let mut chain_tnts = Vec::new();
 
@@ -5369,6 +5789,7 @@ impl Server {
             radius,
             records,
         }));
+        self.flush_dirty_chunks();
     }
 
     fn block_blast_resistance(id: u8) -> f32 {
@@ -6027,7 +6448,6 @@ impl Server {
     }
 
     fn flush_dirty_chunks(&mut self) {
-        while self.world.java_do_lighting() {}
         let dirty_list = self.world.take_dirty_chunks();
         if dirty_list.is_empty() {
             return;
@@ -6057,7 +6477,7 @@ impl Server {
                         self.send(conn_id, pkt.clone());
                     }
                 }
-            } else if dirty.count < 10 {
+            } else if dirty.count < 64 {
                 let mut coordinates = Vec::with_capacity(dirty.count);
                 let mut block_types = Vec::with_capacity(dirty.count);
                 let mut metadata = Vec::with_capacity(dirty.count);
@@ -6380,14 +6800,18 @@ impl Server {
             }
         }
 
-        // Send 3x3 immediate area synchronously so player spawns on solid terrain
-        let immediate_radius = 1;
+        // Send immediate area synchronously so player spawns on solid terrain
+        let immediate_radius = if self.world.live_is_active() { 2 } else { 1 };
         for dz in -immediate_radius..=immediate_radius {
             for dx in -immediate_radius..=immediate_radius {
                 let pos = ChunkPos::new(center.x + dx, center.z + dz);
                 if self.world.live_is_active() {
                     self.world.server_get_chunk_at(pos);
-                    while self.world.java_do_lighting() {}
+                    for _ in 0..3 {
+                        if !self.world.java_do_lighting() {
+                            break;
+                        }
+                    }
                 } else {
                     self.world.populate_chunk(pos);
                 }
@@ -6454,9 +6878,8 @@ impl Server {
     }
 
     fn stream_chunks(&mut self) {
-        let max_per_tick = if self.world.live_is_active() { 5 } else { 2 };
+        let max_per_tick = if self.world.live_is_active() { 16 } else { 2 };
         let chunks_per_tick = self.config.world.chunks_per_tick.clamp(1, max_per_tick);
-        while self.world.java_do_lighting() {}
 
         let player_ids: Vec<ConnId> = self.entities.iter_players().map(|p| p.conn_id).collect();
         let mut populated_this_tick = 0;
