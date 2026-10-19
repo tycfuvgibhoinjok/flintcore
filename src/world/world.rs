@@ -1950,7 +1950,7 @@ impl World {
     }
 
     /// Java `World.m(int i, int j, int k)` (lines 542-560).
-    fn java_can_see_sky(&self, x: i32, y: i32, z: i32) -> bool {
+    pub(crate) fn java_can_see_sky(&self, x: i32, y: i32, z: i32) -> bool {
         if y < 0 {
             return false;
         }

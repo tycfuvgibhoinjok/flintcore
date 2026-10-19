@@ -1,10 +1,10 @@
 //! 1:1 port of all 14 Minecraft Beta 1.7.3 Animals & Mobs, `DataWatcher` metadata,
 //! `Pathfinder` navigation, and `SpawnerCreature` natural spawning from `.references/Project-Poseidon`.
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{MobSpawnSettings, SpawningConfig};
+use crate::entity::physics::{move_entity, Aabb};
 use crate::gameplay::blocks;
 use crate::gameplay::items::{self, ItemStack};
 use crate::util::bytes::Writer;
@@ -262,6 +262,28 @@ pub struct Mob {
     pub on_ground: bool,
     pub horiz_collided: bool,
     pub in_water: bool,
+    /// Java `Entity.bA`: the mob is in the water.
+    pub in_lava: bool,
+    /// Java `Entity.positionChanged`: the last movement changed the position.
+    pub position_changed: bool,
+    /// Java `Entity.br`: the offset between the box of the mob and its
+    /// position (the step up of the reference).
+    pub step_offset: f32,
+    /// Java `EntityLiving.az`: the sideways movement input.
+    pub move_strafe: f32,
+    /// Java `EntityLiving.aA`: the forward movement input.
+    pub move_forward: f32,
+    /// Java `EntityLiving.aC`: the mob wants to jump.
+    pub jump_flag: bool,
+    /// Java `EntityLiving.aB`: the drift of the yaw while the mob looks
+    /// around.
+    pub yaw_drift: f32,
+    /// Java `EntityLiving.a`: the counter of the idle sound of the mob.
+    pub idle_sound_ticks: i32,
+    /// Java `EntityLiving.b`: the player the mob looks at.
+    pub look_target: Option<i32>,
+    /// Java `EntityLiving.aF`: the ticks the mob looks at the player.
+    pub look_ticks: i32,
     pub velocity_changed: bool,
     pub dead: bool,
     pub no_despawn_ticks: i32,
@@ -302,14 +324,42 @@ pub struct Mob {
     // Squid
     pub squid_swim_vec: (f32, f32, f32),
     pub squid_tentacle_angle: f32,
+    /// Java `EntitySquid.k`: the factor of the swim.
     pub squid_speed: f32,
-    // Internal RNG
-    pub rng: JavaRandom,
+    /// Java `EntitySquid.g`: the phase of the swim.
+    pub squid_phase: f32,
+    /// Java `EntitySquid.l`: the speed of the phase.
+    pub squid_phase_speed: f32,
+    /// Java `EntitySquid.m`: the squash of the tentacles.
+    pub squid_squash: f32,
+    /// Java `EntitySquid.K`: the yaw of the swim.
+    pub squid_yaw: f32,
+    /// Java `Entity.bA` of the previous tick: the mob was in the water.
+    pub was_in_water: bool,
+    /// Java `Entity.justCreated`: the mob was just created.
+    pub just_created: bool,
+    /// Java `EntityLiving.K`: the yaw the mob looks at.
+    pub look_yaw: f32,
+    /// Java `Entity.lastX`: the position of the mob in the previous tick.
+    pub last_x: f64,
+    /// Java `Entity.lastZ`: the position of the mob in the previous tick.
+    pub last_z: f64,
 }
 
 impl Mob {
-    pub fn new(entity_id: i32, mob_type: MobType, x: f64, y: f64, z: f64, seed: i64) -> Self {
-        let mut rng = JavaRandom::new(seed ^ ((entity_id as i64).wrapping_mul(0x5DEECE66D)));
+    /// The constructor of a mob.
+    ///
+    /// The random numbers come from the shared stream of the entities
+    /// (`Entity.SHARED_RANDOM`), the reference uses one `Random` for all the
+    /// entities.
+    pub fn new(
+        entity_id: i32,
+        mob_type: MobType,
+        x: f64,
+        y: f64,
+        z: f64,
+        rng: &mut JavaRandom,
+    ) -> Self {
         let slime_size = if mob_type == MobType::Slime {
             1 << rng.next_i32_bound(3)
         } else {
@@ -317,16 +367,22 @@ impl Mob {
         };
         let health = mob_type.default_health(slime_size);
         let sheep_color = if mob_type == MobType::Sheep {
-            Self::natural_sheep_color(&mut rng)
+            Self::natural_sheep_color(rng)
         } else {
             0
         };
+        // The egg timer of the chicken and the split timer of the slime are
+        // drawn in the constructor of the reference.
         let chicken_egg_timer = if mob_type == MobType::Chicken {
             rng.next_i32_bound(6000) + 6000
         } else {
             6000
         };
-        let slime_jump_delay = rng.next_i32_bound(20) + 10;
+        let slime_jump_delay = if mob_type == MobType::Slime {
+            rng.next_i32_bound(20) + 10
+        } else {
+            10
+        };
 
         Self {
             entity_id,
@@ -337,7 +393,9 @@ impl Mob {
             mot_x: 0.0,
             mot_y: 0.0,
             mot_z: 0.0,
-            yaw: rng.next_f32() * 360.0,
+            // The reference starts with the yaw of the entity (zero), the
+            // mobs look around in their AI.
+            yaw: 0.0,
             pitch: 0.0,
             health,
             max_health: health,
@@ -350,6 +408,16 @@ impl Mob {
             on_ground: false,
             horiz_collided: false,
             in_water: false,
+            in_lava: false,
+            position_changed: false,
+            step_offset: 0.0,
+            move_strafe: 0.0,
+            move_forward: 0.0,
+            jump_flag: false,
+            yaw_drift: 0.0,
+            idle_sound_ticks: 0,
+            look_target: None,
+            look_ticks: 0,
             velocity_changed: false,
             dead: false,
             no_despawn_ticks: 0,
@@ -375,14 +443,28 @@ impl Mob {
             creeper_powered: false,
             slime_size,
             slime_jump_delay,
-            ghast_waypoint: (x, y, z),
+            // The waypoint of the ghast is only set in its AI.
+            ghast_waypoint: (0.0, 0.0, 0.0),
             ghast_course_cooldown: 0,
             ghast_charge: 0,
             pigzombie_anger: 0,
             squid_swim_vec: (0.0, 0.0, 0.0),
             squid_tentacle_angle: 0.0,
-            squid_speed: 0.2,
-            rng,
+            squid_speed: 0.0,
+            squid_phase: 0.0,
+            // Only the squid draws the speed of its phase (`EntitySquid`).
+            squid_phase_speed: if mob_type == MobType::Squid {
+                1.0 / (rng.next_f32() + 1.0) * 0.2
+            } else {
+                0.2
+            },
+            squid_squash: 0.0,
+            squid_yaw: 0.0,
+            look_yaw: 0.0,
+            last_x: x,
+            last_z: z,
+            was_in_water: false,
+            just_created: true,
         }
     }
 
@@ -420,9 +502,191 @@ impl Mob {
         self.mob_type.dimensions(self.slime_size)
     }
 
+    /// The bounding box of the mob (`Entity.setPosition`).
+    pub fn aabb(&self) -> Aabb {
+        let (length, width) = self.size();
+        Aabb::for_entity(self.x, self.y, self.z, length, width, 0.0, self.step_offset)
+    }
+
+    /// Java `EntityLiving.a(float, float)`: the movement of the mob.
+    ///
+    /// The acceleration and the drag depend on the ground, the water and the
+    /// lava, the collision is the axis aligned box of the reference
+    /// (`Entity.move`). The returned value is the fall damage of the tick.
+    pub fn apply_movement(
+        &mut self,
+        world: &World,
+        entity_boxes: &[Aabb],
+        scratch: &mut Vec<Aabb>,
+        spider_climb: bool,
+        flying: bool,
+    ) -> f32 {
+        let mut aabb = self.aabb();
+        // The position of the mob before the movement (`EntityLiving.a`).
+        let y_before = self.y;
+
+        // The acceleration (`Entity.a(float, float, float)`).
+        // The reference computes the acceleration with single precision.
+        let input =
+            (self.move_strafe * self.move_strafe + self.move_forward * self.move_forward).sqrt();
+        // The squid has its own check for the water (`EntitySquid.ad()`).
+        let in_water = if self.mob_type == MobType::Squid {
+            crate::entity::physics::squid_in_water(world, &aabb)
+        } else {
+            self.in_water
+        };
+        let in_lava = self.in_lava;
+        let (acceleration, drag): (f32, f32) = if in_water || in_lava {
+            (0.02, 0.5)
+        } else {
+            // The friction of the ground (`EntityLiving.a(float, float)`): the
+            // block below the mob has its own friction factor.
+            let friction = if self.on_ground {
+                let below = world.get_block(
+                    self.x.floor() as i32,
+                    (self.y.floor() as i32) - 1,
+                    self.z.floor() as i32,
+                );
+                if below > 0 {
+                    blocks::friction_factor(below) * 0.91
+                } else {
+                    0.54600006
+                }
+            } else {
+                0.91
+            };
+            let f3 = 0.16277136 / (friction * friction * friction);
+            (if self.on_ground { 0.1 * f3 } else { 0.02 }, friction)
+        };
+        if input >= 0.01 {
+            let scale = acceleration / input.max(1.0);
+            let strafe = self.move_strafe * scale;
+            let forward = self.move_forward * scale;
+            // The sine and the cosine come from the table of the reference
+            // (`MathHelper.sin` and `MathHelper.cos`), the plain functions
+            // would drift a few units in the last place.
+            let radians = self.yaw * JAVA_PI / 180.0f32;
+            let sin = crate::util::math::sin(radians);
+            let cos = crate::util::math::cos(radians);
+            self.mot_x += (strafe * cos - forward * sin) as f64;
+            self.mot_z += (strafe * sin + forward * cos) as f64;
+        }
+
+        // The spider clings to the wall it touches (`EntitySpider.p()`).
+        if self.mob_type == MobType::Spider && self.position_changed {
+            self.mot_x = self.mot_x.clamp(-0.15, 0.15);
+            self.mot_z = self.mot_z.clamp(-0.15, 0.15);
+            self.fall_distance = 0.0;
+            if self.mot_y < -0.15 {
+                self.mot_y = -0.15;
+            }
+        }
+
+        // The movement (`Entity.move`).
+        let result = move_entity(
+            world,
+            &mut aabb,
+            self.mot_x,
+            self.mot_y,
+            self.mot_z,
+            0.5,
+            self.step_offset,
+            self.on_ground,
+            0.0,
+            entity_boxes,
+            scratch,
+        );
+        self.x = result.x;
+        self.y = result.y;
+        self.z = result.z;
+        self.step_offset = result.step_offset;
+        self.on_ground = result.on_ground;
+        self.position_changed = result.position_changed;
+        self.horiz_collided = result.moved_x != self.mot_x || result.moved_z != self.mot_z;
+
+        // The fall distance (`Entity.a(double, boolean)`).
+        let mut fall_damage = 0.0;
+        if result.on_ground {
+            if self.fall_distance > 0.0 {
+                fall_damage = self.fall_distance;
+                self.fall_distance = 0.0;
+            }
+        } else if result.moved_y < 0.0 {
+            // `Entity.a(double, boolean)`: the distance is a single precision
+            // value.
+            self.fall_distance = (self.fall_distance as f64 - result.moved_y) as f32;
+        }
+
+        // The velocity of the blocked axes is dropped.
+        if result.moved_x != self.mot_x {
+            self.mot_x = 0.0;
+        }
+        if result.moved_y != self.mot_y {
+            self.mot_y = 0.0;
+        }
+        if result.moved_z != self.mot_z {
+            self.mot_z = 0.0;
+        }
+
+        if in_water || in_lava {
+            if flying {
+                // `EntityFlying.a(float, float)`: the drag of the flying mobs.
+                self.mot_x *= if in_water { 0.800_000_011_920_929 } else { 0.5 };
+                self.mot_y *= if in_water { 0.800_000_011_920_929 } else { 0.5 };
+                self.mot_z *= if in_water { 0.800_000_011_920_929 } else { 0.5 };
+            } else {
+                // The water and the lava slow the mob down
+                // (`EntityLiving.a(float, float)`).
+                let fluid_drag: f64 = if in_water { 0.800_000_011_920_929 } else { 0.5 };
+                self.mot_x *= fluid_drag;
+                self.mot_y *= fluid_drag;
+                self.mot_z *= fluid_drag;
+                self.mot_y -= 0.02;
+                // The mob swims up when it is stuck
+                // (`Entity.d(double, double, double)`).
+                if result.position_changed {
+                    let box_ =
+                        aabb.moved(self.mot_x, self.mot_y + 0.6 - self.y + y_before, self.mot_z);
+                    let mut scratch = Vec::new();
+                    crate::entity::physics::collect_collision_boxes(
+                        world,
+                        &box_,
+                        &[],
+                        &mut scratch,
+                    );
+                    if scratch.is_empty() {
+                        self.mot_y = 0.3;
+                    }
+                }
+            }
+        } else if flying {
+            // `EntityFlying.a(float, float)`: no gravity, the drag on all the
+            // axes.
+            self.mot_x *= drag as f64;
+            self.mot_y *= drag as f64;
+            self.mot_z *= drag as f64;
+        } else {
+            // The spider climbs the wall it hits (`EntityLiving.a`).
+            if result.position_changed && self.mob_type == MobType::Spider && spider_climb {
+                self.mot_y = 0.2;
+            }
+            // The constants of the reference are the single precision
+            // values (`0.9800000190734863D`).
+            self.mot_y -= 0.08;
+            self.mot_y *= 0.980_000_019_073_486_3;
+            self.mot_x *= drag as f64;
+            self.mot_z *= drag as f64;
+        }
+        fall_damage
+    }
+
+    /// Java `EntityLiving.t()`: the height of the eyes of the mob.
+    ///
+    /// The reference uses the width of the mob, not its height, and the
+    /// multiplication is a single precision one.
     pub fn eye_height(&self) -> f64 {
-        let (_, h) = self.size();
-        (h * 0.85) as f64
+        let (_, width) = self.size();
+        (width * 0.85f32) as f64
     }
 
     pub fn mounted_y_offset(&self) -> f64 {
@@ -431,6 +695,59 @@ impl Mob {
             (h * 0.75) as f64 - 0.5
         } else {
             (h * 0.75) as f64
+        }
+    }
+
+    /// Java `EntityLiving.g()`: the name of the idle sound of the mob.
+    ///
+    /// The wolf draws a number for the sound (`EntityWolf.g()`), but only
+    /// when it is not angry: the number is the condition of the branch.
+    pub fn idle_sound_name(&self, rng: &mut JavaRandom) -> Option<&'static str> {
+        match self.mob_type {
+            MobType::Pig => Some("mob.pig"),
+            MobType::Cow => Some("mob.cow"),
+            MobType::Sheep => Some("mob.sheep"),
+            MobType::Chicken => Some("mob.chicken"),
+            MobType::Zombie => Some("mob.zombie"),
+            MobType::PigZombie => Some("mob.zombiepig.zpig"),
+            MobType::Skeleton => Some("mob.skeleton"),
+            MobType::Spider => Some("mob.spider"),
+            MobType::Ghast => Some("mob.ghast.moan"),
+            MobType::Wolf => {
+                if self.wolf_angry {
+                    Some("mob.wolf.growl")
+                } else {
+                    let roll = rng.next_i32_bound(3);
+                    Some(if roll == 0 {
+                        if self.wolf_tamed {
+                            "mob.wolf.whine"
+                        } else {
+                            "mob.wolf.panting"
+                        }
+                    } else {
+                        "mob.wolf.bark"
+                    })
+                }
+            }
+            // The giant, the slime and the creeper have no sound of their own
+            // (`EntityLiving.g()` is `null`).
+            MobType::Squid | MobType::Slime | MobType::Creeper | MobType::Giant => None,
+        }
+    }
+
+    /// Java `EntityLiving.e()`: the interval of the idle sound of the mob.
+    ///
+    /// The animals (`EntityAnimal.e()`) and the water animals
+    /// (`EntityWaterAnimal.e()`) wait 120 ticks, the other mobs 80.
+    pub fn idle_sound_interval(&self) -> i32 {
+        match self.mob_type {
+            MobType::Pig
+            | MobType::Cow
+            | MobType::Sheep
+            | MobType::Chicken
+            | MobType::Wolf
+            | MobType::Squid => 120,
+            _ => 80,
         }
     }
 
@@ -527,11 +844,18 @@ impl Mob {
     }
 
     /// Generate death loot drops (`EntityLiving.q()` / `j()`).
-    pub fn get_death_drops(&mut self, killed_by_skeleton_arrow: bool) -> Vec<ItemStack> {
+    /// The drops of a dead mob (`EntityLiving.q()`).
+    ///
+    /// The random numbers come from the shared stream of the entities.
+    pub fn get_death_drops(
+        &mut self,
+        rng: &mut JavaRandom,
+        killed_by_skeleton_arrow: bool,
+    ) -> Vec<ItemStack> {
         let mut drops = Vec::new();
         match self.mob_type {
             MobType::Pig => {
-                let count = self.rng.next_i32_bound(3) as u8;
+                let count = rng.next_i32_bound(3) as u8;
                 let id = if self.fire_ticks > 0 {
                     items::GRILLED_PORK
                 } else {
@@ -551,65 +875,65 @@ impl Mob {
                 }
             }
             MobType::Cow => {
-                let count = self.rng.next_i32_bound(3) as u8;
+                let count = rng.next_i32_bound(3) as u8;
                 for _ in 0..count {
                     drops.push(ItemStack::new(items::LEATHER, 1, 0));
                 }
             }
             MobType::Chicken | MobType::Zombie => {
-                let count = self.rng.next_i32_bound(3) as u8;
+                let count = rng.next_i32_bound(3) as u8;
                 for _ in 0..count {
                     drops.push(ItemStack::new(items::FEATHER, 1, 0));
                 }
             }
             MobType::Squid => {
-                let count = (self.rng.next_i32_bound(3) + 1) as u8;
+                let count = (rng.next_i32_bound(3) + 1) as u8;
                 for _ in 0..count {
                     drops.push(ItemStack::new(items::INK_SACK, 1, 0));
                 }
             }
             MobType::Skeleton => {
-                let arrows = self.rng.next_i32_bound(3) as u8;
+                let arrows = rng.next_i32_bound(3) as u8;
                 for _ in 0..arrows {
                     drops.push(ItemStack::new(items::ARROW, 1, 0));
                 }
-                let bones = self.rng.next_i32_bound(3) as u8;
+                let bones = rng.next_i32_bound(3) as u8;
                 for _ in 0..bones {
                     drops.push(ItemStack::new(items::BONE, 1, 0));
                 }
             }
             MobType::Spider => {
-                let count = self.rng.next_i32_bound(3) as u8;
+                let count = rng.next_i32_bound(3) as u8;
                 for _ in 0..count {
                     drops.push(ItemStack::new(items::STRING, 1, 0));
                 }
             }
             MobType::Creeper => {
-                let count = self.rng.next_i32_bound(3) as u8;
+                let count = rng.next_i32_bound(3) as u8;
                 for _ in 0..count {
                     drops.push(ItemStack::new(items::SULPHUR, 1, 0));
                 }
                 if killed_by_skeleton_arrow {
-                    let record = items::GOLD_RECORD + self.rng.next_i32_bound(2) as i16;
+                    let record = items::GOLD_RECORD + rng.next_i32_bound(2) as i16;
                     drops.push(ItemStack::new(record, 1, 0));
                 }
             }
             MobType::Ghast => {
-                let count = self.rng.next_i32_bound(3) as u8;
+                let count = rng.next_i32_bound(3) as u8;
                 for _ in 0..count {
                     drops.push(ItemStack::new(items::SULPHUR, 1, 0));
                 }
             }
             MobType::Slime => {
                 if self.slime_size == 1 {
-                    let count = self.rng.next_i32_bound(3) as u8;
+                    let count = rng.next_i32_bound(3) as u8;
                     for _ in 0..count {
                         drops.push(ItemStack::new(items::SLIME_BALL, 1, 0));
                     }
                 }
             }
             MobType::PigZombie => {
-                let count = self.rng.next_i32_bound(3) as u8;
+                let count = rng.next_i32_bound(3) as u8;
                 for _ in 0..count {
                     drops.push(ItemStack::new(items::GRILLED_PORK, 1, 0));
                 }
@@ -674,7 +998,10 @@ impl Mob {
         tag
     }
 
-    pub fn from_nbt(entity_id: i32, tag: &NbtTag, seed: i64) -> Option<Self> {
+    /// Java `Entity.a(NBTTagCompound)`: the load of a mob.
+    ///
+    /// The random numbers come from the shared stream of the entities.
+    pub fn from_nbt(entity_id: i32, tag: &NbtTag, rng: &mut JavaRandom) -> Option<Self> {
         let id_str = tag.get_str("id")?;
         let mob_type = MobType::from_nbt_id(id_str)?;
         let pos = tag.get_list("Pos")?;
@@ -694,7 +1021,7 @@ impl Mob {
             _ => return None,
         };
 
-        let mut mob = Self::new(entity_id, mob_type, x, y, z, seed);
+        let mut mob = Self::new(entity_id, mob_type, x, y, z, rng);
         if let Some(mot) = tag.get_list("Motion") {
             if mot.len() >= 3 {
                 if let NbtTag::Double(v) = mot[0] {
@@ -766,160 +1093,402 @@ impl Mob {
 }
 
 // -------------------------------------------------------------------------
-// Pathfinder (`Pathfinder.java`: A* grid pathfinding over the voxel world)
+// Pathfinder (`Pathfinder.java`, `PathPoint.java`, `Path.java`)
 // -------------------------------------------------------------------------
 
-#[derive(Clone, Eq, PartialEq)]
-struct AStarNode {
-    pos: (i32, i32, i32),
-    f_cost: i32,
-    g_cost: i32,
+/// Java `PathPoint`: a node of the path.
+#[derive(Debug, Clone)]
+struct PathPoint {
+    x: i32,
+    y: i32,
+    z: i32,
+    /// Java `PathPoint.e`: the cost from the start.
+    g: f32,
+    /// Java `PathPoint.f`: the heuristic to the goal.
+    h: f32,
+    /// Java `PathPoint.g`: the score in the open list.
+    score: f32,
+    /// Java `PathPoint.h`: the predecessor.
+    parent: Option<usize>,
+    /// Java `PathPoint.i`: the node was expanded already.
+    visited: bool,
+    /// Java `PathPoint.d`: the index in the open list (-1 when it is not in it).
+    open_index: i32,
 }
 
-impl Ord for AStarNode {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.f_cost.cmp(&self.f_cost)
+/// The A* of the reference implementation (`Pathfinder`).
+///
+/// The open list is the binary heap of `Path.java`; its tie breaking (the left
+/// child wins, the parent stays above an equal child) decides which of the
+/// equal paths is taken, so it is reproduced exactly.
+struct Pathfinder<'a> {
+    world: &'a World,
+    points: Vec<PathPoint>,
+    /// The index of the point of a position.
+    lookup: HashMap<(i32, i32, i32), usize>,
+    /// The open list: the indices of the points.
+    heap: Vec<usize>,
+    /// The goal of the path.
+    goal: (i32, i32, i32),
+    /// The size of the entity (`Pathfinder` builds a `PathPoint` of the size).
+    size: (i32, i32, i32),
+    /// The maximum distance to the goal.
+    max_dist: f32,
+}
+
+impl<'a> Pathfinder<'a> {
+    fn new(world: &'a World, size: (i32, i32, i32), goal: (i32, i32, i32), max_dist: f32) -> Self {
+        Self {
+            world,
+            points: Vec::new(),
+            lookup: HashMap::new(),
+            heap: Vec::new(),
+            goal,
+            size,
+            max_dist,
+        }
+    }
+
+    /// Java `PathPoint.a(PathPoint)`: the Euclidean distance.
+    fn distance(from: (i32, i32, i32), to: (i32, i32, i32)) -> f32 {
+        let dx = (to.0 - from.0) as f32;
+        let dy = (to.1 - from.1) as f32;
+        let dz = (to.2 - from.2) as f32;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    /// Java `Pathfinder.a(int, int, int)`: the point of a position.
+    fn point(&mut self, x: i32, y: i32, z: i32) -> usize {
+        if let Some(index) = self.lookup.get(&(x, y, z)) {
+            return *index;
+        }
+        self.points.push(PathPoint {
+            x,
+            y,
+            z,
+            g: 0.0,
+            h: 0.0,
+            score: 0.0,
+            parent: None,
+            visited: false,
+            open_index: -1,
+        });
+        let index = self.points.len() - 1;
+        self.lookup.insert((x, y, z), index);
+        index
+    }
+
+    /// Java `Pathfinder.a(Entity, int, int, int, PathPoint)`: the check of the
+    /// blocks of a node.
+    ///
+    /// 1 = the node is free, 0 = a solid block, -1 = water, -2 = lava.
+    fn check_block(&self, x: i32, y: i32, z: i32) -> i32 {
+        for lx in x..x + self.size.0 {
+            for ly in y..y + self.size.1 {
+                for lz in z..z + self.size.2 {
+                    let id = self.world.get_block(lx, ly, lz);
+                    if id == 0 {
+                        continue;
+                    }
+                    if id == blocks::IRON_DOOR || id == blocks::WOODEN_DOOR {
+                        // An open door can be walked through.
+                        let data = self.world.get_data(lx, ly, lz);
+                        if data & 4 == 0 {
+                            return 0;
+                        }
+                        continue;
+                    }
+                    if blocks::material_is_solid(id) {
+                        return 0;
+                    }
+                    if blocks::is_water(id) {
+                        return -1;
+                    }
+                    if blocks::is_lava(id) {
+                        return -2;
+                    }
+                }
+            }
+        }
+        1
+    }
+
+    /// Java `Pathfinder.a(Entity, int, int, int, PathPoint, int)`: the
+    /// neighbour of a node.
+    fn neighbour(&mut self, x: i32, y: i32, z: i32, step_up: bool) -> Option<usize> {
+        let mut result = None;
+        let mut y = y;
+        if self.check_block(x, y, z) == 1 {
+            result = Some(self.point(x, y, z));
+        }
+        if result.is_none() && step_up && self.check_block(x, y + 1, z) == 1 {
+            result = Some(self.point(x, y + 1, z));
+            y += 1;
+        }
+        if result.is_some() {
+            let mut drops = 0;
+            let mut below = 0;
+            while y > 0 {
+                below = self.check_block(x, y - 1, z);
+                if below != 1 {
+                    break;
+                }
+                drops += 1;
+                if drops >= 4 {
+                    return None;
+                }
+                y -= 1;
+                if y > 0 {
+                    result = Some(self.point(x, y, z));
+                }
+            }
+            if below == -2 {
+                return None;
+            }
+        }
+        result
+    }
+
+    /// Java `Pathfinder.b(Entity, PathPoint, PathPoint, PathPoint, float)`: the
+    /// four neighbours of a node.
+    fn expand(&mut self, index: usize) -> [Option<usize>; 4] {
+        let (x, y, z) = {
+            let point = &self.points[index];
+            (point.x, point.y, point.z)
+        };
+        let step_up = self.check_block(x, y + 1, z) == 1;
+        let mut neighbours: [Option<usize>; 4] = [None, None, None, None];
+        // The order of the reference: +Z, -X, +X, -Z.
+        let candidates = [(x, y, z + 1), (x - 1, y, z), (x + 1, y, z), (x, y, z - 1)];
+        for (slot, (nx, ny, nz)) in candidates.into_iter().enumerate() {
+            if let Some(neighbour) = self.neighbour(nx, ny, nz, step_up) {
+                let point = &self.points[neighbour];
+                let position = (point.x, point.y, point.z);
+                // The distance to the goal has to be below the maximum.
+                let distance = Self::distance(position, self.goal);
+                if distance < self.max_dist && !point.visited {
+                    neighbours[slot] = Some(neighbour);
+                }
+            }
+        }
+        neighbours
+    }
+
+    /// Java `Path.a(PathPoint)`: the push onto the open list.
+    fn push(&mut self, index: usize) {
+        self.points[index].open_index = self.heap.len() as i32;
+        self.heap.push(index);
+        self.sift_up(self.heap.len() - 1);
+    }
+
+    /// Java `Path.b()`: the pop of the open list.
+    fn pop(&mut self) -> Option<usize> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let top = self.heap[0];
+        let last = self.heap.pop().unwrap();
+        if !self.heap.is_empty() {
+            self.heap[0] = last;
+            self.points[last].open_index = 0;
+            self.sift_down(0);
+        }
+        self.points[top].open_index = -1;
+        Some(top)
+    }
+
+    /// Java `Path.a(int)`: the sift up of the heap.
+    fn sift_up(&mut self, mut i: usize) {
+        let index = self.heap[i];
+        let score = self.points[index].score;
+        while i > 0 {
+            let parent = (i - 1) >> 1;
+            let parent_index = self.heap[parent];
+            if score >= self.points[parent_index].score {
+                break;
+            }
+            self.heap[i] = parent_index;
+            self.points[parent_index].open_index = i as i32;
+            i = parent;
+        }
+        self.heap[i] = index;
+        self.points[index].open_index = i as i32;
+    }
+
+    /// Java `Path.b(int)`: the sift down of the heap.
+    fn sift_down(&mut self, mut i: usize) {
+        let index = self.heap[i];
+        let score = self.points[index].score;
+        loop {
+            let left = 1 + (i << 1);
+            let right = left + 1;
+            if left >= self.heap.len() {
+                break;
+            }
+            let left_index = self.heap[left];
+            let left_score = self.points[left_index].score;
+            let (right_index, right_score) = if right >= self.heap.len() {
+                (usize::MAX, f32::INFINITY)
+            } else {
+                let right_index = self.heap[right];
+                (right_index, self.points[right_index].score)
+            };
+            if left_score < right_score {
+                if left_score >= score {
+                    break;
+                }
+                self.heap[i] = left_index;
+                self.points[left_index].open_index = i as i32;
+                i = left;
+            } else {
+                if right_score >= score {
+                    break;
+                }
+                self.heap[i] = right_index;
+                self.points[right_index].open_index = i as i32;
+                i = right;
+            }
+        }
+        self.heap[i] = index;
+        self.points[index].open_index = i as i32;
+    }
+
+    /// Java `Pathfinder.a(Entity, PathPoint, PathPoint, PathPoint, float)`: the
+    /// search.
+    fn search(&mut self, start: (i32, i32, i32)) -> Option<Vec<(i32, i32, i32)>> {
+        let start_index = self.point(start.0, start.1, start.2);
+        self.points[start_index].g = 0.0;
+        self.points[start_index].h = Self::distance(start, self.goal);
+        self.points[start_index].score = self.points[start_index].h;
+        self.heap.clear();
+        self.push(start_index);
+
+        let mut closest = start_index;
+        while let Some(current) = self.pop() {
+            let position = {
+                let point = &self.points[current];
+                (point.x, point.y, point.z)
+            };
+            if position == self.goal {
+                return Some(self.build_path(current));
+            }
+            let closest_position = {
+                let point = &self.points[closest];
+                (point.x, point.y, point.z)
+            };
+            if Self::distance(position, self.goal) < Self::distance(closest_position, self.goal) {
+                closest = current;
+            }
+            self.points[current].visited = true;
+            for neighbour in self.expand(current).into_iter().flatten() {
+                let (current_position, neighbour_position) = {
+                    let current_point = &self.points[current];
+                    let neighbour_point = &self.points[neighbour];
+                    (
+                        (current_point.x, current_point.y, current_point.z),
+                        (neighbour_point.x, neighbour_point.y, neighbour_point.z),
+                    )
+                };
+                let g =
+                    self.points[current].g + Self::distance(current_position, neighbour_position);
+                if self.points[neighbour].open_index < 0 || g < self.points[neighbour].g {
+                    self.points[neighbour].parent = Some(current);
+                    self.points[neighbour].g = g;
+                    self.points[neighbour].h = Self::distance(neighbour_position, self.goal);
+                    let score = g + self.points[neighbour].h;
+                    if self.points[neighbour].open_index >= 0 {
+                        let old_score = self.points[neighbour].score;
+                        self.points[neighbour].score = score;
+                        let position = self.points[neighbour].open_index as usize;
+                        if score < old_score {
+                            self.sift_up(position);
+                        } else {
+                            self.sift_down(position);
+                        }
+                    } else {
+                        self.points[neighbour].score = score;
+                        self.push(neighbour);
+                    }
+                }
+            }
+        }
+        if closest == start_index {
+            None
+        } else {
+            Some(self.build_path(closest))
+        }
+    }
+
+    /// Java `Pathfinder.a(PathPoint, PathPoint)`: the path from the start to
+    /// the goal.
+    fn build_path(&self, end: usize) -> Vec<(i32, i32, i32)> {
+        let mut path = Vec::new();
+        let mut current = Some(end);
+        while let Some(index) = current {
+            let point = &self.points[index];
+            path.push((point.x, point.y, point.z));
+            current = point.parent;
+        }
+        path.reverse();
+        path
     }
 }
 
-impl PartialOrd for AStarNode {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+/// The constant of the reference (`3.1415927F`).
+#[allow(clippy::approx_constant)]
+pub const JAVA_PI: f32 = 3.1415927;
+
+/// The double constant of the reference (`3.1415927410125732`).
+#[allow(clippy::approx_constant)]
+pub const JAVA_PI_DOUBLE: f64 = 3.1415927410125732;
+
+/// The curve of the light of the reference (`WorldProvider.c()`).
+///
+/// The mobs score a block by the light of the block, the curve is not linear.
+pub fn light_curve(level: i32) -> f32 {
+    let f = 0.05f32;
+    let i = level.clamp(0, 15) as f32;
+    let f1 = 1.0 - i / 15.0;
+    (1.0 - f1) / (f1 * 3.0 + 1.0) * (1.0 - f) + f
 }
 
 /// Java `Pathfinder.a(Entity, int x, int y, int z, float maxDist)`.
+///
+/// The `length` and the `width` are the size of the mob (`Entity.length` and
+/// `Entity.width`), the goal is the position of the target.
 #[allow(clippy::too_many_arguments)]
 pub fn find_path(
     world: &World,
     start_x: f64,
     start_y: f64,
     start_z: f64,
-    goal_x: i32,
-    goal_y: i32,
-    goal_z: i32,
+    length: f32,
+    width: f32,
+    goal_x: f64,
+    goal_y: f64,
+    goal_z: f64,
     max_dist: f32,
 ) -> Vec<(i32, i32, i32)> {
-    let sx = start_x.floor() as i32;
-    let sy = start_y.floor() as i32;
-    let sz = start_z.floor() as i32;
-    if sx == goal_x && sy == goal_y && sz == goal_z {
-        return Vec::new();
-    }
-
-    let max_dist_sq = ((max_dist + 4.0) * (max_dist + 4.0)) as i32;
-    let mut open = BinaryHeap::new();
-    let mut g_scores: HashMap<(i32, i32, i32), i32> = HashMap::new();
-    let mut came_from: HashMap<(i32, i32, i32), (i32, i32, i32)> = HashMap::new();
-
-    let h0 = ((goal_x - sx).abs() + (goal_y - sy).abs() + (goal_z - sz).abs()) * 10;
-    g_scores.insert((sx, sy, sz), 0);
-    open.push(AStarNode {
-        pos: (sx, sy, sz),
-        f_cost: h0,
-        g_cost: 0,
-    });
-
-    let mut best_pos = (sx, sy, sz);
-    let mut best_h = h0;
-    let mut iterations = 0;
-
-    while let Some(current) = open.pop() {
-        iterations += 1;
-        if iterations > 160 {
-            break;
-        }
-        let (cx, cy, cz) = current.pos;
-        let h = ((goal_x - cx).abs() + (goal_y - cy).abs() + (goal_z - cz).abs()) * 10;
-        if h < best_h {
-            best_h = h;
-            best_pos = (cx, cy, cz);
-        }
-        if (cx - goal_x).abs() <= 1 && (cy - goal_y).abs() <= 1 && (cz - goal_z).abs() <= 1 {
-            best_pos = (cx, cy, cz);
-            break;
-        }
-
-        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            let nx = cx + dx;
-            let nz = cz + dz;
-            let dist_sq = (nx - sx) * (nx - sx) + (nz - sz) * (nz - sz);
-            if dist_sq > max_dist_sq {
-                continue;
-            }
-
-            if let Some(ny) = resolve_step_y(world, nx, cy, nz) {
-                let ng = current.g_cost + 10 + (ny - cy).abs() * 5;
-                if ng < *g_scores.get(&(nx, ny, nz)).unwrap_or(&i32::MAX) {
-                    g_scores.insert((nx, ny, nz), ng);
-                    came_from.insert((nx, ny, nz), (cx, cy, cz));
-                    let nh = ((goal_x - nx).abs() + (goal_y - ny).abs() + (goal_z - nz).abs()) * 10;
-                    open.push(AStarNode {
-                        pos: (nx, ny, nz),
-                        f_cost: ng + nh,
-                        g_cost: ng,
-                    });
-                }
-            }
-        }
-    }
-
-    if best_pos == (sx, sy, sz) {
-        return Vec::new();
-    }
-
-    let mut path = Vec::new();
-    let mut cur = best_pos;
-    while cur != (sx, sy, sz) {
-        path.push(cur);
-        if let Some(&prev) = came_from.get(&cur) {
-            cur = prev;
-        } else {
-            break;
-        }
-    }
-    path.reverse();
-    path
-}
-
-fn is_passable_for_mob(world: &World, x: i32, y: i32, z: i32) -> bool {
-    if !(1..126).contains(&y) {
-        return false;
-    }
-    let b0 = world.get_block(x, y, z);
-    let b1 = world.get_block(x, y + 1, z);
-    !blocks::is_solid(b0)
-        && !blocks::is_lava(b0)
-        && b0 != blocks::FIRE
-        && b0 != blocks::CACTUS
-        && !blocks::is_solid(b1)
-        && !blocks::is_lava(b1)
-}
-
-fn resolve_step_y(world: &World, x: i32, y: i32, z: i32) -> Option<i32> {
-    // Same level
-    if is_passable_for_mob(world, x, y, z) {
-        let mut drop_y = y;
-        for _ in 0..4 {
-            let below = world.get_block(x, drop_y - 1, z);
-            if blocks::is_solid(below) || blocks::is_water(below) {
-                return Some(drop_y);
-            }
-            if blocks::is_lava(below) || below == blocks::FIRE {
-                return None;
-            }
-            drop_y -= 1;
-            if drop_y <= 1 {
-                return None;
-            }
-        }
-        return None;
-    }
-    // Step up +1
-    if is_passable_for_mob(world, x, y + 1, z) && blocks::is_solid(world.get_block(x, y, z)) {
-        return Some(y + 1);
-    }
-    None
+    let half = (length / 2.0) as f64;
+    let start = (
+        (start_x - half).floor() as i32,
+        start_y.floor() as i32,
+        (start_z - half).floor() as i32,
+    );
+    let goal = (
+        (goal_x - half).floor() as i32,
+        goal_y.floor() as i32,
+        (goal_z - half).floor() as i32,
+    );
+    // `Pathfinder` builds the size box of the entity: `floor(length + 1)`,
+    // `floor(width + 1)` and `floor(length + 1)`.
+    let size = (
+        (length + 1.0).floor() as i32,
+        (width + 1.0).floor() as i32,
+        (length + 1.0).floor() as i32,
+    );
+    let mut pathfinder = Pathfinder::new(world, size, goal, max_dist);
+    pathfinder.search(start).unwrap_or_default()
 }
 
 // -------------------------------------------------------------------------
@@ -1619,7 +2188,8 @@ mod tests {
             MobType::Wolf,
         ];
         for (idx, &mtype) in all.iter().enumerate() {
-            let mut mob = Mob::new(idx as i32 + 1, mtype, 10.5, 64.0, -20.5, 12345);
+            let mut rng = JavaRandom::new(12345);
+            let mut mob = Mob::new(idx as i32 + 1, mtype, 10.5, 64.0, -20.5, &mut rng);
             if mtype == MobType::Wolf {
                 mob.wolf_tamed = true;
                 mob.wolf_sitting = true;
@@ -1638,7 +2208,7 @@ mod tests {
             assert_eq!(*meta.last().unwrap(), 127);
 
             let nbt = mob.to_nbt();
-            let restored = Mob::from_nbt(mob.entity_id, &nbt, 12345).unwrap();
+            let restored = Mob::from_nbt(mob.entity_id, &nbt, &mut rng).unwrap();
             assert_eq!(restored.mob_type, mtype);
             assert_eq!(restored.pig_saddled, mob.pig_saddled);
             assert_eq!(restored.sheep_color, mob.sheep_color);
@@ -1652,11 +2222,42 @@ mod tests {
 
     #[test]
     fn creeper_drops_music_record_when_killed_by_skeleton_arrow() {
-        let mut creeper = Mob::new(1, MobType::Creeper, 0.0, 64.0, 0.0, 42);
-        let drops = creeper.get_death_drops(true);
+        let mut rng = JavaRandom::new(42);
+        let mut creeper = Mob::new(1, MobType::Creeper, 0.0, 64.0, 0.0, &mut rng);
+        let drops = creeper.get_death_drops(&mut rng, true);
         assert!(drops
             .iter()
             .any(|d| d.id == items::GOLD_RECORD || d.id == items::GREEN_RECORD));
+    }
+
+    #[test]
+    fn the_pathfinder_does_not_go_through_the_water() {
+        let mut world = World::new(WorldConfig {
+            seed: 100,
+            save_enabled: false,
+            ..Default::default()
+        });
+        world.ensure_chunk_base(ChunkPos::new(0, 0));
+        // A floor at y=63 and a pool of water in the middle of it.
+        for x in 0..12 {
+            for z in 0..12 {
+                world.set_block(x, 63, z, blocks::STONE);
+                world.set_block(x, 64, z, blocks::AIR);
+                if (2..=5).contains(&x) {
+                    world.set_block(x, 64, z, blocks::STATIONARY_WATER);
+                }
+            }
+        }
+        // The mob is in front of the pool, the goal is behind it.
+        let path = find_path(&world, 0.5, 64.0, 5.5, 0.6, 0.9, 7.5, 64.5, 5.5, 16.0);
+        assert!(!path.is_empty(), "the pathfinder should find a way around");
+        for (x, y, z) in &path {
+            // The water is not passable for the mobs of the reference.
+            assert!(
+                !((2..=5).contains(x) && *y == 64),
+                "the path goes through the water at {x},{y},{z}"
+            );
+        }
     }
 
     #[test]
@@ -1679,7 +2280,9 @@ mod tests {
                 }
             }
         }
-        let path = find_path(&world, 1.5, 64.0, 2.5, 6, 65, 2, 16.0);
+        // The goal is the middle of the block (6, 65, 2), the mob is a pig
+        // (0.6 wide and 0.9 high).
+        let path = find_path(&world, 1.5, 64.0, 2.5, 0.6, 0.9, 6.5, 65.5, 2.5, 16.0);
         assert!(
             !path.is_empty(),
             "Pathfinder should find path up 1-block step"

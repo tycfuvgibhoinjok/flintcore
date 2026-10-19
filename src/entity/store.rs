@@ -5,6 +5,7 @@ use crate::entity::player::Player;
 use crate::entity::projectile::{Minecart, Painting, PrimedTnt, Projectile, ProjectileKind};
 use crate::gameplay::items::ItemStack;
 use crate::net::ConnId;
+use crate::util::rng::JavaRandom;
 use crate::world::chunk::ChunkPos;
 
 #[derive(Debug, Clone)]
@@ -354,9 +355,16 @@ impl EntityStore {
     // Mobs
     // ---------------------------------------------------------------------
 
-    pub fn spawn_mob(&mut self, mob_type: MobType, x: f64, y: f64, z: f64, seed: i64) -> i32 {
+    pub fn spawn_mob(
+        &mut self,
+        mob_type: MobType,
+        x: f64,
+        y: f64,
+        z: f64,
+        rng: &mut JavaRandom,
+    ) -> i32 {
         let entity_id = self.allocate_id();
-        let mob = Mob::new(entity_id, mob_type, x, y, z, seed);
+        let mob = Mob::new(entity_id, mob_type, x, y, z, rng);
         self.mobs.insert(entity_id, mob);
         self.tag_spawned(entity_id);
         entity_id

@@ -177,7 +177,88 @@ Worldgen parity harness (Overworld):
   trace (`A4`/`A5`/`B`/`G`/... lines) that can be diffed against a patched
   reference run for byte-level staged comparison.
 
----
+Mob movement parity harness:
+
+- Ground truth: `tools/poseidon_mobs/PoseidonMobTrace.java` runs a single mob
+  of the reference in a handcrafted world and dumps its position, velocity,
+  rotation, ground flag, fall distance, target and path after every tick.
+  Build and run it as described in `tools/poseidon_mobs/README.md`.
+- The traces are the golden file `tests/golden/poseidon_mob_traces.txt`; the
+  test `the_mob_movement_matches_the_poseidon_reference` in `src/server.rs`
+  reproduces the eight scenarios and compares them tick by tick. The test is
+  `#[ignore]`d while the port of the movement model is in progress.
+- The port follows the reference classes one by one: `AxisAlignedBB` and
+  `Entity.move` (`src/entity/physics.rs`), `EntityLiving.a(float, float)`
+  (the acceleration, the drag and the jump), `Pathfinder`/`Path` (the A* with
+  the tie breaking of the reference heap) and `EntityCreature.c_()` (the
+  target, the path following and the random look around).
+- The reference shares **one** `Random` between all entities
+  (`Entity.SHARED_RANDOM`); the flintcore uses the same model, seeded from the
+  seed of the world, so the behaviour is reproducible (the reference takes the
+  seed from the system clock, which is a documented deviation).
+- The movement of the mobs is the most expensive part of the tick: the
+  benchmark `the_mob_tick_is_fast_enough` (100 mobs on a flat floor, 100
+  ticks) measures **0.4 ms per tick** in the release build and 3.6 ms in the
+  debug build.
+- The state of the port (the divergence of the trace against the reference,
+  the comparison lives in `the_mob_movement_matches_the_poseidon_reference`,
+  the golden traces in `tests/golden/poseidon_mob_traces.txt`):
+
+  | scenario | the trace matches for | the difference |
+  |----------|-----------------------|----------------|
+  | `slime`  | **300 ticks (all)**   | - |
+  | `flat`   | **300 ticks (all)**   | - |
+  | `ghast`  | **300 ticks (all)**   | - |
+  | `chase`  | 94 ticks              | the position of the mob on the step |
+  | `wall`   | 89 ticks              | the path of the spider |
+  | `squid`  | 52 ticks              | the velocity of the squid |
+  | `lava`   | 18 ticks              | the position of the zombie (one unit in the last place) |
+  | `water`  | 24 ticks              | the position of the zombie (one unit in the last place) |
+
+  - The random stream of the entities is identical to the reference: the
+    numbers are drawn in the same order and with the same values (the
+    comparison of the traces with `-Dflint.trace.rng=1` shows it tick by
+    tick). The reference draws one number per tick in `EntityLiving.R()`
+    (the idle sound of the mob), the number of the walk of
+    `EntityCreature.c_()` and the two numbers of the base
+    `EntityLiving.c_()`. The sound of the mob (`EntityLiving.Q()`) and the
+    sound of the damage (`EntityLiving.damageEntity`) draw two numbers
+    more.
+  - The order of the draws is the order of the reference: the splash of the
+    water (`Entity.m_()`), the damage of the fire and of the lava
+    (`Entity.R()`), the idle sound (`EntityLiving.R()`), the counters, the
+    target, the path to the target, the walk of the mob, the AI of the mob
+    and the movement.
+  - The arithmetic of the reference is ported exactly: the constants of
+    the single precision (`0.9800000190734863D`, `0.41999998688697815D`),
+    the sine and the cosine of the table of `MathHelper` and the arcus
+    tangens of `org.bukkit.craftbukkit.TrigMath` (`util::math::trig`).
+  - The reference uses **two** arcus tangens: the one of
+    `org.bukkit.craftbukkit.TrigMath` (the walk of the mobs) and the one of
+    the JVM (`Math.atan2`, the look at the target, the flight of the ghast
+    and the swim of the squid). The JVM implements it with the `fdlibm`
+    library, whose result differs from the one of the system library in the
+    last bit, so the port has its own copy (`util::fdlibm`), checked
+    against the JVM bit by bit (`util::fdlibm::tests`).
+  - The interval of the idle sound of a mob is the one of the reference:
+    80 ticks for the mobs and 120 ticks for the animals and the water
+    animals (`EntityLiving.e()`, `EntityAnimal.e()` and
+    `EntityWaterAnimal.e()`). The counter of the sound is reset with it,
+    so a wrong interval shifts the whole stream of the random numbers.
+  - The check of the daylight of the zombies and the skeletons
+    (`EntityZombie.v()`) has three conditions in the reference: the world
+    is bright enough, the light of the block of the mob is above 0.5 and
+    the block of the mob is above the terrain (`World.isChunkLoaded`).
+    Only the last one draws a number, so the port has to check it too.
+  - The light of the scenario is set by hand (the harness and the port set
+    the sky light of the floor to 15): the world of the reference is
+    generated with the normal generator, so the light of the hills around
+    the floor would be an artefact of the terrain.
+  - The differences that are left are the parts of the reference that are
+    not ported yet: the path of the mobs in some situations (the tie
+    breaking of the heap of the path finder), the last unit in the last
+    place of the position of a mob in the water and in the lava and the
+    branch of the swim of the squid.
 
 ## 7. Performance discipline
 

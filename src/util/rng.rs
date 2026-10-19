@@ -38,7 +38,9 @@ impl JavaRandom {
         loop {
             let bits = self.next(31);
             let value = bits % bound;
-            if bits - value + (bound - 1) >= 0 {
+            // Java computes the difference in a long, the sum overflows an
+            // i32 for a large bound.
+            if (bits as i64 - value as i64 + (bound as i64 - 1)) >= 0 {
                 return value;
             }
         }
@@ -94,5 +96,22 @@ mod tests {
             let value = random.next_f64();
             assert!((0.0..1.0).contains(&value));
         }
+    }
+}
+
+#[cfg(test)]
+mod rng_parity_tests {
+    use super::*;
+
+    #[test]
+    fn the_random_stream_matches_the_reference() {
+        let mut rng = JavaRandom::new(12345);
+        // The first raw values of the reference (the stack trace of the
+        // harness): 776966251, 1102109080, 2003588241, 15386631, 13976953.
+        assert_eq!(rng.next(31), 776966251);
+        assert_eq!(rng.next(31), 1102109080);
+        assert_eq!(rng.next(31), 2003588241);
+        assert_eq!(rng.next(24), 15386631);
+        assert_eq!(rng.next(24), 13976953);
     }
 }
