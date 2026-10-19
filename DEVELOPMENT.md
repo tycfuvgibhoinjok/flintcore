@@ -201,8 +201,11 @@ Mob movement parity harness:
   ticks) measures **0.4 ms per tick** in the release build and 3.6 ms in the
   debug build.
 - The state of the port (the divergence of the trace against the reference,
-  the comparison lives in `the_mob_movement_matches_the_poseidon_reference`,
-  the golden traces in `tests/golden/poseidon_mob_traces.txt`):
+  the comparison lives in `the_mob_movement_matches_the_poseidon_reference`
+  (it is ignored while some scenarios differ) and in
+  `the_mob_scenarios_of_the_reference_match` (the scenarios that match, they
+  must not diverge), the golden traces live in
+  `tests/golden/poseidon_mob_traces.txt`):
 
   | scenario | the trace matches for | the difference |
   |----------|-----------------------|----------------|
