@@ -1,10 +1,18 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::gameplay::blocks;
 use crate::util::noise::OctavesNoise;
 use crate::util::rng::JavaRandom;
-use crate::world::biome::{Biome, WorldChunkManager};
+use crate::world::biome::{Biome, TreeKind, WorldChunkManager};
 use crate::world::caves::MapGenCaves;
 use crate::world::chunk::{Chunk, ChunkPos, CHUNK_HEIGHT, CHUNK_WIDTH};
 use crate::world::decorate::{self, GenWorld};
+
+static GENERATE_SANDSTONE: AtomicBool = AtomicBool::new(true);
+
+pub fn set_generate_sandstone(enabled: bool) {
+    GENERATE_SANDSTONE.store(enabled, Ordering::Relaxed);
+}
 
 const BLOCKS: usize = CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_WIDTH;
 pub const CHUNK_SEED_X: i64 = 341873128712;
@@ -387,7 +395,10 @@ impl Generator {
                             } else if remaining > 0 {
                                 remaining -= 1;
                                 blocks[index] = filler;
-                                if remaining == 0 && filler == blocks::SAND {
+                                if remaining == 0
+                                    && filler == blocks::SAND
+                                    && GENERATE_SANDSTONE.load(Ordering::Relaxed)
+                                {
                                     remaining = self.random.next_i32_bound(4);
                                     filler = blocks::SANDSTONE;
                                 }
@@ -530,12 +541,15 @@ impl Generator {
             decorate::generate_minable(world, &mut self.random, x, y, z, blocks::DIAMOND_ORE, 7);
         }
 
-        for _ in 0..1 {
-            let x = k + self.random.next_i32_bound(16);
-            let a = self.random.next_i32_bound(16);
-            let y = a + self.random.next_i32_bound(16);
-            let z = l + self.random.next_i32_bound(16);
-            decorate::generate_minable(world, &mut self.random, x, y, z, blocks::LAPIS_ORE, 6);
+        let wg = world.worldgen_config();
+        if wg.generate_lapis_ores {
+            for _ in 0..1 {
+                let x = k + self.random.next_i32_bound(16);
+                let a = self.random.next_i32_bound(16);
+                let y = a + self.random.next_i32_bound(16);
+                let z = l + self.random.next_i32_bound(16);
+                decorate::generate_minable(world, &mut self.random, x, y, z, blocks::LAPIS_ORE, 6);
+            }
         }
 
         let d0 = 0.5;
@@ -558,7 +572,24 @@ impl Generator {
         for _ in 0..tree_count.max(0) {
             let x = k + self.random.next_i32_bound(16) + 8;
             let z = l + self.random.next_i32_bound(16) + 8;
-            let kind = biome.tree_kind(&mut self.random);
+            let mut kind = if wg.pre_b1_2_tree_generation {
+                let mut knd = if self.random.next_i32_bound(10) == 0 {
+                    TreeKind::BigTree
+                } else {
+                    TreeKind::Trees
+                };
+                if biome == Biome::Rainforest && self.random.next_i32_bound(3) == 0 {
+                    knd = TreeKind::BigTree;
+                }
+                knd
+            } else {
+                biome.tree_kind(&mut self.random)
+            };
+            if ((kind == TreeKind::Taiga1 || kind == TreeKind::Taiga2) && !wg.generate_spruces)
+                || (kind == TreeKind::Forest && !wg.generate_birches)
+            {
+                kind = TreeKind::Trees;
+            }
             let y = world.highest_block_y(x, z);
             decorate::generate_tree(world, &mut self.random, kind, x, y, z);
         }
@@ -585,23 +616,35 @@ impl Generator {
             Biome::Plains => 10,
             _ => 0,
         };
-        for _ in 0..grass.max(0) {
-            let mut data = 1u8;
-            if biome == Biome::Rainforest && self.random.next_i32_bound(3) != 0 {
-                data = 2;
+        if wg.generate_tallgrass {
+            for _ in 0..grass.max(0) {
+                let mut data = 1u8;
+                if biome == Biome::Rainforest && self.random.next_i32_bound(3) != 0 {
+                    data = 2;
+                }
+                let x = k + self.random.next_i32_bound(16) + 8;
+                let y = self.random.next_i32_bound(128);
+                let z = l + self.random.next_i32_bound(16) + 8;
+                decorate::generate_grass(
+                    world,
+                    &mut self.random,
+                    x,
+                    y,
+                    z,
+                    blocks::TALL_GRASS,
+                    data,
+                );
             }
-            let x = k + self.random.next_i32_bound(16) + 8;
-            let y = self.random.next_i32_bound(128);
-            let z = l + self.random.next_i32_bound(16) + 8;
-            decorate::generate_grass(world, &mut self.random, x, y, z, blocks::TALL_GRASS, data);
         }
 
         let dead_bush = if biome == Biome::Desert { 2 } else { 0 };
-        for _ in 0..dead_bush {
-            let x = k + self.random.next_i32_bound(16) + 8;
-            let y = self.random.next_i32_bound(128);
-            let z = l + self.random.next_i32_bound(16) + 8;
-            decorate::generate_dead_bush(world, &mut self.random, x, y, z, blocks::DEAD_BUSH);
+        if wg.generate_tallgrass {
+            for _ in 0..dead_bush {
+                let x = k + self.random.next_i32_bound(16) + 8;
+                let y = self.random.next_i32_bound(128);
+                let z = l + self.random.next_i32_bound(16) + 8;
+                decorate::generate_dead_bush(world, &mut self.random, x, y, z, blocks::DEAD_BUSH);
+            }
         }
 
         if self.random.next_i32_bound(2) == 0 {
@@ -681,6 +724,18 @@ impl Generator {
                 {
                     world.set_block_physics(i3, l3, l2, blocks::SNOW);
                 }
+            }
+        }
+
+        if wg.generate_steveco_chests {
+            let k2 = k + self.random.next_i32_bound(16) + 8;
+            let l2 = self.random.next_i32_bound(128);
+            let i3 = l + self.random.next_i32_bound(16) + 8;
+            if l2 > 0
+                && world.get_block(k2, l2, i3) == blocks::AIR
+                && blocks::material(world.get_block(k2, l2 - 1, i3)).is_solid()
+            {
+                world.set_block_physics(k2, l2, i3, blocks::LOCKED_CHEST);
             }
         }
     }

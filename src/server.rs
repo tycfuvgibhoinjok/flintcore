@@ -77,42 +77,70 @@ impl Server {
         running: Arc<AtomicBool>,
     ) -> Self {
         let mut world = World::new(config.world.clone());
+        world.allow_nether = config.server.allow_nether;
+        world.spawning = config.spawning.clone();
+        world.worldgen = config.worldgen.clone();
+        world.mechanics = config.mechanics.clone();
+        world.fixes = config.fixes.clone();
+        crate::world::generator::set_generate_sandstone(config.worldgen.generate_sandstone);
+        crate::gameplay::crafting::set_crafting_mechanics(
+            config.mechanics.glowstone_pre_1_6_6,
+            config.mechanics.wool_recipe_pre_1_6_6,
+            config.mechanics.old_slab_recipe,
+            config.mechanics.allow_ladder_gap,
+        );
         if config.world.save_enabled {
             world.live_enable();
             if world.is_fresh_world() {
-                let rng_seed = std::env::var("FLINTCORE_SPAWN_RNG_SEED")
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or_else(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as i64)
-                            .unwrap_or(config.world.seed)
-                    });
-                let (sx, sz) = world.live_find_spawn(rng_seed);
-                config.world.spawn_x = sx;
-                config.world.spawn_y = 64;
-                config.world.spawn_z = sz;
+                let custom_spawn = !config.world.auto_find_spawn
+                    || config.world.override_saved_spawn
+                    || config.world.spawn_x != 0
+                    || config.world.spawn_y != 64
+                    || config.world.spawn_z != 0;
+                if custom_spawn {
+                    world.set_spawn_xyz(
+                        config.world.spawn_x,
+                        config.world.spawn_y,
+                        config.world.spawn_z,
+                    );
+                } else {
+                    let rng_seed = std::env::var("FLINTCORE_SPAWN_RNG_SEED")
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as i64)
+                                .unwrap_or(config.world.seed)
+                        });
+                    let (sx, sz) = world.live_find_spawn(rng_seed);
+                    config.world.spawn_x = sx;
+                    config.world.spawn_y = 64;
+                    config.world.spawn_z = sz;
+                }
             } else {
                 let (sx, sy, sz) = world.spawn_point();
                 config.world.spawn_x = sx;
                 config.world.spawn_y = sy;
                 config.world.spawn_z = sz;
             }
-            log::info(&format!(
-                "Preparing start region for level 0 (Seed: {})",
-                world.seed()
-            ));
-            world.live_prepare_spawn_region();
-            // Queue and immediately flush startup-only chunks outside the 128-block keep-spawn radius
-            world.queue_unwatched_chunks();
-            while !world.live.unload_queue.is_empty() {
-                world.live_unload_chunks();
+            if config.world.keep_spawn_in_memory {
+                log::info(&format!(
+                    "Preparing start region for level 0 (Seed: {})",
+                    world.seed()
+                ));
+                world.live_prepare_spawn_region();
+                // Queue and immediately flush startup-only chunks outside the 128-block keep-spawn radius
+                world.queue_unwatched_chunks();
+                while !world.live.unload_queue.is_empty() {
+                    world.live_unload_chunks();
+                }
+                world.compact_all_chunks();
             }
-            world.compact_all_chunks();
         }
         let player_store = crate::world::storage::PlayerStore::new(world.world_dir());
         let view_distance = config.world.view_distance;
+        let whitelist_enabled = config.server.white_list;
         let ops = Self::load_list_file("ops.txt");
         let banned_players = Self::load_list_file("banned-players.txt");
         let banned_ips = Self::load_list_file("banned-ips.txt");
@@ -134,7 +162,7 @@ impl Server {
             banned_players,
             banned_ips,
             whitelist,
-            whitelist_enabled: false,
+            whitelist_enabled,
             tps_records: VecDeque::with_capacity(900),
             last_tps_sample: Instant::now(),
             ticks_since_sample: 0,
@@ -221,14 +249,21 @@ impl Server {
         } else {
             self.world.increment_time();
         }
+        if self.config.server.time_speed_multiplier != 1 {
+            let extra = self.config.server.time_speed_multiplier - 1;
+            self.world.live_time = self.world.live_time.wrapping_add(extra);
+            self.world.level_data.borrow_mut().time = self.world.live_time;
+        }
         self.drain_inbound();
 
         // Incremental auto-save (`ChunkProviderServer.saveChunks(false, null)` — up to 24 dirty chunks)
-        if ticks > 0 && self.config.world.save_enabled {
+        let autosave_ticks = self.config.server.autosave_interval_ticks;
+        if ticks > 0 && self.config.world.save_enabled && autosave_ticks > 0 {
             if ticks % 100 == 0 {
                 let _ = self.world.save_chunks_incremental(24);
             }
-            if ticks % 1200 == 0 {
+            let player_save_every = autosave_ticks.min(1200);
+            if self.config.server.save_playerdata && ticks % player_save_every == 0 {
                 for player in self.entities.iter_players() {
                     let _ = self.player_store.save_player(player);
                 }
@@ -427,7 +462,7 @@ impl Server {
                 if self.world.live_is_active() {
                     self.world.live_player_quit(id);
                 }
-                if self.config.world.save_enabled {
+                if self.config.world.save_enabled && self.config.server.save_playerdata {
                     let _ = self.player_store.save_player(&player);
                 }
 
@@ -438,17 +473,27 @@ impl Server {
                     }
                 }
 
-                let msg =
-                    self.config
-                        .server
-                        .leave_message
-                        .replacen("%player%", &player.username, 1);
+                if !self.config.messages.remove_join_leave_debug {
+                    log::info(&format!(
+                        "{} lost connection: disconnect.quitting",
+                        player.username
+                    ));
+                }
+                let default_leave = crate::config::ServerConfig::default().leave_message;
+                let leave_tpl = if self.config.server.leave_message != default_leave {
+                    &self.config.server.leave_message
+                } else {
+                    &self.config.messages.leave
+                };
+                let msg = leave_tpl.replacen("%player%", &player.username, 1);
                 self.broadcast_chat(&msg);
             }
-            log::info(&format!(
-                "connection {id} ({}) disconnected",
-                conn.username.as_deref().unwrap_or("unknown")
-            ));
+            if !self.config.messages.remove_join_leave_debug {
+                log::info(&format!(
+                    "connection {id} ({}) disconnected",
+                    conn.username.as_deref().unwrap_or("unknown")
+                ));
+            }
         }
     }
 
@@ -632,6 +677,7 @@ impl Server {
 
         let mut resync_teleport = None;
         let mut stepped_block = None;
+        let mut kick_flight = false;
         let (fall_damage, entity_id, old_chunk, new_chunk) = {
             if let Some(player) = self.entities.get_by_conn_mut(id) {
                 if player.dead {
@@ -665,17 +711,30 @@ impl Server {
                     self.kick(id, "Nope!");
                     return;
                 }
+                if self.config.fixes.head_rotation_patch_enabled
+                    && rot.is_some()
+                    && !(-90.0..=90.0).contains(&pitch)
+                {
+                    self.kick(id, "Illegal stance");
+                    return;
+                }
                 if x.abs() > 3.2e7 || z.abs() > 3.2e7 {
                     self.kick(id, "Illegal position");
                     return;
                 }
 
-                // Poseidon / NetServerHandler.java:385-394 — reject stale pre-teleport / >10-block single-packet jump
-                if self.world.live_is_active() && pos.is_some() {
+                // Poseidon / NetServerHandler.java:385-394 — reject stale pre-teleport / >max_distance single-packet jump
+                if self.world.live_is_active()
+                    && self.config.fixes.speed_hack_check_enabled
+                    && pos.is_some()
+                {
                     let dx_m = x - player.x;
                     let dz_m = z - player.z;
                     let mot_sq = player.mot_x * player.mot_x + player.mot_z * player.mot_z;
-                    if (dx_m * dx_m + dz_m * dz_m) - mot_sq > 100.0 {
+                    if (dx_m * dx_m + dz_m * dz_m) - mot_sq
+                        > self.config.fixes.speed_hack_max_distance
+                        && self.config.fixes.speed_hack_teleport
+                    {
                         resync_teleport =
                             Some((player.x, player.y, player.z, player.yaw, player.pitch));
                     }
@@ -686,10 +745,13 @@ impl Server {
                     let by = y.floor() as i32;
                     let bz = z.floor() as i32;
                     let at_block = self.world.get_block(bx, by, bz);
-                    if blocks::is_water(at_block)
+                    let in_climb_or_fluid = blocks::is_water(at_block)
+                        || blocks::is_lava(at_block)
                         || at_block == blocks::WEB
                         || at_block == blocks::LADDER
-                    {
+                        || (self.config.mechanics.allow_ladder_gap
+                            && self.world.get_block(bx, by + 1, bz) == blocks::LADDER);
+                    if in_climb_or_fluid {
                         player.fall_distance = 0.0;
                     }
                     if player.vehicle_id.is_none() {
@@ -697,7 +759,22 @@ impl Server {
                             if y < prev_y {
                                 player.fall_distance += (prev_y - y) as f32;
                             }
+                            if !in_climb_or_fluid && y >= prev_y - 0.03125 {
+                                player.air_hover_ticks += 1;
+                                if player.air_hover_ticks > 80 {
+                                    let is_op = self.ops.contains(&player.username.to_lowercase());
+                                    if !self.config.server.allow_flight
+                                        && !(self.config.server.exempt_staff_from_flight_kick
+                                            && is_op)
+                                    {
+                                        kick_flight = true;
+                                    }
+                                }
+                            } else {
+                                player.air_hover_ticks = 0;
+                            }
                         } else {
+                            player.air_hover_ticks = 0;
                             if player.fall_distance > 3.0 {
                                 fall_damage = ((player.fall_distance - 3.0).ceil() as i16).max(0);
                             }
@@ -713,6 +790,7 @@ impl Server {
                             stepped_block = Some((bx, (y - 0.2).floor() as i32, bz));
                         }
                     } else {
+                        player.air_hover_ticks = 0;
                         player.fall_distance = 0.0;
                     }
 
@@ -725,6 +803,11 @@ impl Server {
                 return;
             }
         };
+
+        if kick_flight {
+            self.kick(id, "Flying is not enabled on this server");
+            return;
+        }
 
         if let Some((tx, ty, tz, tyaw, tpitch)) = resync_teleport {
             self.send(
@@ -746,7 +829,12 @@ impl Server {
             if (0..128).contains(&sby) {
                 let bid = self.world.get_block(sbx, sby, sbz);
                 if bid == blocks::FARMLAND {
-                    self.world.trample_farmland(sbx, sby, sbz);
+                    if !self.config.mechanics.trample_farmland_above_fence
+                        || sby == 0
+                        || self.world.get_block(sbx, sby - 1, sbz) != blocks::FENCE
+                    {
+                        self.world.trample_farmland(sbx, sby, sbz);
+                    }
                 } else if bid == blocks::REDSTONE_ORE {
                     self.world
                         .java_set_type_id(sbx, sby, sbz, blocks::LIT_REDSTONE_ORE);
@@ -991,24 +1079,34 @@ impl Server {
                             self.send(target.conn_id, outbound.packet);
                         }
                     }
-                    // EntityBoat.java:124-130 — drop 3x WOOD_PLANKS + 2x STICK
-                    for _ in 0..3 {
+                    if self.config.mechanics.boats_drop_boat_not_wood {
                         self.spawn_dropped_item_random(
                             bx,
                             by,
                             bz,
-                            ItemStack::new(blocks::WOOD_PLANKS as i16, 1, 0),
+                            ItemStack::new(items::BOAT, 1, 0),
                             10,
                         );
-                    }
-                    for _ in 0..2 {
-                        self.spawn_dropped_item_random(
-                            bx,
-                            by,
-                            bz,
-                            ItemStack::new(items::STICK, 1, 0),
-                            10,
-                        );
+                    } else {
+                        // EntityBoat.java:124-130 — drop 3x WOOD_PLANKS + 2x STICK
+                        for _ in 0..3 {
+                            self.spawn_dropped_item_random(
+                                bx,
+                                by,
+                                bz,
+                                ItemStack::new(blocks::WOOD_PLANKS as i16, 1, 0),
+                                10,
+                            );
+                        }
+                        for _ in 0..2 {
+                            self.spawn_dropped_item_random(
+                                bx,
+                                by,
+                                bz,
+                                ItemStack::new(items::STICK, 1, 0),
+                                10,
+                            );
+                        }
                     }
                 }
             }
@@ -1106,6 +1204,10 @@ impl Server {
         }
 
         if use_entity.attack {
+            if !self.config.server.pvp {
+                return;
+            }
+            let keep_inv = self.config.mechanics.keep_inventory_on_death;
             let mut woke_target = false;
             let armor_sync;
             let (target_conn_id, target_name, target_health, died, mot_x, mot_y, mot_z, drops) = {
@@ -1145,7 +1247,7 @@ impl Server {
                     let mot_x = (target.mot_x.clamp(-3.9, 3.9) * 8000.0) as i16;
                     let mot_y = (target.mot_y.clamp(-3.9, 3.9) * 8000.0) as i16;
                     let mot_z = (target.mot_z.clamp(-3.9, 3.9) * 8000.0) as i16;
-                    let drops = if died {
+                    let drops = if died && !keep_inv {
                         let tx = target.x;
                         let ty = target.y;
                         let tz = target.z;
@@ -1679,9 +1781,12 @@ impl Server {
         } else {
             old_meta
         };
-        // BlockTNT.postBreak (`BlockTNT.java:41-52`): ignite when metadata bit 0 is set, else drop TNT block
+        // BlockTNT.postBreak (`BlockTNT.java:41-60`): ignite when metadata bit 0 is set, holding lighter, or `!tnt_require_lighter`
         if old_block == blocks::TNT {
-            if (old_meta & 1) != 0 || held_item.is_some_and(|s| s.id == items::FLINT_AND_STEEL) {
+            if !self.config.mechanics.tnt_require_lighter
+                || (old_meta & 1) != 0
+                || held_item.is_some_and(|s| s.id == items::FLINT_AND_STEEL)
+            {
                 self.world.ignite_tnt(x, y, z, false);
                 self.process_world_events();
             } else {
@@ -1698,7 +1803,18 @@ impl Server {
                 &mut self.world.world_random,
                 crate::util::rng::JavaRandom::new(0),
             );
-            let drops = blocks::get_block_drops(old_block, harvest_meta, &mut rng, held_item);
+            let mut drops = blocks::get_block_drops(old_block, harvest_meta, &mut rng, held_item);
+            if old_block == blocks::LAPIS_ORE && self.config.mechanics.drop_lapis_as_b1_2 {
+                drops = vec![ItemStack::new(items::INK_SACK, 1, 4)];
+            } else if old_block == blocks::GLOWSTONE && self.config.mechanics.glowstone_pre_1_6_6 {
+                drops = vec![ItemStack::new(items::GLOWSTONE_DUST, 1, 0)];
+            } else if old_block == blocks::LEAVES
+                && !self.config.mechanics.drop_saplings_of_leaf_type
+            {
+                for st in &mut drops {
+                    st.damage = 0;
+                }
+            }
             self.world.world_random = rng;
             for stack in drops {
                 self.spawn_dropped_item_random(x as f64, y as f64, z as f64, stack, 10);
@@ -2240,6 +2356,7 @@ impl Server {
 
                 let mut sleep_pkt = None;
                 let mut only_at_night = false;
+                let set_spawn = self.config.mechanics.beds_set_spawnpoint;
                 let time_of_day = self.world.world_time().rem_euclid(24000);
                 let is_night = (12541..=23458).contains(&time_of_day) || self.world.is_thundering();
                 if let Some(player) = self.entities.get_by_conn_mut(id) {
@@ -2249,7 +2366,9 @@ impl Server {
                     {
                         return true;
                     }
-                    player.spawn_bed = Some((hx, y, hz));
+                    if set_spawn {
+                        player.spawn_bed = Some((hx, y, hz));
+                    }
                     if is_night {
                         player.sleeping = true;
                         player.sleep_ticks = 0;
@@ -2414,6 +2533,18 @@ impl Server {
                 if (face != 0 && above == blocks::AIR && clicked_block == blocks::GRASS)
                     || clicked_block == blocks::DIRT
                 {
+                    if clicked_block == blocks::GRASS
+                        && self.config.mechanics.tile_grass_drop_seeds
+                        && self.world.tick_random.next_i32_bound(8) == 0
+                    {
+                        self.spawn_dropped_item_random(
+                            cx as f64,
+                            (cy + 1) as f64,
+                            cz as f64,
+                            ItemStack::new(items::SEEDS, 1, 0),
+                            10,
+                        );
+                    }
                     self.world.java_set_type_id(cx, cy, cz, blocks::FARMLAND);
                     self.send_block_change_to_observers(cx, cy, cz);
                     durability_cost = 1;
@@ -2421,9 +2552,10 @@ impl Server {
             }
             // Seeds: plant crops (59) on top of farmland (60)
             items::SEEDS => {
+                let above_id = self.world.get_block(cx, cy + 1, cz);
                 if face == 1
                     && clicked_block == blocks::FARMLAND
-                    && self.world.get_block(cx, cy + 1, cz) == blocks::AIR
+                    && (above_id == blocks::AIR || self.config.mechanics.seeds_replace_blocks)
                 {
                     self.world.java_set_type_id(cx, cy + 1, cz, blocks::CROPS);
                     self.send_block_change_to_observers(cx, cy + 1, cz);
@@ -2715,7 +2847,9 @@ impl Server {
                         .java_set_type_id_and_data(tx, ty, tz, blocks::DOUBLE_STEP, meta);
                     self.send_block_change_to_observers(tx, ty, tz);
                     consumed = true;
-                } else if !(ty == 127 && blocks::material(block_id).is_buildable())
+                } else if !(!self.config.mechanics.allow_blocks_at_y_127
+                    && ty == 127
+                    && blocks::material(block_id).is_buildable())
                     && self.world.can_place_block_at(block_id, tx, ty, tz, face)
                     && !self.block_intersects_any_player(block_id, tx, ty, tz)
                 {
@@ -3274,7 +3408,10 @@ impl Server {
                 boat_snap.on_ground = false;
             }
 
-            if horiz_collided && pre_move_speed > 0.15 {
+            if horiz_collided
+                && pre_move_speed > 0.15
+                && self.config.mechanics.boats_break_on_collision
+            {
                 boat_snap.dead = true;
                 crashed_boats.push((
                     boat_id,
@@ -3364,17 +3501,27 @@ impl Server {
                     self.send(target.conn_id, outbound.packet);
                 }
             }
-            for _ in 0..3 {
-                self.spawn_dropped_item_random(
-                    bx,
-                    by,
-                    bz,
-                    ItemStack::new(blocks::WOOD_PLANKS as i16, 1, 0),
-                    10,
-                );
-            }
-            for _ in 0..2 {
-                self.spawn_dropped_item_random(bx, by, bz, ItemStack::new(items::STICK, 1, 0), 10);
+            if self.config.mechanics.boats_drop_boat_not_wood {
+                self.spawn_dropped_item_random(bx, by, bz, ItemStack::new(items::BOAT, 1, 0), 10);
+            } else {
+                for _ in 0..3 {
+                    self.spawn_dropped_item_random(
+                        bx,
+                        by,
+                        bz,
+                        ItemStack::new(blocks::WOOD_PLANKS as i16, 1, 0),
+                        10,
+                    );
+                }
+                for _ in 0..2 {
+                    self.spawn_dropped_item_random(
+                        bx,
+                        by,
+                        bz,
+                        ItemStack::new(items::STICK, 1, 0),
+                        10,
+                    );
+                }
             }
         }
     }
@@ -3382,6 +3529,18 @@ impl Server {
     pub fn spawn_mob_at(&mut self, mob_type: MobType, x: f64, y: f64, z: f64) -> i32 {
         let seed = self.world.seed() ^ (self.current_tick as i64);
         let mob_id = self.entities.spawn_mob(mob_type, x, y, z, seed);
+        if mob_type == MobType::Sheep
+            && (!self.config.spawning.spawn_sheep_shades_of_black
+                || !self.config.spawning.spawn_brown_and_pink_sheep)
+        {
+            if let Some(m) = self.entities.get_mob_mut(mob_id) {
+                m.sheep_color = crate::entity::mob::Mob::natural_sheep_color_ex(
+                    &mut m.rng,
+                    self.config.spawning.spawn_sheep_shades_of_black,
+                    self.config.spawning.spawn_brown_and_pink_sheep,
+                );
+            }
+        }
         let players: Vec<_> = self.entities.iter_players().cloned().collect();
         if let Some(mob) = self.entities.get_mob(mob_id) {
             for out in self.tracker.track_mob_and_scan(mob, &players) {
@@ -3616,6 +3775,24 @@ impl Server {
             }
 
             let mob_type = MobType::from_nbt_id(&entity_id).unwrap_or(MobType::Pig);
+            if self.config.spawning.mob_spawner_area_limit_enabled {
+                let rad_blocks = (self.config.spawning.mob_spawner_chunk_radius.max(1) * 16) as f64;
+                let area_count = self
+                    .entities
+                    .iter_mobs()
+                    .filter(|m| {
+                        !m.dead
+                            && m.mob_type == mob_type
+                            && (m.x - (sx as f64 + 0.5)).abs() <= rad_blocks
+                            && (m.z - (sz as f64 + 0.5)).abs() <= rad_blocks
+                    })
+                    .count();
+                if area_count >= self.config.spawning.mob_spawner_area_limit {
+                    delay = (200 + rng.next_i32_bound(600)) as i16;
+                    delay_updates.push((sx, sy, sz, delay));
+                    continue;
+                }
+            }
             let nearby_same = self
                 .entities
                 .iter_mobs()
@@ -3800,6 +3977,13 @@ impl Server {
                     }
                 }
             }
+            MobType::Squid if self.config.mechanics.allow_milking_squids => {
+                if let Some(stack) = held {
+                    if stack.id == items::BUCKET {
+                        updated_hand = Some(Some(ItemStack::new(items::MILK_BUCKET, 1, 0)));
+                    }
+                }
+            }
             MobType::Wolf => {
                 let (tamed, angry, owner, health) = self
                     .entities
@@ -3907,6 +4091,28 @@ impl Server {
         });
         if !within_reach {
             return;
+        }
+
+        if self.config.mechanics.sheep_drop_wool_on_punch {
+            let mut punched_wool = None;
+            if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                if mob.mob_type == MobType::Sheep && !mob.sheep_sheared && damage > 0 {
+                    mob.sheep_sheared = true;
+                    let count = 1 + mob.rng.next_i32_bound(3);
+                    punched_wool = Some((mob.x, mob.y + 0.5, mob.z, mob.sheep_color, count));
+                }
+            }
+            if let Some((wx, wy, wz, color, count)) = punched_wool {
+                for _ in 0..count {
+                    self.spawn_dropped_item_random(
+                        wx,
+                        wy,
+                        wz,
+                        ItemStack::new(blocks::WOOL as i16, 1, color as i16),
+                        10,
+                    );
+                }
+            }
         }
 
         let dealt = self.damage_mob(
@@ -4029,7 +4235,16 @@ impl Server {
             if mob.health <= 0 {
                 mob.dead = true;
                 died = true;
-                let drops = mob.get_death_drops(killed_by_skeleton_arrow);
+                let mut drops = mob.get_death_drops(killed_by_skeleton_arrow);
+                if mob.mob_type == MobType::Pig
+                    && !self.config.mechanics.burning_pig_drop_cooked_meat
+                {
+                    for st in &mut drops {
+                        if st.id == items::GRILLED_PORK {
+                            st.id = items::PORK;
+                        }
+                    }
+                }
                 death_info = Some((
                     mob.mob_type,
                     mob.x,
@@ -4912,7 +5127,10 @@ impl Server {
                 }
 
                 // Spider wall climbing (`EntitySpider.p()`)
-                if mob.mob_type == MobType::Spider && mob.horiz_collided {
+                if mob.mob_type == MobType::Spider
+                    && self.config.mechanics.spiders_climb_walls
+                    && mob.horiz_collided
+                {
                     mob.mot_y = 0.2;
                 }
 
@@ -4938,7 +5156,10 @@ impl Server {
                         }
                     }
                     mob.fall_distance = 0.0;
-                    if below_id == blocks::FARMLAND {
+                    if below_id == blocks::FARMLAND
+                        && (mob.mob_type != MobType::Spider
+                            || self.config.mechanics.spiders_trample_crops)
+                    {
                         stepped_soil = Some((mob.x.floor() as i32, below_y, mob.z.floor() as i32));
                     } else if below_id == blocks::SOUL_SAND {
                         mob.mot_x *= 0.4;
@@ -4975,7 +5196,12 @@ impl Server {
             }
 
             if let Some((sx, sy, sz)) = stepped_soil {
-                self.world.trample_farmland(sx, sy, sz);
+                if !self.config.mechanics.trample_farmland_above_fence
+                    || sy == 0
+                    || self.world.get_block(sx, sy - 1, sz) != blocks::FENCE
+                {
+                    self.world.trample_farmland(sx, sy, sz);
+                }
             }
 
             if let Some((pid, rx, ry, rz)) = rider_sync {
@@ -5045,13 +5271,15 @@ impl Server {
                 vy,
                 vz,
             );
-            self.broadcast(Clientbound::LevelSound(LevelSound {
-                effect_id: 1002,
-                x: sx.floor() as i32,
-                y: sy.floor().clamp(0.0, 127.0) as u8,
-                z: sz.floor() as i32,
-                data: 0,
-            }));
+            if self.config.mechanics.skeleton_shooting_sound_fix {
+                self.broadcast(Clientbound::LevelSound(LevelSound {
+                    effect_id: 1002,
+                    x: sx.floor() as i32,
+                    y: sy.floor().clamp(0.0, 127.0) as u8,
+                    z: sz.floor() as i32,
+                    data: 0,
+                }));
+            }
         }
 
         for (ghast_id, gx, gy, gz, dx, dy, dz) in fireballs_to_shoot {
@@ -5080,7 +5308,8 @@ impl Server {
                     self.send(target.conn_id, out.packet);
                 }
             }
-            self.create_explosion(cx, cy, cz, radius, false);
+            let allow_blocks = self.config.mechanics.creeper_block_damage;
+            self.create_explosion_ex(cx, cy, cz, radius, false, allow_blocks);
         }
     }
 
@@ -5131,7 +5360,8 @@ impl Server {
                 ));
             }
             p.apply_knockback(attacker_x, attacker_z);
-            let drops = if died {
+            let keep_inv = self.config.mechanics.keep_inventory_on_death;
+            let drops = if died && !keep_inv {
                 let px = p.x;
                 let py = p.y;
                 let pz = p.z;
@@ -5204,14 +5434,16 @@ impl Server {
                 }
             }
 
-            let vel = Clientbound::EntityVelocity(EntityVelocity {
-                entity_id: player_id,
-                mot_x: mx,
-                mot_y: my,
-                mot_z: mz,
-            });
-            self.send(conn_id, vel.clone());
-            self.broadcast(vel);
+            if self.config.mechanics.player_knockback_fix {
+                let vel = Clientbound::EntityVelocity(EntityVelocity {
+                    entity_id: player_id,
+                    mot_x: mx,
+                    mot_y: my,
+                    mot_z: mz,
+                });
+                self.send(conn_id, vel.clone());
+                self.broadcast(vel);
+            }
             self.broadcast(Clientbound::EntityStatus(EntityStatus {
                 entity_id: player_id,
                 status: 2,
@@ -5391,8 +5623,10 @@ impl Server {
                 } else {
                     if proj_snapshot.kind == ProjectileKind::Arrow && proj_snapshot.from_player {
                         // Check if a player walks over the stuck arrow to pick it up
+                        let allow_others = self.config.mechanics.arrows_pickup_by_others;
                         let collector = self.entities.iter_players().find_map(|p| {
                             if !p.dead
+                                && (allow_others || proj_snapshot.shooter_id == Some(p.entity_id))
                                 && (p.x - proj_snapshot.x).abs() <= 1.2
                                 && (p.y - proj_snapshot.y).abs() <= 1.8
                                 && (p.z - proj_snapshot.z).abs() <= 1.2
@@ -5487,24 +5721,28 @@ impl Server {
             });
 
             if let Some(player_id) = hit_player {
-                let dmg = match proj_snapshot.kind {
-                    ProjectileKind::Arrow => 4,
-                    ProjectileKind::Fireball => 5,
-                    _ => 0,
-                };
-                player_hits.push((player_id, dmg, proj_snapshot.x, proj_snapshot.z));
-                if proj_snapshot.kind == ProjectileKind::Egg {
-                    egg_hatches.push((next_x, next_y, next_z));
-                } else if proj_snapshot.kind == ProjectileKind::Fireball {
-                    fireball_explosions.push((next_x, next_y, next_z));
-                }
-                if proj_snapshot.kind == ProjectileKind::FishingHook {
-                    if let Some(p) = self.entities.get_projectile_mut(pid) {
-                        p.hooked_entity = Some(player_id);
-                    }
+                if !self.config.server.pvp && proj_snapshot.from_player {
+                    // PvP disabled: player-fired arrows/snowballs/rods don't hit other players
                 } else {
-                    to_remove.push(pid);
-                    continue;
+                    let dmg = match proj_snapshot.kind {
+                        ProjectileKind::Arrow => 4,
+                        ProjectileKind::Fireball => 5,
+                        _ => 0,
+                    };
+                    player_hits.push((player_id, dmg, proj_snapshot.x, proj_snapshot.z));
+                    if proj_snapshot.kind == ProjectileKind::Egg {
+                        egg_hatches.push((next_x, next_y, next_z));
+                    } else if proj_snapshot.kind == ProjectileKind::Fireball {
+                        fireball_explosions.push((next_x, next_y, next_z));
+                    }
+                    if proj_snapshot.kind == ProjectileKind::FishingHook {
+                        if let Some(p) = self.entities.get_projectile_mut(pid) {
+                            p.hooked_entity = Some(player_id);
+                        }
+                    } else {
+                        to_remove.push(pid);
+                        continue;
+                    }
                 }
             }
 
@@ -5663,7 +5901,8 @@ impl Server {
         }
 
         for (fx, fy, fz) in fireball_explosions {
-            self.create_explosion(fx, fy, fz, 1.0, true);
+            let allow_blocks = self.config.mechanics.ghast_block_damage;
+            self.create_explosion_ex(fx, fy, fz, 1.0, true, allow_blocks);
         }
     }
 
@@ -5753,12 +5992,17 @@ impl Server {
                     self.send(t.conn_id, out.packet);
                 }
             }
-            self.create_explosion(tx, ty, tz, 4.0, false);
+            let allow_blocks = self.config.mechanics.tnt_block_damage;
+            self.create_explosion_ex(tx, ty, tz, 4.0, false, allow_blocks);
         }
     }
 
     fn spawn_minecart_at(&mut self, cart_type: u8, x: f64, y: f64, z: f64) {
         let cid = self.entities.spawn_minecart(cart_type, x, y, z);
+        if let Some(cart) = self.entities.get_minecart_mut(cid) {
+            cart.max_speed = self.config.mechanics.minecart_max_speed;
+            cart.slow_when_empty = self.config.mechanics.minecart_slow_when_empty;
+        }
         let players: Vec<_> = self.entities.iter_players().cloned().collect();
         if let Some(cart) = self.entities.get_minecart(cid) {
             for out in self.tracker.track_minecart_and_scan(cart, &players) {
@@ -5805,8 +6049,9 @@ impl Server {
             }
         } else if ctype == 1 {
             // StorageMinecart (`EntityMinecart.java:862-865` + Poseidon dupe fix `NetServerHandler.java:1037-1039`)
+            let prevent_vehicle_open = self.config.fixes.prevent_vehicle_chest_open;
             let open_info = if let Some(player) = self.entities.get_by_conn_mut(conn_id) {
-                if player.vehicle_id.is_some() {
+                if prevent_vehicle_open && player.vehicle_id.is_some() {
                     return;
                 }
                 let win_id = player.next_window_id();
@@ -6201,11 +6446,13 @@ impl Server {
                 d0 = d0 * d3 * 0.10000000149011612 * 0.5;
                 d1 = d1 * d3 * 0.10000000149011612 * 0.5;
 
-                let d4 = ox - cx;
-                let d5 = oz - cz;
-                let d6 = d4 * o_mz + d5 * o_last_x;
-                if d6 * d6 > 5.0 {
-                    continue;
+                if !self.config.mechanics.allow_minecart_boosters {
+                    let d4 = ox - cx;
+                    let d5 = oz - cz;
+                    let d6 = d4 * o_mz + d5 * o_last_x;
+                    if d6 * d6 > 5.0 {
+                        continue;
+                    }
                 }
                 let mut d7 = o_mx + cur_mx;
                 let mut d8 = o_mz + cur_mz;
@@ -6705,45 +6952,70 @@ impl Server {
 
     /// Java `Explosion.java` — 16x16x16 raycast block destruction, entity damage/knockback, and `Packet60Explosion`.
     pub fn create_explosion(&mut self, ex: f64, ey: f64, ez: f64, radius: f32, set_fire: bool) {
+        self.create_explosion_ex(ex, ey, ez, radius, set_fire, true);
+    }
+
+    pub fn create_explosion_ex(
+        &mut self,
+        ex: f64,
+        ey: f64,
+        ez: f64,
+        radius: f32,
+        set_fire: bool,
+        allow_block_damage: bool,
+    ) {
         let mut destroyed_blocks = HashSet::new();
         let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
+        let step_size = if self.config.mechanics.optimized_explosions {
+            2
+        } else {
+            1
+        };
 
-        for i in 0..16 {
-            for j in 0..16 {
-                for k in 0..16 {
-                    if i == 0 || i == 15 || j == 0 || j == 15 || k == 0 || k == 15 {
-                        let mut dx = (i as f64) / 15.0 * 2.0 - 1.0;
-                        let mut dy = (j as f64) / 15.0 * 2.0 - 1.0;
-                        let mut dz = (k as f64) / 15.0 * 2.0 - 1.0;
-                        let len = (dx * dx + dy * dy + dz * dz).sqrt();
-                        dx /= len;
-                        dy /= len;
-                        dz /= len;
+        if allow_block_damage {
+            for i in (0..16).step_by(step_size) {
+                for j in (0..16).step_by(step_size) {
+                    for k in (0..16).step_by(step_size) {
+                        if i == 0
+                            || i >= 16 - step_size
+                            || j == 0
+                            || j >= 16 - step_size
+                            || k == 0
+                            || k >= 16 - step_size
+                        {
+                            let mut dx = (i as f64) / 15.0 * 2.0 - 1.0;
+                            let mut dy = (j as f64) / 15.0 * 2.0 - 1.0;
+                            let mut dz = (k as f64) / 15.0 * 2.0 - 1.0;
+                            let len = (dx * dx + dy * dy + dz * dz).sqrt();
+                            dx /= len;
+                            dy /= len;
+                            dz /= len;
 
-                        let mut power = radius * (0.7 + rng.next_f32() * 0.6);
-                        let mut rx = ex;
-                        let mut ry = ey;
-                        let mut rz = ez;
+                            let mut power = radius * (0.7 + rng.next_f32() * 0.6);
+                            let mut rx = ex;
+                            let mut ry = ey;
+                            let mut rz = ez;
 
-                        while power > 0.0 {
-                            let bx = rx.floor() as i32;
-                            let by = ry.floor() as i32;
-                            let bz = rz.floor() as i32;
-                            if !(0..128).contains(&by) {
-                                break;
+                            while power > 0.0 {
+                                let bx = rx.floor() as i32;
+                                let by = ry.floor() as i32;
+                                let bz = rz.floor() as i32;
+                                if !(0..128).contains(&by) {
+                                    break;
+                                }
+                                let id = self.world.get_block(bx, by, bz);
+                                if id != blocks::AIR {
+                                    let res = Self::block_blast_resistance(id);
+                                    power -= (res + 0.3) * 0.3;
+                                }
+                                if power > 0.0 && id != blocks::BEDROCK {
+                                    destroyed_blocks.insert((bx, by, bz));
+                                }
+                                rx += dx * 0.3;
+                                ry += dy * 0.3;
+                                rz += dz * 0.3;
+                                power -= 0.225;
                             }
-                            let id = self.world.get_block(bx, by, bz);
-                            if id != blocks::AIR {
-                                let res = Self::block_blast_resistance(id);
-                                power -= (res + 0.3) * 0.3;
-                            }
-                            if power > 0.0 && id != blocks::BEDROCK {
-                                destroyed_blocks.insert((bx, by, bz));
-                            }
-                            rx += dx * 0.3;
-                            ry += dy * 0.3;
-                            rz += dz * 0.3;
-                            power -= 0.225;
                         }
                     }
                 }
@@ -6783,7 +7055,11 @@ impl Server {
                     let impact = (1.0 - d7) * exposure;
                     let dmg =
                         (((impact * impact + impact) / 2.0 * 8.0 * blast_size + 1.0) as i16).max(1);
+                    let prev_kb = self.config.mechanics.player_knockback_fix;
+                    self.config.mechanics.player_knockback_fix =
+                        self.config.mechanics.send_explosion_velocity;
                     self.damage_player_from_mob(pid, dmg, ex, ez);
+                    self.config.mechanics.player_knockback_fix = prev_kb;
                 }
             }
         }
@@ -7163,6 +7439,12 @@ impl Server {
 
         for player in self.entities.iter_players_mut() {
             let (px, py, pz) = (player.x, player.y, player.z);
+            let max_dist_sq = if self.config.fixes.container_interaction_check_enabled {
+                let d = (self.config.fixes.container_interaction_max_distance.max(1) as f64) + 1.5;
+                d * d
+            } else {
+                64.0
+            };
             match &mut player.open_container {
                 Some(OpenContainer::Workbench {
                     window_id, x, y, z, ..
@@ -7171,8 +7453,14 @@ impl Server {
                         && (px - (*x as f64 + 0.5)).powi(2)
                             + (py - (*y as f64 + 0.5)).powi(2)
                             + (pz - (*z as f64 + 0.5)).powi(2)
-                            <= 64.0;
+                            <= max_dist_sq;
                     if !valid {
+                        if self.config.fixes.container_interaction_log {
+                            log::warn(&format!(
+                                "{} exceeded container interaction distance at ({}, {}, {})",
+                                player.username, x, y, z
+                            ));
+                        }
                         force_closes.push((player.conn_id, *window_id));
                     }
                 }
@@ -7189,7 +7477,7 @@ impl Server {
                     let dist_ok = (px - (*x as f64 + 0.5)).powi(2)
                         + (py - (*y as f64 + 0.5)).powi(2)
                         + (pz - (*z as f64 + 0.5)).powi(2)
-                        <= 64.0;
+                        <= max_dist_sq;
                     if let Some(TileEntity {
                         kind:
                             TileEntityKind::Furnace {
@@ -7240,7 +7528,7 @@ impl Server {
                         let dist_ok = (px - (cx as f64 + 0.5)).powi(2)
                             + (py - (cy as f64 + 0.5)).powi(2)
                             + (pz - (cz as f64 + 0.5)).powi(2)
-                            <= 64.0;
+                            <= max_dist_sq;
                         if let Some(TileEntity {
                             kind: TileEntityKind::Chest { items: te_items },
                             ..
@@ -7277,7 +7565,7 @@ impl Server {
                     let dist_ok = (px - (*x as f64 + 0.5)).powi(2)
                         + (py - (*y as f64 + 0.5)).powi(2)
                         + (pz - (*z as f64 + 0.5)).powi(2)
-                        <= 64.0;
+                        <= max_dist_sq;
                     if let Some(TileEntity {
                         kind: TileEntityKind::Dispenser { items: te_items },
                         ..
@@ -7304,8 +7592,8 @@ impl Server {
                     slots,
                 }) => {
                     if let Some(&(cx, cy, cz, ref cargo)) = cart_snapshots.get(entity_id) {
-                        let dist_ok =
-                            (px - cx).powi(2) + (py - cy).powi(2) + (pz - cz).powi(2) <= 64.0;
+                        let dist_ok = (px - cx).powi(2) + (py - cy).powi(2) + (pz - cz).powi(2)
+                            <= max_dist_sq;
                         if dist_ok {
                             let mut slot_changes = Vec::new();
                             for i in 0..27 {
@@ -7960,9 +8248,13 @@ impl Server {
         }
 
         let mut respawned_eid = None;
+        let spawn_yaw = self.config.world.spawn_yaw;
+        let spawn_pitch = self.config.world.spawn_pitch;
         if let Some(player) = self.entities.get_by_conn_mut(id) {
             let old_chunk = player.chunk_pos();
             player.respawn(spawn_x as f64 + 0.5, spawn_y as f64, spawn_z as f64 + 0.5);
+            player.yaw = spawn_yaw;
+            player.pitch = spawn_pitch;
             let new_chunk = player.chunk_pos();
             let entity_id = player.entity_id;
             respawned_eid = Some(entity_id);
@@ -8004,7 +8296,15 @@ impl Server {
     }
 
     fn handle_login(&mut self, id: ConnId, login: Login) {
-        if login.protocol != PROTOCOL_VERSION {
+        let protocol_allowed = if self.config.network.allowed_protocols.is_empty() {
+            login.protocol == PROTOCOL_VERSION
+        } else {
+            self.config
+                .network
+                .allowed_protocols
+                .contains(&login.protocol)
+        };
+        if !protocol_allowed {
             let reason = if login.protocol > PROTOCOL_VERSION {
                 "Outdated server! I'm still on Beta 1.7.3"
             } else {
@@ -8014,31 +8314,83 @@ impl Server {
             return;
         }
 
-        let name = login.username.trim();
-        // Poseidon username validity check (`poseidon.yml`: length 3..=16, `[a-zA-Z0-9_.]*`)
-        if name.len() < 3 {
-            self.kick(
-                id,
-                "Sorry, your username is too short. The minimum length is: 3",
-            );
-            return;
-        }
-        if name.len() > 16 {
-            self.kick(
-                id,
-                "Sorry, your username is too long. The maximum length is: 16",
-            );
-            return;
-        }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '?')
+        let raw_name = login.username.trim();
+        let name_str = if !self.config.server.online_mode
+            && self.config.server.cracked_username_prefix
+            && !raw_name.starts_with('.')
         {
-            self.kick(
-                id,
-                "Sorry, your username is invalid, allowed characters: [a-zA-Z0-9_.]*",
-            );
+            format!(".{raw_name}")
+        } else {
+            raw_name.to_string()
+        };
+        let name = name_str.as_str();
+
+        // Poseidon username validity check (`poseidon.yml`: length min..=max, `username_regex`)
+        if self.config.server.check_username_validity {
+            let min_len = self.config.server.username_min_length;
+            let max_len = self.config.server.username_max_length;
+            if name.len() < min_len {
+                self.kick(
+                    id,
+                    &format!("Sorry, your username is too short. The minimum length is: {min_len}"),
+                );
+                return;
+            }
+            if name.len() > max_len {
+                self.kick(
+                    id,
+                    &format!("Sorry, your username is too long. The maximum length is: {max_len}"),
+                );
+                return;
+            }
+            let pattern = &self.config.server.username_regex;
+            if !Self::matches_username_pattern(name, pattern) {
+                self.kick(
+                    id,
+                    &format!("Sorry, your username is invalid, allowed characters: {pattern}"),
+                );
+                return;
+            }
+        }
+
+        // Poseidon proxy handler (`NetLoginHandler.java:122-169`, `Release2Beta.java`)
+        // `login.dimension`: 25 ((byte)-999) or 26 = Release2Beta IP forwarding, 1 = Release2Beta, 2 = BungeeCord IP forwarding
+        let is_bungee_forwarding = login.dimension == 2;
+        let is_r2b_forwarding = login.dimension == 25 || login.dimension == 26;
+        if self.config.network.bungeecord_mode && !is_bungee_forwarding {
+            let msg = self.config.network.bungeecord_kick_message.clone();
+            self.kick(id, &msg);
             return;
+        }
+        if is_r2b_forwarding || is_bungee_forwarding {
+            if self.config.network.release2beta_ip_passthrough {
+                let socket_ip = self
+                    .connections
+                    .get(&id)
+                    .map(|c| c.address.ip().to_string())
+                    .unwrap_or_default();
+                if socket_ip.eq_ignore_ascii_case(&self.config.network.release2beta_proxy_ip) {
+                    let forwarded_v4 = std::net::Ipv4Addr::from(login.map_seed as u32);
+                    log::info(&format!(
+                        "{name} has been detected using Release2Beta/BungeeCord, using forwarded IP: {forwarded_v4}"
+                    ));
+                    if let Some(conn) = self.connections.get_mut(&id) {
+                        conn.address.set_ip(std::net::IpAddr::V4(forwarded_v4));
+                    }
+                } else {
+                    self.kick(
+                        id,
+                        "\u{00A7}cThe Release2Beta server you are connecting through is unauthorized.",
+                    );
+                    return;
+                }
+            } else {
+                self.kick(
+                    id,
+                    "\u{00A7}cIP Forwarding is disabled in Poseidon. Please disable in Release2Beta.",
+                );
+                return;
+            }
         }
 
         let lower_name = name.to_lowercase();
@@ -8049,22 +8401,26 @@ impl Server {
             .unwrap_or_default();
 
         if self.banned_players.contains(&lower_name) {
-            self.kick(id, "You are banned from this server!");
+            let msg = self.config.messages.kick_banned.clone();
+            self.kick(id, &msg);
             return;
         }
         if self.banned_ips.contains(&peer_ip.to_lowercase()) {
-            self.kick(id, "Your IP address is banned from this server!");
+            let msg = self.config.messages.kick_ip_banned.clone();
+            self.kick(id, &msg);
             return;
         }
         if self.whitelist_enabled
             && !self.whitelist.contains(&lower_name)
             && !self.ops.contains(&lower_name)
         {
-            self.kick(id, "You are not white-listed on this server!");
+            let msg = self.config.messages.kick_not_whitelisted.clone();
+            self.kick(id, &msg);
             return;
         }
         if self.entities.player_count() >= self.config.server.max_players as usize {
-            self.kick(id, "The server is full!");
+            let msg = self.config.messages.kick_full.clone();
+            self.kick(id, &msg);
             return;
         }
 
@@ -8074,15 +8430,24 @@ impl Server {
             .iter_players()
             .any(|p| p.username.eq_ignore_ascii_case(name));
         if already_online {
-            self.kick(
-                id,
-                "\u{00A7}cA player with your username or uuid is already online, try reconnecting in a minute.",
-            );
+            let msg = self.config.messages.kick_already_online.clone();
+            self.kick(id, &msg);
             return;
         }
 
         let seed = self.world.seed();
-        let (spawn_x, spawn_y, spawn_z) = self.world.safe_spawn_point();
+        let (mut spawn_x, mut spawn_y, mut spawn_z) = self.world.safe_spawn_point();
+        if self.config.world.randomize_spawn && self.config.world.randomize_spawn_radius > 0 {
+            let r = self.config.world.randomize_spawn_radius;
+            spawn_x += self.world.tick_random.next_i32_bound(r * 2) - r;
+            spawn_z += self.world.tick_random.next_i32_bound(r * 2) - r;
+            if self.config.world.teleport_to_highest_safe_block {
+                let g = self.world.top_solid_or_liquid_block(spawn_x, spawn_z);
+                if g > 0 {
+                    spawn_y = g;
+                }
+            }
+        }
         let player_x = spawn_x as f64 + 0.5;
         let player_y = spawn_y as f64;
         let player_z = spawn_z as f64 + 0.5;
@@ -8090,8 +8455,12 @@ impl Server {
         let entity_id =
             self.entities
                 .insert_player(id, name.to_string(), player_x, player_y, player_z);
+        if let Some(player) = self.entities.get_player_mut(entity_id) {
+            player.yaw = self.config.world.spawn_yaw;
+            player.pitch = self.config.world.spawn_pitch;
+        }
 
-        if self.config.world.save_enabled {
+        if self.config.world.save_enabled && self.config.server.save_playerdata {
             let mut chunk_shift = None;
             if let Some(player) = self.entities.get_player_mut(entity_id) {
                 let old_c = player.chunk_pos();
@@ -8168,11 +8537,13 @@ impl Server {
         }
 
         // Poseidon: PlayerJoinEvent -> broadcast join message to other players
-        let join_msg = self
-            .config
-            .server
-            .join_message
-            .replacen("%player%", name, 1);
+        let default_join = crate::config::ServerConfig::default().join_message;
+        let join_tpl = if self.config.server.join_message != default_join {
+            &self.config.server.join_message
+        } else {
+            &self.config.messages.join
+        };
+        let join_msg = join_tpl.replacen("%player%", name, 1);
         self.broadcast_chat_except(id, &join_msg);
     }
 
@@ -8447,6 +8818,20 @@ impl Server {
             .unwrap_or_else(|| "unknown".to_string());
 
         let cmd_body = &command[1..];
+        if !self.config.server.enable_tps_command
+            && cmd_body
+                .split_whitespace()
+                .next()
+                .is_some_and(|c| c.eq_ignore_ascii_case("tps"))
+        {
+            self.send(
+                id,
+                Clientbound::Chat(Chat {
+                    message: "Unknown command. Type \"help\" for help.".to_string(),
+                }),
+            );
+            return;
+        }
         let mut online_players: Vec<String> = self
             .entities
             .iter_players()
@@ -8650,7 +9035,8 @@ impl Server {
                     .find(|p| p.username.eq_ignore_ascii_case(&target))
                     .map(|p| p.conn_id);
                 if let Some(conn_id) = target_conn {
-                    self.kick(conn_id, "You are banned from this server!");
+                    let msg = self.config.messages.kick_banned.clone();
+                    self.kick(conn_id, &msg);
                 }
             }
             CommandAction::Pardon(target) => {
@@ -8672,8 +9058,9 @@ impl Server {
                         }
                     })
                     .collect();
+                let msg = self.config.messages.kick_ip_banned.clone();
                 for cid in matching_conns {
-                    self.kick(cid, "Your IP address is banned from this server!");
+                    self.kick(cid, &msg);
                 }
             }
             CommandAction::PardonIp(ip) => {
@@ -8718,16 +9105,16 @@ impl Server {
                 self.config.world.save_enabled = false;
             }
             CommandAction::Stop => {
-                for player in self.entities.iter_players() {
-                    let _ = self.player_store.save_player(player);
+                if self.config.world.save_enabled && self.config.server.save_playerdata {
+                    for player in self.entities.iter_players() {
+                        let _ = self.player_store.save_player(player);
+                    }
                 }
                 let _ = self.world.save_all();
                 let conn_ids: Vec<ConnId> = self.connections.keys().copied().collect();
+                let msg = self.config.messages.kick_shutdown.clone();
                 for cid in conn_ids {
-                    self.kick(
-                        cid,
-                        "\u{00A7}cServer is shutting down, please rejoin later.",
-                    );
+                    self.kick(cid, &msg);
                 }
                 self.running.store(false, Ordering::Relaxed);
             }
@@ -8740,12 +9127,41 @@ impl Server {
         }
     }
 
+    fn matches_username_pattern(name: &str, pattern: &str) -> bool {
+        if let (Some(start), Some(end)) = (pattern.find('['), pattern.rfind(']')) {
+            if start < end {
+                let class = &pattern[(start + 1)..end];
+                let chars: Vec<char> = class.chars().collect();
+                return name.chars().all(|ch| {
+                    let mut idx = 0;
+                    while idx < chars.len() {
+                        if idx + 2 < chars.len() && chars[idx + 1] == '-' {
+                            if ch >= chars[idx] && ch <= chars[idx + 2] {
+                                return true;
+                            }
+                            idx += 3;
+                        } else {
+                            if ch == chars[idx] {
+                                return true;
+                            }
+                            idx += 1;
+                        }
+                    }
+                    ch == '?' && class.contains('.')
+                });
+            }
+        }
+        name.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '?')
+    }
+
     fn damage_player_direct(&mut self, entity_id: i32, damage: i16, reason: &str) {
+        let keep_inv = self.config.mechanics.keep_inventory_on_death;
         let (conn_id, username, health, died, drops) = {
             if let Some(player) = self.entities.get_player_mut(entity_id) {
                 let (dealt, died) = player.take_damage_direct(damage);
                 if dealt > 0 {
-                    let drops = if died {
+                    let drops = if died && !keep_inv {
                         let px = player.x;
                         let py = player.y;
                         let pz = player.z;
@@ -8796,11 +9212,12 @@ impl Server {
 
     #[allow(dead_code)]
     fn damage_player(&mut self, entity_id: i32, damage: i16, reason: &str) {
+        let keep_inv = self.config.mechanics.keep_inventory_on_death;
         let (conn_id, username, health, died, drops) = {
             if let Some(player) = self.entities.get_player_mut(entity_id) {
                 let (dealt, died) = player.take_damage(damage);
                 if dealt > 0 {
-                    let drops = if died {
+                    let drops = if died && !keep_inv {
                         let px = player.x;
                         let py = player.y;
                         let pz = player.z;

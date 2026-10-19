@@ -69,6 +69,7 @@ pub struct Player {
     pub last_place_item: Option<(u64, i16)>,
     pub last_drop_tick: u64,
     pub drop_count: u32,
+    pub air_hover_ticks: u32,
     pub dead: bool,
 }
 
@@ -124,6 +125,7 @@ impl Player {
             last_place_item: None,
             last_drop_tick: 0,
             drop_count: 0,
+            air_hover_ticks: 0,
             dead: false,
         }
     }

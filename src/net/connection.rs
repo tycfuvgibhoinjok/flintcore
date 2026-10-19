@@ -45,7 +45,8 @@ pub async fn serve(
 ) {
     let _ = stream.set_nodelay(config.network.tcp_nodelay);
     let (read_half, write_half) = stream.into_split();
-    let writer = tokio::spawn(write_loop(write_half, outbound));
+    let faster = config.network.faster_packets;
+    let writer = tokio::spawn(write_loop(write_half, outbound, faster));
     if let Err(error) = read_loop(id, read_half, &inbound, &config).await {
         log::warn(&format!("connection {id} closed: {error}"));
     }
@@ -63,6 +64,8 @@ async fn read_loop(
     let mut buffer: Vec<u8> = Vec::with_capacity(8192);
     let mut consumed = 0usize;
     let mut chunk = vec![0u8; 4096];
+    let mut packets_in_window = 0usize;
+    let mut window_start = std::time::Instant::now();
 
     loop {
         if consumed > 0 {
@@ -92,6 +95,16 @@ async fn read_loop(
                     }
                     state = state.transition(id_now);
                     consumed += length;
+                    if config.network.packet_spam_detection {
+                        if window_start.elapsed().as_secs() >= 5 {
+                            window_start = std::time::Instant::now();
+                            packets_in_window = 0;
+                        }
+                        packets_in_window += 1;
+                        if packets_in_window > config.network.packet_spam_threshold {
+                            return Err(Error::Network("Packet spam detected".to_string()));
+                        }
+                    }
                     if inbound.send(NetEvent::Packet { id, packet }).await.is_err() {
                         return Ok(());
                     }
@@ -103,7 +116,11 @@ async fn read_loop(
     }
 }
 
-async fn write_loop(mut write: OwnedWriteHalf, mut outbound: mpsc::UnboundedReceiver<Outbound>) {
+async fn write_loop(
+    mut write: OwnedWriteHalf,
+    mut outbound: mpsc::UnboundedReceiver<Outbound>,
+    faster_packets: bool,
+) {
     let mut encoder = Writer::with_capacity(65536);
     while let Some(first) = outbound.recv().await {
         encoder.clear();
@@ -118,7 +135,7 @@ async fn write_loop(mut write: OwnedWriteHalf, mut outbound: mpsc::UnboundedRece
                 should_close = true;
             }
         }
-        while !should_close && encoder.as_slice().len() < 262_144 {
+        while faster_packets && !should_close && encoder.as_slice().len() < 262_144 {
             match outbound.try_recv() {
                 Ok(Outbound::Packet(packet)) => {
                     if packet.encode(&mut encoder).is_err() {

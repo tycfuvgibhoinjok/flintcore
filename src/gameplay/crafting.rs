@@ -1,7 +1,32 @@
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 use crate::gameplay::blocks::{self, Material};
 use crate::gameplay::items::{self, ItemStack};
+
+static CRAFTING_FLAGS: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_crafting_mechanics(
+    glowstone_pre_1_6_6: bool,
+    wool_recipe_pre_1_6_6: bool,
+    old_slab_recipe: bool,
+    allow_ladder_gap: bool,
+) {
+    let mut bits = 0u8;
+    if glowstone_pre_1_6_6 {
+        bits |= 1;
+    }
+    if wool_recipe_pre_1_6_6 {
+        bits |= 2;
+    }
+    if old_slab_recipe {
+        bits |= 4;
+    }
+    if allow_ladder_gap {
+        bits |= 8;
+    }
+    CRAFTING_FLAGS.store(bits, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ingredient {
@@ -910,9 +935,41 @@ impl CraftingManager {
     }
 
     pub fn craft_3x3(&self, grid: &[Option<ItemStack>; 9]) -> Option<ItemStack> {
+        let flags = CRAFTING_FLAGS.load(Ordering::Relaxed);
+        if (flags & 1) != 0
+            && grid
+                .iter()
+                .all(|s| s.is_some_and(|st| st.id == items::GLOWSTONE_DUST))
+        {
+            return Some(ItemStack::new(blocks::GLOWSTONE as i16, 1, 0));
+        }
+        if (flags & 2) != 0
+            && grid
+                .iter()
+                .all(|s| s.is_some_and(|st| st.id == items::STRING))
+        {
+            return Some(ItemStack::new(blocks::WOOL as i16, 1, 0));
+        }
+
         for recipe in &self.recipes {
             if recipe.matches(grid) {
-                return Some(recipe.result());
+                let mut res = recipe.result();
+                if (flags & 1) != 0 && res.id == blocks::GLOWSTONE as i16 {
+                    continue;
+                }
+                if (flags & 2) != 0
+                    && res.id == blocks::WOOL as i16
+                    && grid.iter().flatten().any(|st| st.id == items::STRING)
+                {
+                    continue;
+                }
+                if (flags & 4) != 0 && res.id == blocks::STEP as i16 && res.damage == 3 {
+                    res.damage = 0;
+                }
+                if (flags & 8) != 0 && res.id == blocks::LADDER as i16 {
+                    res.count = 1;
+                }
+                return Some(res);
             }
         }
         None
@@ -1090,5 +1147,34 @@ mod tests {
             furnace_fuel_time(Some(ItemStack::new(blocks::WOOD_PLANKS as i16, 1, 0))),
             300
         );
+    }
+
+    #[test]
+    fn uberbukkit_recipe_toggles() {
+        let mgr = CraftingManager::instance();
+        let dust = Some(ItemStack::new(items::GLOWSTONE_DUST, 1, 0));
+        let stick = Some(ItemStack::new(items::STICK, 1, 0));
+        let cobble = Some(ItemStack::new(blocks::COBBLESTONE as i16, 1, 0));
+
+        set_crafting_mechanics(true, true, true, true);
+        // 2x2 glowstone should not craft when `glowstone_pre_1_6_6 = true`, 3x3 should!
+        assert_eq!(mgr.craft_2x2(&[dust, dust, dust, dust]), None);
+        assert_eq!(
+            mgr.craft_3x3(&[dust; 9]),
+            Some(ItemStack::new(blocks::GLOWSTONE as i16, 1, 0))
+        );
+        // Ladder crafts 1 instead of 2 when `allow_ladder_gap = true`
+        let ladder_grid = [stick, None, stick, stick, stick, stick, stick, None, stick];
+        assert_eq!(
+            mgr.craft_3x3(&ladder_grid),
+            Some(ItemStack::new(blocks::LADDER as i16, 1, 0))
+        );
+        // Cobblestone crafts stone slab (damage 0) when `old_slab_recipe = true`
+        let slab_grid = [cobble, cobble, cobble, None, None, None, None, None, None];
+        assert_eq!(
+            mgr.craft_3x3(&slab_grid),
+            Some(ItemStack::new(blocks::STEP as i16, 3, 0))
+        );
+        set_crafting_mechanics(false, false, false, false);
     }
 }

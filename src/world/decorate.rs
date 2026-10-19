@@ -35,6 +35,15 @@ pub trait GenWorld {
     fn is_empty(&self, x: i32, y: i32, z: i32) -> bool {
         self.get_block(x, y, z) == blocks::AIR
     }
+
+    fn worldgen_config(&self) -> crate::config::WorldgenConfig {
+        crate::config::WorldgenConfig::default()
+    }
+}
+
+fn tree_leaf_blacklisted(world: &dyn GenWorld, id: u8) -> bool {
+    let cfg = world.worldgen_config();
+    cfg.block_tree_growth_enabled && cfg.block_tree_growth_blacklist.contains(&id)
 }
 
 fn flower_soil(id: u8) -> bool {
@@ -163,7 +172,7 @@ pub fn generate_lakes(
     true
 }
 
-fn dungeon_loot(random: &mut JavaRandom) -> Option<(usize, ItemStack)> {
+fn dungeon_loot(random: &mut JavaRandom, cocoabeans_loot: bool) -> Option<(usize, ItemStack)> {
     let i = random.next_i32_bound(11);
     let item = match i {
         0 => Some(ItemStack::new(329, 1, 0)),
@@ -208,7 +217,7 @@ fn dungeon_loot(random: &mut JavaRandom) -> Option<(usize, ItemStack)> {
                 None
             }
         }
-        10 => Some(ItemStack::new(351, 1, 3)),
+        10 if cocoabeans_loot => Some(ItemStack::new(351, 1, 3)),
         _ => None,
     };
     if let Some(stack) = item {
@@ -301,8 +310,9 @@ pub fn generate_dungeons(
                 if k2 == 1 {
                     world.set_block_physics(i2, j, j2, blocks::CHEST);
                     let mut chest_te = TileEntity::new_chest(i2, j, j2);
+                    let cocoabeans = world.worldgen_config().cocoabeans_loot;
                     for _ in 0..8 {
-                        if let Some((slot, stack)) = dungeon_loot(random) {
+                        if let Some((slot, stack)) = dungeon_loot(random, cocoabeans) {
                             if let crate::gameplay::tile::TileEntityKind::Chest { items } =
                                 &mut chest_te.kind
                             {
@@ -342,29 +352,50 @@ pub fn generate_minable(
     block: u8,
     size: i32,
 ) -> bool {
-    let f = random.next_f32() * std::f32::consts::PI;
+    let wg = world.worldgen_config();
+    let mut custom_rng;
+    let rng = if wg.custom_ore_seed_enabled {
+        custom_rng = JavaRandom::new(wg.custom_ore_seed);
+        &mut custom_rng
+    } else {
+        random
+    };
+    let f = rng.next_f32() * std::f32::consts::PI;
     let d0 = ((i + 8) as f32 + math::sin(f) * size as f32 / 8.0) as f64;
     let d1 = ((i + 8) as f32 - math::sin(f) * size as f32 / 8.0) as f64;
     let d2 = ((k + 8) as f32 + math::cos(f) * size as f32 / 8.0) as f64;
     let d3 = ((k + 8) as f32 - math::cos(f) * size as f32 / 8.0) as f64;
-    let d4 = (j + random.next_i32_bound(3) + 2) as f64;
-    let d5 = (j + random.next_i32_bound(3) + 2) as f64;
+    let d4 = (j + rng.next_i32_bound(3) + 2) as f64;
+    let d5 = (j + rng.next_i32_bound(3) + 2) as f64;
 
     for l in 0..=size {
         let d6 = d0 + (d1 - d0) * l as f64 / size as f64;
         let d7 = d4 + (d5 - d4) * l as f64 / size as f64;
         let d8 = d2 + (d3 - d2) * l as f64 / size as f64;
-        let d9 = random.next_f64() * size as f64 / 16.0;
+        let d9 = rng.next_f64() * size as f64 / 16.0;
         let d10 =
             (math::sin(l as f32 * std::f32::consts::PI / size as f32) + 1.0) as f64 * d9 + 1.0;
         let d11 =
             (math::sin(l as f32 * std::f32::consts::PI / size as f32) + 1.0) as f64 * d9 + 1.0;
-        let i1 = math::floor_double(d6 - d10 / 2.0);
-        let j1 = math::floor_double(d7 - d11 / 2.0);
-        let k1 = math::floor_double(d8 - d10 / 2.0);
-        let l1 = math::floor_double(d6 + d10 / 2.0);
-        let i2 = math::floor_double(d7 + d11 / 2.0);
-        let j2 = math::floor_double(d8 + d10 / 2.0);
+        let (i1, j1, k1, l1, i2, j2) = if wg.pre_b1_2_ore_generation {
+            (
+                (d6 - d10 / 2.0) as i32,
+                (d7 - d11 / 2.0) as i32,
+                (d8 - d10 / 2.0) as i32,
+                (d6 + d10 / 2.0) as i32,
+                (d7 + d11 / 2.0) as i32,
+                (d8 + d10 / 2.0) as i32,
+            )
+        } else {
+            (
+                math::floor_double(d6 - d10 / 2.0),
+                math::floor_double(d7 - d11 / 2.0),
+                math::floor_double(d8 - d10 / 2.0),
+                math::floor_double(d6 + d10 / 2.0),
+                math::floor_double(d7 + d11 / 2.0),
+                math::floor_double(d8 + d10 / 2.0),
+            )
+        };
 
         for k2 in i1..=l1 {
             let d12 = (k2 as f64 + 0.5 - d6) / (d10 / 2.0);
@@ -742,7 +773,7 @@ pub fn generate_trees(
                 let l2 = k2 - k;
                 if (j2.abs() != k1 || l2.abs() != k1 || random.next_i32_bound(2) != 0 && j1 != 0)
                     && !blocks::is_opaque_cube(world.get_block(l1, i2, k2))
-                    && !blocks::leaf_decay_blacklist(world.get_block(l1, i2, k2))
+                    && !tree_leaf_blacklisted(world, world.get_block(l1, i2, k2))
                 {
                     world.set_block(l1, i2, k2, blocks::LEAVES);
                 }
@@ -900,7 +931,7 @@ pub fn generate_taiga1(
                 let j3 = i3 - k;
                 if (k2.abs() != l2 || j3.abs() != l2 || l2 <= 0)
                     && !blocks::is_opaque_cube(world.get_block(j2, i2, i3))
-                    && !blocks::leaf_decay_blacklist(world.get_block(ground as i32, i2, k2))
+                    && !tree_leaf_blacklisted(world, world.get_block(ground as i32, i2, k2))
                 {
                     world.set_block_and_data(j2, i2, i3, blocks::LEAVES, 1);
                 }
@@ -987,7 +1018,7 @@ pub fn generate_taiga2(
                 let i4 = l3 - k;
                 if (k3.abs() != k2 || i4.abs() != k2 || k2 <= 0)
                     && !blocks::is_opaque_cube(world.get_block(i3, j3, l3))
-                    && !blocks::leaf_decay_blacklist(world.get_block(ground as i32, i2, k2))
+                    && !tree_leaf_blacklisted(world, world.get_block(ground as i32, i2, k2))
                 {
                     world.set_block_and_data(i3, j3, l3, blocks::LEAVES, 1);
                 }

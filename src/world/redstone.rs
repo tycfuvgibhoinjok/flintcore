@@ -871,11 +871,14 @@ impl World {
         if id == blocks::AIR {
             return true;
         }
+        if (id == blocks::FURNACE || id == blocks::LIT_FURNACE)
+            && self.fixes.block_pistons_pushing_furnaces
+        {
+            return false;
+        }
         if id == blocks::OBSIDIAN
             || id == blocks::BEDROCK
             || id == blocks::PORTAL
-            || id == blocks::FURNACE
-            || id == blocks::LIT_FURNACE
             || id == blocks::CHEST
             || id == blocks::DISPENSER
             || id == blocks::NOTE_BLOCK
@@ -1659,7 +1662,14 @@ impl World {
                     let be = match bid {
                         blocks::STEP => by as f64 + 0.5,
                         blocks::SOUL_SAND => by as f64 + 0.875,
-                        blocks::FENCE => by as f64 + 1.5,
+                        blocks::FENCE => {
+                            by as f64
+                                + if self.mechanics.use_modern_fence_bounding_boxes {
+                                    1.0
+                                } else {
+                                    1.5
+                                }
+                        }
                         blocks::BED => by as f64 + 0.5625,
                         _ => (by + 1) as f64,
                     };
@@ -2113,14 +2123,32 @@ impl World {
         }
     }
 
+    fn fire_encourage_for(&self, id: u8) -> i32 {
+        if (id == blocks::FENCE || id == blocks::WOOD_STAIRS)
+            && !self.mechanics.flammable_fences_stairs
+        {
+            return 0;
+        }
+        Self::fire_encourage_chance(id)
+    }
+
+    fn fire_burn_for(&self, id: u8) -> i32 {
+        if (id == blocks::FENCE || id == blocks::WOOD_STAIRS)
+            && !self.mechanics.flammable_fences_stairs
+        {
+            return 0;
+        }
+        Self::fire_burn_ability(id)
+    }
+
     /// Java `BlockFire.g(World, i, j, k)`: does any of the 6 neighbors have `a[id] > 0`?
     pub fn has_flammable_neighbor(&self, x: i32, y: i32, z: i32) -> bool {
-        Self::fire_encourage_chance(self.get_block(x + 1, y, z)) > 0
-            || Self::fire_encourage_chance(self.get_block(x - 1, y, z)) > 0
-            || Self::fire_encourage_chance(self.get_block(x, y - 1, z)) > 0
-            || Self::fire_encourage_chance(self.get_block(x, y + 1, z)) > 0
-            || Self::fire_encourage_chance(self.get_block(x, y, z - 1)) > 0
-            || Self::fire_encourage_chance(self.get_block(x, y, z + 1)) > 0
+        self.fire_encourage_for(self.get_block(x + 1, y, z)) > 0
+            || self.fire_encourage_for(self.get_block(x - 1, y, z)) > 0
+            || self.fire_encourage_for(self.get_block(x, y - 1, z)) > 0
+            || self.fire_encourage_for(self.get_block(x, y + 1, z)) > 0
+            || self.fire_encourage_for(self.get_block(x, y, z - 1)) > 0
+            || self.fire_encourage_for(self.get_block(x, y, z + 1)) > 0
     }
 
     fn max_neighbor_fire_encourage(&self, x: i32, y: i32, z: i32) -> i32 {
@@ -2136,7 +2164,7 @@ impl World {
             (x, y, z - 1),
             (x, y, z + 1),
         ] {
-            m = m.max(Self::fire_encourage_chance(self.get_block(nx, ny, nz)));
+            m = m.max(self.fire_encourage_for(self.get_block(nx, ny, nz)));
         }
         m
     }
@@ -2155,11 +2183,20 @@ impl World {
             return;
         }
         let target_id = self.get_block(x, y, z);
-        let ability = Self::fire_burn_ability(target_id);
+        let ability = self.fire_burn_for(target_id);
         if rng.next_i32_bound(bound) < ability {
             let is_tnt = target_id == blocks::TNT;
-            if rng.next_i32_bound(age + 10) < 5 && !self.is_being_rained_on(x, y, z) {
-                let new_age = (age + rng.next_i32_bound(5) / 4).min(15) as u8;
+            let keep_fire = if self.mechanics.pre_1_6_fire {
+                rng.next_i32_bound(2) == 0
+            } else {
+                rng.next_i32_bound(age + 10) < 5 && !self.is_being_rained_on(x, y, z)
+            };
+            if keep_fire {
+                let new_age = if self.mechanics.pre_1_6_fire {
+                    0
+                } else {
+                    (age + rng.next_i32_bound(5) / 4).min(15) as u8
+                };
                 self.java_set_type_id_and_data(x, y, z, blocks::FIRE, new_age);
             } else {
                 self.java_set_type_id(x, y, z, blocks::AIR);
@@ -2173,7 +2210,11 @@ impl World {
     /// Java `BlockFire.a(World, i, j, k, Random)` (`BlockFire.java:61-152`).
     pub fn tick_fire(&mut self, x: i32, y: i32, z: i32) {
         let on_netherrack = y > 0 && self.get_block(x, y - 1, z) == blocks::NETHERRACK;
-        if !self.is_solid_normal_at(x, y - 1, z) && !self.has_flammable_neighbor(x, y, z) {
+        let old_fire = self.mechanics.pre_1_6_fire;
+        if !old_fire
+            && !self.is_solid_normal_at(x, y - 1, z)
+            && !self.has_flammable_neighbor(x, y, z)
+        {
             self.java_set_type_id(x, y, z, blocks::AIR);
             return;
         }
@@ -2191,12 +2232,18 @@ impl World {
 
         let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
         let age = self.get_data(x, y, z) as i32;
-        if age < 15 {
-            let next_age = (age + rng.next_i32_bound(3) / 2).min(15) as u8;
-            self.java_set_raw_data(x, y, z, next_age);
+        if old_fire {
+            if age < 15 {
+                self.java_set_data(x, y, z, (age + 1) as u8);
+                self.java_schedule_tick(x, y, z, blocks::FIRE, 10);
+            }
+        } else {
+            if age < 15 {
+                let next_age = (age + rng.next_i32_bound(3) / 2).min(15) as u8;
+                self.java_set_raw_data(x, y, z, next_age);
+            }
+            self.java_schedule_tick(x, y, z, blocks::FIRE, 40);
         }
-
-        self.java_schedule_tick(x, y, z, blocks::FIRE, 40);
 
         if !on_netherrack && !self.has_flammable_neighbor(x, y, z) {
             if !self.is_solid_normal_at(x, y - 1, z) || age > 3 {
@@ -2207,7 +2254,7 @@ impl World {
         }
 
         if !on_netherrack
-            && Self::fire_encourage_chance(self.get_block(x, y - 1, z)) == 0
+            && self.fire_encourage_for(self.get_block(x, y - 1, z)) == 0
             && age == 15
             && rng.next_i32_bound(4) == 0
         {
@@ -2216,37 +2263,52 @@ impl World {
             return;
         }
 
-        self.try_burn_neighbor_block(x + 1, y, z, 300, age, &mut rng);
-        self.try_burn_neighbor_block(x - 1, y, z, 300, age, &mut rng);
-        self.try_burn_neighbor_block(x, y - 1, z, 250, age, &mut rng);
-        self.try_burn_neighbor_block(x, y + 1, z, 250, age, &mut rng);
-        self.try_burn_neighbor_block(x, y, z - 1, 300, age, &mut rng);
-        self.try_burn_neighbor_block(x, y, z + 1, 300, age, &mut rng);
+        if !self.mechanics.fire_spread {
+            self.tick_random = rng;
+            return;
+        }
 
-        for ix in (x - 1)..=(x + 1) {
-            for iz in (z - 1)..=(z + 1) {
-                for iy in (y - 1)..=(y + 4) {
-                    if !(1..127).contains(&iy) || (ix == x && iy == y && iz == z) {
-                        continue;
-                    }
-                    let mut chance_bound = 100;
-                    if iy > y + 1 {
-                        chance_bound += (iy - (y + 1)) * 100;
-                    }
-                    let enc = self.max_neighbor_fire_encourage(ix, iy, iz);
-                    if enc > 0 {
-                        let spread_threshold = (enc + 40) / (age + 30);
-                        if spread_threshold > 0
-                            && rng.next_i32_bound(chance_bound) <= spread_threshold
-                            && (!self.is_raining()
-                                || (!self.is_being_rained_on(ix, iy, iz)
-                                    && !self.is_being_rained_on(ix - 1, iy, iz)
-                                    && !self.is_being_rained_on(ix + 1, iy, iz)
-                                    && !self.is_being_rained_on(ix, iy, iz - 1)
-                                    && !self.is_being_rained_on(ix, iy, iz + 1)))
-                        {
-                            let new_age = (age + rng.next_i32_bound(5) / 4).min(15) as u8;
-                            self.java_set_type_id_and_data(ix, iy, iz, blocks::FIRE, new_age);
+        if !old_fire || (age % 2 == 0 && age > 2) {
+            self.try_burn_neighbor_block(x + 1, y, z, 300, age, &mut rng);
+            self.try_burn_neighbor_block(x - 1, y, z, 300, age, &mut rng);
+            self.try_burn_neighbor_block(x, y - 1, z, 250, age, &mut rng);
+            self.try_burn_neighbor_block(x, y + 1, z, 250, age, &mut rng);
+            self.try_burn_neighbor_block(x, y, z - 1, 300, age, &mut rng);
+            self.try_burn_neighbor_block(x, y, z + 1, 300, age, &mut rng);
+
+            for ix in (x - 1)..=(x + 1) {
+                for iz in (z - 1)..=(z + 1) {
+                    for iy in (y - 1)..=(y + 4) {
+                        if !(1..127).contains(&iy) || (ix == x && iy == y && iz == z) {
+                            continue;
+                        }
+                        let mut chance_bound = 100;
+                        if iy > y + 1 {
+                            chance_bound += (iy - (y + 1)) * 100;
+                        }
+                        let enc = self.max_neighbor_fire_encourage(ix, iy, iz);
+                        if enc > 0 {
+                            let spread_threshold = if old_fire {
+                                enc
+                            } else {
+                                (enc + 40) / (age + 30)
+                            };
+                            if spread_threshold > 0
+                                && rng.next_i32_bound(chance_bound) <= spread_threshold
+                                && (!self.is_raining()
+                                    || (!self.is_being_rained_on(ix, iy, iz)
+                                        && !self.is_being_rained_on(ix - 1, iy, iz)
+                                        && !self.is_being_rained_on(ix + 1, iy, iz)
+                                        && !self.is_being_rained_on(ix, iy, iz - 1)
+                                        && !self.is_being_rained_on(ix, iy, iz + 1)))
+                            {
+                                let new_age = if old_fire {
+                                    0
+                                } else {
+                                    (age + rng.next_i32_bound(5) / 4).min(15) as u8
+                                };
+                                self.java_set_type_id_and_data(ix, iy, iz, blocks::FIRE, new_age);
+                            }
                         }
                     }
                 }
@@ -2306,6 +2368,13 @@ impl World {
 
     /// Java `World.i()` (`World.java:1770-1850`): tick weather timers; returns `Some(new_raining)` when rain state changes.
     pub fn tick_weather(&mut self) -> Option<bool> {
+        if !self.mechanics.do_weather {
+            let mut ld = self.level_data.borrow_mut();
+            let was_raining = ld.raining;
+            ld.raining = false;
+            ld.thundering = false;
+            return if was_raining { Some(false) } else { None };
+        }
         let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
         let mut ld = self.level_data.borrow_mut();
         let was_raining = ld.raining;
@@ -2436,6 +2505,9 @@ impl World {
 
     /// Java `BlockPortal.a_(World, i, j, k)` (`BlockPortal.java:44-118`): validate 4x5 obsidian frame and fill 2x3 with PORTAL.
     pub fn try_create_portal(&mut self, mut x: i32, y: i32, mut z: i32) -> bool {
+        if !self.allow_nether {
+            return false;
+        }
         let mut b0 = 0i32;
         let mut b1 = 0i32;
         if self.get_block(x - 1, y, z) == blocks::OBSIDIAN
@@ -2615,6 +2687,7 @@ impl World {
                         if wy > 0
                             && below == blocks::STATIONARY_WATER
                             && self.get_data(wx, wy - 1, wz) == 0
+                            && (!self.mechanics.ice_generate_only_when_snowing || self.is_raining())
                         {
                             self.java_set_type_id(wx, wy - 1, wz, blocks::ICE);
                         }
@@ -2785,7 +2858,7 @@ impl World {
                                 item: ItemStack::new(block_id as i16, 1, 0),
                             });
                             self.java_set_type_id(wx, y, wz, blocks::AIR);
-                        } else if rng.next_i32_bound(100) == 0 {
+                        } else if self.mechanics.mushroom_spread && rng.next_i32_bound(100) == 0 {
                             let tx = wx + rng.next_i32_bound(3) - 1;
                             let ty = y + rng.next_i32_bound(2) - rng.next_i32_bound(2);
                             let tz = wz + rng.next_i32_bound(3) - 1;
@@ -2856,6 +2929,9 @@ impl World {
                         rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
                     }
                     blocks::LEAVES => {
+                        if !self.mechanics.leaf_decay {
+                            continue;
+                        }
                         let meta = self.get_data(wx, y, wz);
                         if (meta & 8) != 0 {
                             // Exact 4-step 3D Manhattan BFS (`BlockLeaves.java:39-131`)
@@ -2912,6 +2988,12 @@ impl World {
                                     self.java_set_raw_data(wx, y, wz, meta & !8);
                                 } else {
                                     if rng.next_i32_bound(20) == 0 {
+                                        let sapling_meta =
+                                            if self.mechanics.drop_saplings_of_leaf_type {
+                                                (meta & 3) as i16
+                                            } else {
+                                                0
+                                            };
                                         self.world_events.push(WorldEvent::DropItem {
                                             x: wx as f64,
                                             y: y as f64,
@@ -2919,7 +3001,7 @@ impl World {
                                             item: ItemStack::new(
                                                 blocks::SAPLING as i16,
                                                 1,
-                                                (meta & 3) as i16,
+                                                sapling_meta,
                                             ),
                                         });
                                     }
@@ -3303,5 +3385,59 @@ mod tests {
         assert_eq!(restored.cart_type, 2);
         assert_eq!(restored.fuel, powered.fuel);
         assert!((restored.x - powered.x).abs() < 1e-6);
+    }
+
+    #[test]
+    fn custom_spawn_and_poseidon_uberbukkit_config_toggles() {
+        let mut world = World::new(WorldConfig {
+            seed: 42,
+            save_enabled: false,
+            spawn_x: 12,
+            spawn_y: 65,
+            spawn_z: -5,
+            teleport_to_highest_safe_block: false,
+            ..Default::default()
+        });
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                world.ensure_chunk_base(ChunkPos::new(cx, cz));
+            }
+        }
+        // Place a solid ceiling at (12, 70, -5) above our indoor spawn at (12, 65, -5)
+        world.set_block(12, 64, -5, blocks::STONE);
+        world.set_block(12, 65, -5, blocks::AIR);
+        world.set_block(12, 66, -5, blocks::AIR);
+        world.set_block(12, 70, -5, blocks::STONE);
+
+        // 1. With `teleport_to_highest_safe_block = false`, `safe_spawn_point` returns exact `(12, 65, -5)`
+        assert_eq!(world.safe_spawn_point(), (12, 65, -5));
+
+        // 2. Even with `teleport_to_highest_safe_block = true`, custom `spawn_y = 65` stays at 65 if (12, 65..66, -5) is air!
+        let mut world2 = World::new(WorldConfig {
+            seed: 42,
+            save_enabled: false,
+            spawn_x: 12,
+            spawn_y: 65,
+            spawn_z: -5,
+            teleport_to_highest_safe_block: true,
+            ..Default::default()
+        });
+        world2.ensure_chunk_base(ChunkPos::new(0, -1));
+        world2.set_block(12, 64, -5, blocks::STONE);
+        world2.set_block(12, 65, -5, blocks::AIR);
+        world2.set_block(12, 66, -5, blocks::AIR);
+        world2.set_block(12, 70, -5, blocks::STONE);
+        assert_eq!(world2.safe_spawn_point(), (12, 65, -5));
+
+        // 3. Test sponge water absorption when `sponge_absorption_enabled = true`
+        world2.mechanics.sponge_absorption_enabled = true;
+        world2.mechanics.sponge_radius = 2;
+        world2.set_block(5, 65, 5, blocks::STATIONARY_WATER);
+        world2.java_set_type_id(5, 65, 4, blocks::SPONGE);
+        assert_eq!(
+            world2.get_block(5, 65, 5),
+            blocks::AIR,
+            "Sponge should absorb nearby water when sponge_absorption_enabled is true"
+        );
     }
 }

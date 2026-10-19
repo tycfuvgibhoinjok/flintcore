@@ -325,16 +325,24 @@ impl Mob {
 
     /// Java `EntitySheep.a(Random)`: natural wool color distribution.
     pub fn natural_sheep_color(rng: &mut JavaRandom) -> u8 {
+        Self::natural_sheep_color_ex(rng, true, true)
+    }
+
+    pub fn natural_sheep_color_ex(
+        rng: &mut JavaRandom,
+        spawn_black: bool,
+        spawn_brown_pink: bool,
+    ) -> u8 {
         let i = rng.next_i32_bound(100);
-        if i < 5 {
+        if i < 5 && spawn_black {
             15 // Black
-        } else if i < 10 {
+        } else if i < 10 && spawn_black {
             7 // Gray
-        } else if i < 15 {
+        } else if i < 15 && spawn_black {
             8 // Silver / Light Gray
-        } else if i < 18 {
+        } else if i < 18 && spawn_brown_pink {
             12 // Brown
-        } else if rng.next_i32_bound(500) == 0 {
+        } else if spawn_brown_pink && rng.next_i32_bound(500) == 0 {
             6 // Pink
         } else {
             0 // White
@@ -968,9 +976,24 @@ pub fn evaluate_natural_spawns(
 
     // Categories: (0 = Monster, 1 = Creature, 2 = WaterCreature)
     let categories = [
-        (0u8, allow_monsters, current_monsters, 70usize),
-        (1u8, allow_animals, current_animals, 15usize),
-        (2u8, allow_animals, current_water, 5usize),
+        (
+            0u8,
+            allow_monsters && world.spawning.spawn_monsters,
+            current_monsters,
+            world.spawning.monster_cap,
+        ),
+        (
+            1u8,
+            allow_animals && world.spawning.spawn_animals,
+            current_animals,
+            world.spawning.animal_cap,
+        ),
+        (
+            2u8,
+            allow_animals && world.spawning.spawn_water_mobs && world.spawning.spawn_squids,
+            current_water,
+            world.spawning.water_mob_cap,
+        ),
     ];
 
     for (cat, enabled, cur_count, max_base) in categories {
@@ -999,6 +1022,12 @@ pub fn evaluate_natural_spawns(
             let Some(mob_type) = chosen_mob else {
                 continue;
             };
+            if (mob_type == MobType::Slime && !world.spawning.spawn_slimes)
+                || (mob_type == MobType::Wolf && !world.spawning.spawn_wolves)
+                || (mob_type == MobType::Squid && !world.spawning.spawn_squids)
+            {
+                continue;
+            }
 
             let base_x = cpos.x * 16 + rng.next_i32_bound(16);
             let base_y = rng.next_i32_bound(128);

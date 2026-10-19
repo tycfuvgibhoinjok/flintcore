@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::config::WorldConfig;
+use crate::config::{FixesConfig, MechanicsConfig, SpawningConfig, WorldConfig, WorldgenConfig};
 use crate::gameplay::blocks;
 use crate::net::packets::chunk::{MapChunk, PreChunk};
 use crate::util::rng::JavaRandom;
@@ -188,6 +188,11 @@ pub(crate) fn with_generator<R>(seed: i64, f: impl FnOnce(&mut Generator) -> R) 
 
 pub struct World {
     config: WorldConfig,
+    pub allow_nether: bool,
+    pub spawning: SpawningConfig,
+    pub worldgen: WorldgenConfig,
+    pub mechanics: MechanicsConfig,
+    pub fixes: FixesConfig,
     world_dir: PathBuf,
     pub(crate) chunks: HashMap<ChunkPos, Chunk>,
     pub(crate) packet_cache: RefCell<HashMap<ChunkPos, (PreChunk, MapChunk)>>,
@@ -379,11 +384,22 @@ impl World {
         let (_session_lock, storage, level_data) = if config.save_enabled {
             let lock = SessionLock::acquire(&world_dir).ok();
             let loaded = LevelData::load_from_dir(&world_dir).ok().flatten();
-            let level = if let Some(lvl) = loaded {
+            let level = if let Some(mut lvl) = loaded {
                 config.seed = lvl.seed;
-                config.spawn_x = lvl.spawn_x;
-                config.spawn_y = lvl.spawn_y;
-                config.spawn_z = lvl.spawn_z;
+                let custom_spawn = config.override_saved_spawn
+                    || !config.auto_find_spawn
+                    || config.spawn_x != 0
+                    || config.spawn_y != 64
+                    || config.spawn_z != 0;
+                if custom_spawn {
+                    lvl.spawn_x = config.spawn_x;
+                    lvl.spawn_y = config.spawn_y;
+                    lvl.spawn_z = config.spawn_z;
+                } else {
+                    config.spawn_x = lvl.spawn_x;
+                    config.spawn_y = lvl.spawn_y;
+                    config.spawn_z = lvl.spawn_z;
+                }
                 lvl
             } else {
                 fresh_world = true;
@@ -418,6 +434,11 @@ impl World {
 
         Self {
             config,
+            allow_nether: true,
+            spawning: SpawningConfig::default(),
+            worldgen: WorldgenConfig::default(),
+            mechanics: MechanicsConfig::default(),
+            fixes: FixesConfig::default(),
             world_dir,
             chunks: HashMap::new(),
             packet_cache: RefCell::new(HashMap::new()),
@@ -498,6 +519,19 @@ impl World {
         } else {
             self.populate_chunk(chunk_pos);
         }
+        if !self.config.teleport_to_highest_safe_block {
+            return (x, default_y.clamp(1, 127), z);
+        }
+        if default_y != 64 {
+            let mut y = default_y.clamp(1, 126);
+            while y < 126
+                && (blocks::is_solid(self.get_block(x, y, z))
+                    || blocks::is_solid(self.get_block(x, y + 1, z)))
+            {
+                y += 1;
+            }
+            return (x, y, z);
+        }
         let ground = self.highest_solid_y(x, z);
         let y = if ground > 0 {
             ground
@@ -527,7 +561,18 @@ impl World {
         if !self.chunks.contains_key(&pos) {
             let loaded_chunk = if let Some(storage) = &self.storage {
                 match storage.borrow_mut().read_chunk(pos.x, pos.z) {
-                    Ok(Some(nbt)) => ChunkLoader::chunk_from_nbt(&nbt).ok(),
+                    Ok(Some(nbt)) => match ChunkLoader::chunk_from_nbt(&nbt) {
+                        Ok(c) => Some(c),
+                        Err(err) => {
+                            if self.config.regenerate_corrupt_chunks {
+                                crate::util::log::warn(&format!(
+                                    "regenerating corrupt chunk ({}, {}): {err}",
+                                    pos.x, pos.z
+                                ));
+                            }
+                            None
+                        }
+                    },
                     _ => None,
                 }
             } else {
@@ -1382,7 +1427,9 @@ impl World {
             && !self.insta_tick
             && self.chunks_area_loaded(x - b0, y - b0, z - b0, x + b0, y + b0, z + b0)
         {
-            self.java_set_type_id(x, y, z, 0);
+            if self.fixes.piston_sand_gravel_duping_fix {
+                self.java_set_type_id(x, y, z, 0);
+            }
             if self.chunks.contains_key(&ChunkPos::new(x >> 4, z >> 4)) {
                 let _ = self.live_resolve_read(ChunkPos::new(x >> 4, z >> 4));
                 self.falling_sands.push(FallingSand {
@@ -2074,15 +2121,17 @@ impl World {
                 }
             }
             blocks::SPONGE => {
-                for dx in -2..=2 {
-                    for dy in -2..=2 {
+                let r = self.mechanics.sponge_radius.clamp(1, 8);
+                let opt = self.mechanics.optimize_sponges;
+                for dx in -r..=r {
+                    for dy in -r..=r {
                         let ny = y + dy;
                         if !(0..128).contains(&ny) {
                             continue;
                         }
-                        for dz in -2..=2 {
+                        for dz in -r..=r {
                             let t = self.get_block(x + dx, ny, z + dz);
-                            if t == blocks::WATER || t == blocks::STATIONARY_WATER {
+                            if !opt || t == blocks::WATER || t == blocks::STATIONARY_WATER {
                                 self.java_apply_physics(x + dx, ny, z + dz, t as i32);
                             }
                         }
@@ -2194,7 +2243,25 @@ impl World {
                 if !self.is_solid_normal_at(x, y - 1, z) && !self.has_flammable_neighbor(x, y, z) {
                     self.java_set_type_id(x, y, z, 0);
                 } else {
-                    self.java_schedule_tick(x, y, z, blocks::FIRE, 40);
+                    let delay = if self.mechanics.pre_1_6_fire { 10 } else { 40 };
+                    self.java_schedule_tick(x, y, z, blocks::FIRE, delay);
+                }
+            }
+            blocks::SPONGE if self.mechanics.sponge_absorption_enabled => {
+                let r = self.mechanics.sponge_radius.clamp(1, 8);
+                for dx in -r..=r {
+                    for dy in -r..=r {
+                        let ny = y + dy;
+                        if !(0..128).contains(&ny) {
+                            continue;
+                        }
+                        for dz in -r..=r {
+                            let t = self.get_block(x + dx, ny, z + dz);
+                            if t == blocks::WATER || t == blocks::STATIONARY_WATER {
+                                self.java_set_type_id(x + dx, ny, z + dz, 0);
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -2407,8 +2474,10 @@ impl World {
                 trace_rng!(x, y, z);
             }
             if lava && l < 8 && i1 < 8 && i1 > l && random.next_i32_bound(4) != 0 {
-                // Poseidon flowing-lava fix is enabled by default: keep `i1`,
-                // but the RNG draw still happens and `flag` still clears.
+                // Poseidon flowing-lava fix (`world.settings.flowing-lava-fix.enabled`)
+                if !self.mechanics.flowing_lava_fix {
+                    i1 = l;
+                }
                 flag = false;
             }
             if i1 != l {
@@ -2543,7 +2612,12 @@ impl World {
                     || self.is_solid_normal_at(x, y, z - 1)
                     || self.is_solid_normal_at(x, y, z + 1)
                     || self.is_solid_normal_at(x, y - 1, z)
-                    || self.get_block(x, y - 1, z) == blocks::FENCE
+                    || (self.mechanics.allow_1_7_fence_placement
+                        && self.get_block(x, y - 1, z) == blocks::FENCE)
+            }
+            blocks::FENCE => {
+                self.mechanics.allow_1_7_fence_placement
+                    || blocks::material(self.get_block(x, y - 1, z)).is_buildable()
             }
             blocks::LADDER => {
                 self.is_solid_normal_at(x - 1, y, z)
@@ -2581,9 +2655,10 @@ impl World {
             | blocks::DETECTOR_RAIL
             | blocks::REPEATER_OFF
             | blocks::REPEATER_ON
-            | blocks::PUMPKIN
-            | blocks::JACK_O_LANTERN
             | blocks::SNOW => self.is_solid_normal_at(x, y - 1, z),
+            blocks::PUMPKIN | blocks::JACK_O_LANTERN => {
+                self.mechanics.pre_b1_5_pumpkins || self.is_solid_normal_at(x, y - 1, z)
+            }
             blocks::CAKE => blocks::material(self.get_block(x, y - 1, z)).is_buildable(),
             blocks::SAPLING | blocks::YELLOW_FLOWER | blocks::RED_ROSE | blocks::TALL_GRASS => {
                 matches!(
@@ -2638,7 +2713,8 @@ impl World {
             blocks::TORCH | blocks::REDSTONE_TORCH_OFF | blocks::REDSTONE_TORCH_ON => {
                 let mut meta = 0u8;
                 let can_floor = self.is_solid_normal_at(x, y - 1, z)
-                    || self.get_block(x, y - 1, z) == blocks::FENCE;
+                    || (self.mechanics.allow_1_7_fence_placement
+                        && self.get_block(x, y - 1, z) == blocks::FENCE);
                 if face == 1 && can_floor {
                     meta = 5;
                 } else if face == 2 && self.is_solid_normal_at(x, y, z + 1) {
@@ -2977,10 +3053,10 @@ impl World {
 
         let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
         let kind = match data {
-            1 => TreeKind::Taiga2,
-            2 => TreeKind::Forest,
+            1 if self.worldgen.generate_spruces => TreeKind::Taiga2,
+            2 if self.worldgen.generate_birches => TreeKind::Forest,
             _ => {
-                if rng.next_i32_bound(10) == 0 {
+                if !self.worldgen.pre_b1_2_tree_generation && rng.next_i32_bound(10) == 0 {
                     TreeKind::BigTree
                 } else {
                     TreeKind::Trees
@@ -3012,6 +3088,10 @@ impl World {
 
     /// Java `ItemDye.a`: apply bone meal to a grass block, growing tall grass and flowers around `(x, y, z)`.
     pub fn apply_bonemeal_to_grass(&mut self, x: i32, y: i32, z: i32) {
+        if !self.mechanics.allow_bone_meal_on_grass {
+            return;
+        }
+        let allow_tallgrass = self.mechanics.allow_grow_tallgrass;
         let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
         'outer: for j1 in 0..128 {
             let mut kx = x;
@@ -3028,7 +3108,7 @@ impl World {
                 }
             }
             if self.get_block(kx, ly, iz) == blocks::AIR {
-                if rng.next_i32_bound(10) != 0 {
+                if allow_tallgrass && rng.next_i32_bound(10) != 0 {
                     self.java_set_type_id_and_data(kx, ly, iz, blocks::TALL_GRASS, 1);
                 } else if rng.next_i32_bound(3) != 0 {
                     self.java_set_type_id(kx, ly, iz, blocks::YELLOW_FLOWER);
@@ -3329,6 +3409,10 @@ impl GenWorld for World {
 
     fn biome_at(&self, x: i32, z: i32) -> Biome {
         self.chunk_mgr.borrow_mut().biome_at(x, z)
+    }
+
+    fn worldgen_config(&self) -> crate::config::WorldgenConfig {
+        self.worldgen.clone()
     }
 }
 
