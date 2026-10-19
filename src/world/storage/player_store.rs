@@ -51,6 +51,10 @@ impl PlayerStore {
             }
         }
 
+        if let Some(dimension) = root.get_i32("Dimension") {
+            player.dimension = dimension;
+        }
+
         if let Some(health) = root.get_i16("Health") {
             player.health = health.clamp(0, 20);
         }
@@ -128,7 +132,7 @@ impl PlayerStore {
             "OnGround",
             NbtTag::Byte(if player.on_ground { 1 } else { 0 }),
         );
-        root.insert("Dimension", NbtTag::Int(0));
+        root.insert("Dimension", NbtTag::Int(player.dimension));
         root.insert("Health", NbtTag::Short(player.health));
         if let Some((sx, sy, sz)) = player.spawn_bed {
             root.insert("SpawnX", NbtTag::Int(sx));
@@ -193,6 +197,7 @@ mod tests {
         player.yaw = 180.0;
         player.pitch = -15.0;
         player.health = 18;
+        player.dimension = -1;
         player.inventory.items[0] = Some(ItemStack::new(276, 1, 10)); // Diamond sword
         player.inventory.armor[0] = Some(ItemStack::new(313, 1, 5)); // Diamond boots
 
@@ -208,6 +213,7 @@ mod tests {
         assert_eq!(loaded.yaw, 180.0);
         assert_eq!(loaded.pitch, -15.0);
         assert_eq!(loaded.health, 18);
+        assert_eq!(loaded.dimension, -1);
         assert_eq!(loaded.inventory.items[0], Some(ItemStack::new(276, 1, 10)));
         assert_eq!(loaded.inventory.armor[0], Some(ItemStack::new(313, 1, 5)));
 

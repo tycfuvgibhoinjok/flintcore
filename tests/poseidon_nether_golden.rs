@@ -1,0 +1,111 @@
+//! Java-free Nether (`DIM-1`) regression pin.
+//!
+//! Regenerates a 3x3 populated Nether region for each seed and compares an
+//! FNV-1a 64 hash of the full dump image (blocks | meta | height) against the
+//! golden hashes committed in `tests/golden/poseidon_nether_hashes.txt`.
+//!
+//! The golden file is derived from `tools/poseidon_dump/PoseidonHellGenerator.java`
+//! (a headless Project-Poseidon run using `ChunkProviderHell`). See the file
+//! header for the regeneration command.
+
+use flintcore::config::WorldConfig;
+use flintcore::world::chunk::{Chunk, ChunkPos, CHUNK_WIDTH};
+use flintcore::world::world::World;
+use std::collections::HashMap;
+use std::path::Path;
+
+const SEEDS: &[i64] = &[
+    12345, 0, 9999, 54321, -12345, 1337, 42, 1, 7, 100, 777, 2024, 31337, 65536, 777777, -42, -999,
+    123456789,
+];
+
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// 32768 block bytes, 16384 nibble-packed meta bytes, 256 height bytes.
+fn build_dump_image(chunk: &Chunk) -> Vec<u8> {
+    let mut img = Vec::with_capacity(32768 + 16384 + 256);
+    for wire in 0..32768usize {
+        img.push(chunk.get_block(wire >> 11, wire & 127, (wire >> 7) & 15));
+    }
+    for wire in (0..32768usize).step_by(2) {
+        let lo = chunk.get_metadata(wire >> 11, wire & 127, (wire >> 7) & 15) & 15;
+        let hi_wire = wire + 1;
+        let hi = chunk.get_metadata(hi_wire >> 11, hi_wire & 127, (hi_wire >> 7) & 15) & 15;
+        img.push(lo | (hi << 4));
+    }
+    for z in 0..CHUNK_WIDTH {
+        for x in 0..CHUNK_WIDTH {
+            img.push(chunk.get_height(x, z));
+        }
+    }
+    assert_eq!(img.len(), 32768 + 16384 + 256);
+    img
+}
+
+#[test]
+fn poseidon_nether_golden_hashes() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/poseidon_nether_hashes.txt");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+
+    let mut golden: HashMap<(i64, i32, i32), u64> = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let seed: i64 = it.next().unwrap().parse().unwrap();
+        let cx: i32 = it.next().unwrap().parse().unwrap();
+        let cz: i32 = it.next().unwrap().parse().unwrap();
+        let hash = u64::from_str_radix(it.next().unwrap(), 16).unwrap();
+        golden.insert((seed, cx, cz), hash);
+    }
+    assert!(!golden.is_empty(), "nether golden hash file is empty");
+
+    let mut checked = 0usize;
+    for &seed in SEEDS {
+        let config = WorldConfig {
+            seed,
+            save_enabled: false,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new_nether(config);
+        for cz in -1..=1 {
+            for cx in -1..=1 {
+                world.populate_chunk(ChunkPos::new(cx, cz));
+            }
+        }
+
+        for cz in -1..=1 {
+            for cx in -1..=1 {
+                let Some(&expected) = golden.get(&(seed, cx, cz)) else {
+                    continue;
+                };
+                let chunk = world
+                    .get_chunk(ChunkPos::new(cx, cz))
+                    .expect("generated nether chunk missing");
+                let actual = fnv1a64(&build_dump_image(chunk));
+                assert_eq!(
+                    actual, expected,
+                    "nether golden hash mismatch for seed {seed} chunk ({cx},{cz})"
+                );
+                checked += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        checked,
+        golden.len(),
+        "some nether golden entries were never checked (seed list out of sync?)"
+    );
+}

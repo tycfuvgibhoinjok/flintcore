@@ -1031,7 +1031,14 @@ impl World {
                         item,
                     });
                 }
-                self.java_set_type_id(cx, cy, cz, blocks::AIR);
+                // Poseidon `world.settings.pistons.other-fixes.enabled`:
+                // break fragile blocks with `setRawTypeId` so their removal
+                // cannot trigger neighbour physics that re-enters the piston.
+                if self.fixes.piston_other_fixes {
+                    self.java_set_raw_type_id(cx, cy, cz, blocks::AIR);
+                } else {
+                    self.java_set_type_id(cx, cy, cz, blocks::AIR);
+                }
                 break;
             }
             if count == 12 {
@@ -2607,6 +2614,257 @@ impl World {
     }
 
     // ---------------------------------------------------------------------
+    // PortalTravelAgent (`PortalTravelAgent.java`)
+    // ---------------------------------------------------------------------
+
+    /// Java `PortalTravelAgent.b(World, Entity)` (lines 24-88): nearest portal
+    /// block within ±128 blocks, snapped to the bottom-center of the column.
+    pub fn find_portal(&mut self, x: f64, y: f64, z: f64) -> Option<(f64, f64, f64)> {
+        const RADIUS: i32 = 128;
+        let ox = x.floor() as i32;
+        let oz = z.floor() as i32;
+        let mut best = -1.0f64;
+        let (mut bx, mut by, mut bz) = (0i32, 0i32, 0i32);
+
+        for px in ox - RADIUS..=ox + RADIUS {
+            let dx = px as f64 + 0.5 - x;
+            for pz in oz - RADIUS..=oz + RADIUS {
+                let dz = pz as f64 + 0.5 - z;
+                let mut py = 127i32;
+                while py >= 0 {
+                    if self.get_block(px, py, pz) == blocks::PORTAL {
+                        while py > 0 && self.get_block(px, py - 1, pz) == blocks::PORTAL {
+                            py -= 1;
+                        }
+                        let dy = py as f64 + 0.5 - y;
+                        let dist = dx * dx + dy * dy + dz * dz;
+                        if best < 0.0 || dist < best {
+                            best = dist;
+                            bx = px;
+                            by = py;
+                            bz = pz;
+                        }
+                    }
+                    py -= 1;
+                }
+            }
+        }
+
+        if best < 0.0 {
+            return None;
+        }
+
+        let mut sx = bx as f64 + 0.5;
+        let sy = by as f64 + 0.5;
+        let mut sz = bz as f64 + 0.5;
+        if self.get_block(bx - 1, by, bz) == blocks::PORTAL {
+            sx -= 0.5;
+        }
+        if self.get_block(bx + 1, by, bz) == blocks::PORTAL {
+            sx += 0.5;
+        }
+        if self.get_block(bx, by, bz - 1) == blocks::PORTAL {
+            sz -= 0.5;
+        }
+        if self.get_block(bx, by, bz + 1) == blocks::PORTAL {
+            sz += 0.5;
+        }
+        Some((sx, sy, sz))
+    }
+
+    /// Java `PortalTravelAgent.c(World, Entity)` (lines 90-324): find a clear
+    /// 4x5 footprint (or clamp to y 70..=118 and carve one), build the
+    /// obsidian frame, and fill the 2x3 interior with PORTAL.
+    pub fn create_portal(&mut self, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+        const RADIUS: i32 = 16;
+        let ox = x.floor() as i32;
+        let oy = y.floor() as i32;
+        let oz = z.floor() as i32;
+        let mut best = -1.0f64;
+        let (mut bx, mut by, mut bz) = (ox, oy, oz);
+        let mut rotation = 0i32;
+        let start_rotation = self.tick_random.next_i32_bound(4);
+
+        // First pass: prefer a 4x5x4 clear volume above solid ground.
+        for px in ox - RADIUS..=ox + RADIUS {
+            let dx = px as f64 + 0.5 - x;
+            for pz in oz - RADIUS..=oz + RADIUS {
+                let dz = pz as f64 + 0.5 - z;
+                let mut py = 127i32;
+                while py >= 0 {
+                    if self.get_block(px, py, pz) == blocks::AIR {
+                        while py > 0 && self.get_block(px, py - 1, pz) == blocks::AIR {
+                            py -= 1;
+                        }
+                        for rot in start_rotation..start_rotation + 4 {
+                            let side_a = rot % 2;
+                            let side_b = 1 - side_a;
+                            let (side_a, side_b) = if rot % 4 >= 2 {
+                                (-side_a, -side_b)
+                            } else {
+                                (side_a, side_b)
+                            };
+                            let mut clear = true;
+                            'candidate: for depth in 0..3 {
+                                for width in 0..4i32 {
+                                    for hy in -1..4i32 {
+                                        let cx = px + (width - 1) * side_a + depth * side_b;
+                                        let cy = py + hy;
+                                        let cz = pz + (width - 1) * side_b - depth * side_a;
+                                        let buildable = blocks::material_is_buildable(
+                                            self.get_block(cx, cy, cz),
+                                        );
+                                        let empty = self.get_block(cx, cy, cz) == blocks::AIR;
+                                        if (hy < 0 && !buildable) || (hy >= 0 && !empty) {
+                                            clear = false;
+                                            break 'candidate;
+                                        }
+                                    }
+                                }
+                            }
+                            if !clear {
+                                // Java `continue label271`: abandon every
+                                // rotation for this column and scan downward.
+                                break;
+                            }
+                            let dy = py as f64 + 0.5 - y;
+                            let dist = dx * dx + dy * dy + dz * dz;
+                            if best < 0.0 || dist < best {
+                                best = dist;
+                                bx = px;
+                                by = py;
+                                bz = pz;
+                                rotation = rot % 4;
+                            }
+                        }
+                    }
+                    py -= 1;
+                }
+            }
+        }
+
+        // Second pass: any 2x3 pocket (used when no 4x5 volume exists).
+        if best < 0.0 {
+            for px in ox - RADIUS..=ox + RADIUS {
+                let dx = px as f64 + 0.5 - x;
+                for pz in oz - RADIUS..=oz + RADIUS {
+                    let dz = pz as f64 + 0.5 - z;
+                    let mut py = 127i32;
+                    while py >= 0 {
+                        if self.get_block(px, py, pz) == blocks::AIR {
+                            while py > 0 && self.get_block(px, py - 1, pz) == blocks::AIR {
+                                py -= 1;
+                            }
+                            for rot in start_rotation..start_rotation + 2 {
+                                let side_a = rot % 2;
+                                let side_b = 1 - side_a;
+                                let mut clear = true;
+                                'candidate2: for width in 0..4i32 {
+                                    for hy in -1..4i32 {
+                                        let cx = px + (width - 1) * side_a;
+                                        let cy = py + hy;
+                                        let cz = pz + (width - 1) * side_b;
+                                        let buildable = blocks::material_is_buildable(
+                                            self.get_block(cx, cy, cz),
+                                        );
+                                        let empty = self.get_block(cx, cy, cz) == blocks::AIR;
+                                        if (hy < 0 && !buildable) || (hy >= 0 && !empty) {
+                                            clear = false;
+                                            break 'candidate2;
+                                        }
+                                    }
+                                }
+                                if !clear {
+                                    // Java `continue label219` (second pass).
+                                    break;
+                                }
+                                let dy = py as f64 + 0.5 - y;
+                                let dist = dx * dx + dy * dy + dz * dz;
+                                if best < 0.0 || dist < best {
+                                    best = dist;
+                                    bx = px;
+                                    by = py;
+                                    bz = pz;
+                                    rotation = rot % 2;
+                                }
+                            }
+                        }
+                        py -= 1;
+                    }
+                }
+            }
+        }
+
+        let mut axis_a = rotation % 2;
+        let mut axis_b = 1 - axis_a;
+        if rotation % 4 >= 2 {
+            axis_a = -axis_a;
+            axis_b = -axis_b;
+        }
+
+        let mut base_y = by;
+        if best < 0.0 {
+            base_y = base_y.clamp(70, 118);
+            for depth in -1..=1 {
+                for width in 1..3 {
+                    for hy in -1..3 {
+                        let cx = bx + (width - 1) * axis_a + depth * axis_b;
+                        let cy = base_y + hy;
+                        let cz = bz + (width - 1) * axis_b - depth * axis_a;
+                        let id = if hy < 0 {
+                            blocks::OBSIDIAN
+                        } else {
+                            blocks::AIR
+                        };
+                        self.java_set_type_id(cx, cy, cz, id);
+                    }
+                }
+            }
+        }
+
+        for _depth in 0..4 {
+            self.suppress_physics = true;
+            for width in 0..4 {
+                for hy in -1..4 {
+                    let cx = bx + (width - 1) * axis_a;
+                    let cy = base_y + hy;
+                    let cz = bz + (width - 1) * axis_b;
+                    let edge = width == 0 || width == 3 || hy == -1 || hy == 3;
+                    let id = if edge {
+                        blocks::OBSIDIAN
+                    } else {
+                        blocks::PORTAL
+                    };
+                    self.java_set_type_id(cx, cy, cz, id);
+                }
+            }
+            self.suppress_physics = false;
+            for width in 0..4 {
+                for hy in -1..4 {
+                    let cx = bx + (width - 1) * axis_a;
+                    let cy = base_y + hy;
+                    let cz = bz + (width - 1) * axis_b;
+                    let id = self.get_block(cx, cy, cz);
+                    self.java_apply_physics(cx, cy, cz, id as i32);
+                }
+            }
+        }
+
+        (bx as f64 + 0.5, base_y as f64 + 0.5, bz as f64 + 0.5)
+    }
+
+    /// Java `PortalTravelAgent.a(World, Entity)`: snap to an existing portal or
+    /// create one, then snap to the result.
+    pub fn find_or_create_portal(&mut self, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+        if let Some(pos) = self.find_portal(x, y, z) {
+            return pos;
+        }
+        let created = self.create_portal(x, y, z);
+        self.find_portal(created.0, created.1, created.2)
+            .unwrap_or(created)
+    }
+
+    // ---------------------------------------------------------------------
     // Random Block Ticks (`World.j()`)
     // ---------------------------------------------------------------------
 
@@ -3439,5 +3697,55 @@ mod tests {
             blocks::AIR,
             "Sponge should absorb nearby water when sponge_absorption_enabled is true"
         );
+    }
+
+    #[test]
+    fn portal_travel_agent_finds_and_snaps_to_existing_portal() {
+        let mut world = make_flat_world();
+
+        // 4x5 obsidian frame in the x/y plane at z = 10, with a 2x3 portal.
+        for x in 10..=13 {
+            for y in 63..=67 {
+                let edge = x == 10 || x == 13 || y == 63 || y == 67;
+                world.set_block(
+                    x,
+                    y,
+                    10,
+                    if edge {
+                        blocks::OBSIDIAN
+                    } else {
+                        blocks::PORTAL
+                    },
+                );
+            }
+        }
+
+        let found = world.find_portal(12.5, 65.0, 10.5).expect("portal");
+        // Java centers on the bottom of the nearest column and expands by
+        // half a block towards adjacent portal columns along both axes.
+        assert_eq!(found, (12.0, 64.5, 10.5));
+    }
+
+    #[test]
+    fn portal_travel_agent_creates_frame_when_missing() {
+        let mut world = make_flat_world();
+        let pos = world.find_or_create_portal(5.0, 64.0, 5.0);
+
+        let mut portals = 0;
+        let mut obsidian = 0;
+        for x in -16..=26 {
+            for y in 60..=75 {
+                for z in -16..=26 {
+                    match world.get_block(x, y, z) {
+                        blocks::PORTAL => portals += 1,
+                        blocks::OBSIDIAN => obsidian += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(portals, 6, "2x3 portal interior");
+        assert!(obsidian >= 14, "obsidian frame, got {obsidian}");
+        assert!((60.5..=118.5).contains(&pos.1));
     }
 }

@@ -19,6 +19,14 @@ pub struct Player {
     pub entity_id: i32,
     pub conn_id: ConnId,
     pub username: String,
+    /// Java `EntityPlayer.dimension`: 0 = overworld, -1 = Nether.
+    pub dimension: i32,
+    /// Java `EntityPlayer.D`: portal cooldown in ticks after a dimension change.
+    pub portal_cooldown: i32,
+    /// Java `EntityPlayer.E`: touched a portal this tick, travel on the next tick.
+    pub in_portal: bool,
+    /// Java `EntityPlayer.F`: portal swirl timer (`+0.0125` per tick, travel at 1.0).
+    pub portal_time: f32,
     pub x: f64,
     pub y: f64,
     pub z: f64,
@@ -79,6 +87,10 @@ impl Player {
             entity_id,
             conn_id,
             username,
+            dimension: 0,
+            portal_cooldown: 0,
+            in_portal: false,
+            portal_time: 0.0,
             x,
             y,
             z,

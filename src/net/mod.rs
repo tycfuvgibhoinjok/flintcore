@@ -29,6 +29,11 @@ pub enum NetEvent {
         id: ConnId,
         packet: packets::Serverbound,
     },
+    /// Legacy `0xFE` server-list ping; the server answers with a raw `0xFF`
+    /// packet containing the MOTD, online count and player limit.
+    LegacyPing {
+        id: ConnId,
+    },
     Disconnected {
         id: ConnId,
     },

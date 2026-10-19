@@ -1411,3 +1411,124 @@ pub fn generate_tree(
         }
     }
 }
+
+/// Java `WorldGenHellLava`: single lava spring inside netherrack wall/ceiling.
+pub fn generate_hell_lava(
+    world: &mut dyn GenWorld,
+    random: &mut JavaRandom,
+    i: i32,
+    j: i32,
+    k: i32,
+    block: u8,
+) -> bool {
+    if world.get_block(i, j + 1, k) != blocks::NETHERRACK {
+        return false;
+    }
+    let here = world.get_block(i, j, k);
+    if here != blocks::AIR && here != blocks::NETHERRACK {
+        return false;
+    }
+
+    let mut l = 0;
+    if world.get_block(i - 1, j, k) == blocks::NETHERRACK {
+        l += 1;
+    }
+    if world.get_block(i + 1, j, k) == blocks::NETHERRACK {
+        l += 1;
+    }
+    if world.get_block(i, j, k - 1) == blocks::NETHERRACK {
+        l += 1;
+    }
+    if world.get_block(i, j, k + 1) == blocks::NETHERRACK {
+        l += 1;
+    }
+    if world.get_block(i, j - 1, k) == blocks::NETHERRACK {
+        l += 1;
+    }
+
+    let mut i1 = 0;
+    if world.is_empty(i - 1, j, k) {
+        i1 += 1;
+    }
+    if world.is_empty(i + 1, j, k) {
+        i1 += 1;
+    }
+    if world.is_empty(i, j, k - 1) {
+        i1 += 1;
+    }
+    if world.is_empty(i, j, k + 1) {
+        i1 += 1;
+    }
+    if world.is_empty(i, j - 1, k) {
+        i1 += 1;
+    }
+
+    if l == 4 && i1 == 1 {
+        world.set_block_physics(i, j, k, block);
+        world.fluid_tick(i, j, k, block == blocks::LAVA, random);
+    }
+    true
+}
+
+/// Java `WorldGenFire`: scatter up to 64 fire blocks on top of netherrack.
+pub fn generate_fire(
+    world: &mut dyn GenWorld,
+    random: &mut JavaRandom,
+    i: i32,
+    j: i32,
+    k: i32,
+) -> bool {
+    for _ in 0..64 {
+        let i1 = i + random.next_i32_bound(8) - random.next_i32_bound(8);
+        let j1 = j + random.next_i32_bound(4) - random.next_i32_bound(4);
+        let k1 = k + random.next_i32_bound(8) - random.next_i32_bound(8);
+        if world.is_empty(i1, j1, k1) && world.get_block(i1, j1 - 1, k1) == blocks::NETHERRACK {
+            world.set_block_physics(i1, j1, k1, blocks::FIRE);
+        }
+    }
+    true
+}
+
+/// Java `WorldGenLightStone1` / `WorldGenLightStone2`: branching glowstone cluster hanging from netherrack.
+pub fn generate_glowstone(
+    world: &mut dyn GenWorld,
+    random: &mut JavaRandom,
+    i: i32,
+    j: i32,
+    k: i32,
+) -> bool {
+    if !world.is_empty(i, j, k) {
+        return false;
+    }
+    if world.get_block(i, j + 1, k) != blocks::NETHERRACK {
+        return false;
+    }
+    world.set_block_physics(i, j, k, blocks::GLOWSTONE);
+
+    for _ in 0..1500 {
+        let i1 = i + random.next_i32_bound(8) - random.next_i32_bound(8);
+        let j1 = j - random.next_i32_bound(12);
+        let k1 = k + random.next_i32_bound(8) - random.next_i32_bound(8);
+        if world.get_block(i1, j1, k1) == blocks::AIR {
+            let mut l1 = 0;
+            for i2 in 0..6 {
+                let j2 = match i2 {
+                    0 => world.get_block(i1 - 1, j1, k1),
+                    1 => world.get_block(i1 + 1, j1, k1),
+                    2 => world.get_block(i1, j1 - 1, k1),
+                    3 => world.get_block(i1, j1 + 1, k1),
+                    4 => world.get_block(i1, j1, k1 - 1),
+                    5 => world.get_block(i1, j1, k1 + 1),
+                    _ => 0,
+                };
+                if j2 == blocks::GLOWSTONE {
+                    l1 += 1;
+                }
+            }
+            if l1 == 1 {
+                world.set_block_physics(i1, j1, k1, blocks::GLOWSTONE);
+            }
+        }
+    }
+    true
+}

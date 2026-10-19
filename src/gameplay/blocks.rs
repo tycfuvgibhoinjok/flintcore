@@ -378,6 +378,48 @@ pub fn light_emission(id: u8) -> u8 {
     }
 }
 
+/// Java `Block.o[id]` — `Block.a()` (default `true`, overridden `false` for
+/// non-full-cube/technical blocks). Used by `WorldProviderHell.canSpawn`.
+pub fn is_spawnable(id: u8) -> bool {
+    !matches!(
+        id,
+        SAPLING
+            | WATER
+            | STATIONARY_WATER
+            | LAVA
+            | STATIONARY_LAVA
+            | GLASS
+            | BED
+            | POWERED_RAIL
+            | DETECTOR_RAIL
+            | STICKY_PISTON
+            | PISTON
+            | PISTON_HEAD
+            | TALL_GRASS
+            | DEAD_BUSH
+            | YELLOW_FLOWER
+            | RED_ROSE
+            | BROWN_MUSHROOM
+            | RED_MUSHROOM
+            | FIRE
+            | MOB_SPAWNER
+            | CROPS
+            | WOODEN_DOOR
+            | LADDER
+            | RAIL
+            | LEVER
+            | IRON_DOOR
+            | STONE_BUTTON
+            | ICE
+            | CACTUS
+            | FENCE
+            | PORTAL
+            | CAKE
+            | REPEATER_OFF
+            | REPEATER_ON
+    )
+}
+
 pub fn is_opaque(id: u8) -> bool {
     light_opacity(id) > 0
 }

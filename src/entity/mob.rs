@@ -1014,10 +1014,17 @@ pub fn evaluate_natural_spawns(
                 continue;
             };
             let biome = Biome::from_id(chunk.biomes[0]);
-            let chosen_mob = match cat {
-                0 => pick_weighted(biome_monsters(biome), rng),
-                1 => pick_weighted(biome_creatures(biome), rng),
-                _ => Some(MobType::Squid),
+            let chosen_mob = if world.is_hell {
+                match cat {
+                    0 => pick_weighted(&[(MobType::Ghast, 10), (MobType::PigZombie, 10)], rng),
+                    _ => None,
+                }
+            } else {
+                match cat {
+                    0 => pick_weighted(biome_monsters(biome), rng),
+                    1 => pick_weighted(biome_creatures(biome), rng),
+                    _ => Some(MobType::Squid),
+                }
             };
             let Some(mob_type) = chosen_mob else {
                 continue;

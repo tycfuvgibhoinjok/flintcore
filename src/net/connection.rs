@@ -66,6 +66,7 @@ async fn read_loop(
     let mut chunk = vec![0u8; 4096];
     let mut packets_in_window = 0usize;
     let mut window_start = std::time::Instant::now();
+    let mut legacy_ping_sent = false;
 
     loop {
         if consumed > 0 {
@@ -85,6 +86,21 @@ async fn read_loop(
         }
 
         loop {
+            // Pre-1.7 server-list ping: a lone `0xFE` request. It is not a
+            // framed packet, so it must be handled before the codec. The
+            // simulation thread owns the MOTD/player counts and answers via
+            // `NetEvent::LegacyPing`.
+            if state == ConnectionState::Handshaking
+                && !legacy_ping_sent
+                && buffer.get(consumed) == Some(&0xFE)
+            {
+                consumed += 1;
+                legacy_ping_sent = true;
+                if inbound.send(NetEvent::LegacyPing { id }).await.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
             match codec::decode_serverbound(&buffer[consumed..]) {
                 Ok((packet, length)) => {
                     let id_now = packet.id();

@@ -76,6 +76,12 @@ pub struct EntityStore {
     minecarts: HashMap<i32, Minecart>,
     paintings: HashMap<i32, Painting>,
     next_id: i32,
+    /// Dimension of non-player entities (players carry their own field).
+    /// Missing entries mean the default overworld dimension 0.
+    dimensions: HashMap<i32, i32>,
+    /// Dimension assigned to entities inserted right now. The server sets
+    /// this while a dimension's world is active.
+    pub spawn_dimension: i32,
 }
 
 impl EntityStore {
@@ -92,6 +98,8 @@ impl EntityStore {
             minecarts: HashMap::new(),
             paintings: HashMap::new(),
             next_id: 1,
+            dimensions: HashMap::new(),
+            spawn_dimension: 0,
         }
     }
 
@@ -99,6 +107,22 @@ impl EntityStore {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         id
+    }
+
+    fn tag_spawned(&mut self, entity_id: i32) {
+        if self.spawn_dimension != 0 {
+            self.dimensions.insert(entity_id, self.spawn_dimension);
+        } else {
+            self.dimensions.remove(&entity_id);
+        }
+    }
+
+    pub fn dimension_of(&self, entity_id: i32) -> i32 {
+        self.dimensions.get(&entity_id).copied().unwrap_or(0)
+    }
+
+    pub fn remove_dimension(&mut self, entity_id: i32) {
+        self.dimensions.remove(&entity_id);
     }
 
     pub fn insert_player(
@@ -236,6 +260,7 @@ impl EntityStore {
             dead: false,
         };
         self.dropped_items.insert(entity_id, dropped);
+        self.tag_spawned(entity_id);
         entity_id
     }
 
@@ -248,6 +273,7 @@ impl EntityStore {
     }
 
     pub fn remove_dropped_item(&mut self, entity_id: i32) -> Option<DroppedItem> {
+        self.remove_dimension(entity_id);
         self.dropped_items.remove(&entity_id)
     }
 
@@ -269,6 +295,9 @@ impl EntityStore {
                 true
             }
         });
+        for id in &removed {
+            self.remove_dimension(*id);
+        }
         removed
     }
 
@@ -296,6 +325,7 @@ impl EntityStore {
             dead: false,
         };
         self.boats.insert(entity_id, boat);
+        self.tag_spawned(entity_id);
         entity_id
     }
 
@@ -308,6 +338,7 @@ impl EntityStore {
     }
 
     pub fn remove_boat(&mut self, entity_id: i32) -> Option<Boat> {
+        self.remove_dimension(entity_id);
         self.boats.remove(&entity_id)
     }
 
@@ -327,12 +358,14 @@ impl EntityStore {
         let entity_id = self.allocate_id();
         let mob = Mob::new(entity_id, mob_type, x, y, z, seed);
         self.mobs.insert(entity_id, mob);
+        self.tag_spawned(entity_id);
         entity_id
     }
 
     pub fn insert_mob(&mut self, mob: Mob) -> i32 {
         let id = mob.entity_id;
         self.mobs.insert(id, mob);
+        self.tag_spawned(id);
         id
     }
 
@@ -345,6 +378,7 @@ impl EntityStore {
     }
 
     pub fn remove_mob(&mut self, entity_id: i32) -> Option<Mob> {
+        self.remove_dimension(entity_id);
         self.mobs.remove(&entity_id)
     }
 
@@ -356,12 +390,12 @@ impl EntityStore {
         self.mobs.values_mut()
     }
 
-    pub fn count_mob_categories(&self) -> (usize, usize, usize) {
+    pub fn count_mob_categories(&self, dimension: i32) -> (usize, usize, usize) {
         let mut monsters = 0;
         let mut animals = 0;
         let mut water = 0;
         for m in self.mobs.values() {
-            if m.dead {
+            if m.dead || self.dimension_of(m.entity_id) != dimension {
                 continue;
             }
             if m.mob_type.is_monster() {
@@ -419,6 +453,7 @@ impl EntityStore {
             dead: false,
         };
         self.projectiles.insert(entity_id, proj);
+        self.tag_spawned(entity_id);
         entity_id
     }
 
@@ -431,6 +466,7 @@ impl EntityStore {
     }
 
     pub fn remove_projectile(&mut self, entity_id: i32) -> Option<Projectile> {
+        self.remove_dimension(entity_id);
         self.projectiles.remove(&entity_id)
     }
 
@@ -458,6 +494,7 @@ impl EntityStore {
             dead: false,
         };
         self.primed_tnts.insert(entity_id, tnt);
+        self.tag_spawned(entity_id);
         entity_id
     }
 
@@ -470,6 +507,7 @@ impl EntityStore {
     }
 
     pub fn remove_primed_tnt(&mut self, entity_id: i32) -> Option<PrimedTnt> {
+        self.remove_dimension(entity_id);
         self.primed_tnts.remove(&entity_id)
     }
 
@@ -485,12 +523,14 @@ impl EntityStore {
         let entity_id = self.allocate_id();
         let cart = Minecart::new(entity_id, cart_type, x, y, z);
         self.minecarts.insert(entity_id, cart);
+        self.tag_spawned(entity_id);
         entity_id
     }
 
     pub fn insert_minecart(&mut self, cart: Minecart) -> i32 {
         let id = cart.entity_id;
         self.minecarts.insert(id, cart);
+        self.tag_spawned(id);
         id
     }
 
@@ -503,6 +543,7 @@ impl EntityStore {
     }
 
     pub fn remove_minecart(&mut self, entity_id: i32) -> Option<Minecart> {
+        self.remove_dimension(entity_id);
         self.minecarts.remove(&entity_id)
     }
 
@@ -526,6 +567,7 @@ impl EntityStore {
             dead: false,
         };
         self.paintings.insert(entity_id, p);
+        self.tag_spawned(entity_id);
         entity_id
     }
 
@@ -534,6 +576,7 @@ impl EntityStore {
     }
 
     pub fn remove_painting(&mut self, entity_id: i32) -> Option<Painting> {
+        self.remove_dimension(entity_id);
         self.paintings.remove(&entity_id)
     }
 

@@ -12,7 +12,7 @@ use crate::util::{Error, Result};
 use crate::world::biome::{Biome, WorldChunkManager};
 use crate::world::chunk::{Chunk, ChunkPos, ChunkState, CHUNK_HEIGHT};
 use crate::world::decorate::GenWorld;
-use crate::world::generator::Generator;
+use crate::world::generator::{Generator, HellGenerator};
 use crate::world::lighting::{LightType, LightingWorld};
 use crate::world::storage::{ChunkLoader, LevelData, RegionFileCache, SessionLock};
 
@@ -188,12 +188,19 @@ pub(crate) fn with_generator<R>(seed: i64, f: impl FnOnce(&mut Generator) -> R) 
 
 pub struct World {
     config: WorldConfig,
+    /// Java `WorldProvider.dimension`: 0 = overworld, -1 = Nether.
+    pub dimension: i32,
+    /// Cached `WorldProvider.e` (`isHell`): disables sky light entirely.
+    pub is_hell: bool,
     pub allow_nether: bool,
     pub spawning: SpawningConfig,
     pub worldgen: WorldgenConfig,
     pub mechanics: MechanicsConfig,
     pub fixes: FixesConfig,
     world_dir: PathBuf,
+    /// Java `ChunkProviderHell` instance. Its `Random` is stateful and is NOT
+    /// re-seeded by `getChunkAt(populate)`, so it must live next to the world.
+    hell_generator: Option<HellGenerator>,
     pub(crate) chunks: HashMap<ChunkPos, Chunk>,
     pub(crate) packet_cache: RefCell<HashMap<ChunkPos, (PreChunk, MapChunk)>>,
     chunk_mgr: RefCell<WorldChunkManager>,
@@ -258,6 +265,10 @@ pub struct World {
     pub active_detector_rails: HashSet<(i32, i32, i32)>,
     /// Pressure plates currently occupied by an entity (`BlockPressurePlate.g`).
     pub active_pressure_plates: HashSet<(i32, i32, i32)>,
+    /// Optional dedicated Rayon pools from `world.gen_workers` /
+    /// `world.compression_workers` (`0` means “use the global pool”).
+    gen_pool: Option<rayon::ThreadPool>,
+    compression_pool: Option<rayon::ThreadPool>,
 }
 
 /// Active `EntityFallingSand` instance ticked by `World.cleanUp()`.
@@ -377,14 +388,52 @@ impl Ord for ScheduledTick {
 }
 
 impl World {
-    pub fn new(mut config: WorldConfig) -> Self {
-        let world_dir = PathBuf::from(&config.level_name);
+    pub fn new(config: WorldConfig) -> Self {
+        Self::new_with_dimension(config, 0)
+    }
+
+    /// Create the Nether (`DIM-1`) world. Region files live in
+    /// `<level_name>/DIM-1/region`, exactly like `ServerNBTManager`; the
+    /// `level.dat` and session lock belong to the overworld.
+    pub fn new_nether(config: WorldConfig) -> Self {
+        Self::new_with_dimension(config, -1)
+    }
+
+    pub fn new_with_dimension(mut config: WorldConfig, dimension: i32) -> Self {
+        let level_dir = PathBuf::from(&config.level_name);
+        let world_dir = if dimension == -1 {
+            level_dir.join("DIM-1")
+        } else {
+            level_dir
+        };
+        let is_hell = dimension == -1;
+        if is_hell {
+            // DIM-1 has no level.dat of its own; its spawn is the origin.
+            config.spawn_x = 0;
+            config.spawn_y = 64;
+            config.spawn_z = 0;
+        }
 
         let mut fresh_world = false;
-        let (_session_lock, storage, level_data) = if config.save_enabled {
-            let lock = SessionLock::acquire(&world_dir).ok();
+        let mut lock = None;
+        let mut storage = None;
+        let level = if is_hell {
+            // The Nether never owns `level.dat`; it is constructed with the
+            // overworld seed and default level data. Its world spawn is the
+            // origin (Java DIM-1 level data starts at (0, 64, 0)).
+            fresh_world = true;
+            LevelData {
+                seed: config.seed,
+                spawn_x: 0,
+                spawn_y: 64,
+                spawn_z: 0,
+                level_name: config.level_name.clone(),
+                ..LevelData::default()
+            }
+        } else if config.save_enabled {
+            lock = SessionLock::acquire(&world_dir).ok();
             let loaded = LevelData::load_from_dir(&world_dir).ok().flatten();
-            let level = if let Some(mut lvl) = loaded {
+            if let Some(mut lvl) = loaded {
                 config.seed = lvl.seed;
                 let custom_spawn = config.override_saved_spawn
                     || !config.auto_find_spawn
@@ -411,41 +460,65 @@ impl World {
                     level_name: config.level_name.clone(),
                     ..LevelData::default()
                 }
-            };
-            let cache = RegionFileCache::new(&world_dir);
-            (lock, Some(RefCell::new(cache)), RefCell::new(level))
+            }
         } else {
             fresh_world = true;
-            let level = LevelData {
+            LevelData {
                 seed: config.seed,
                 spawn_x: config.spawn_x,
                 spawn_y: config.spawn_y,
                 spawn_z: config.spawn_z,
                 level_name: config.level_name.clone(),
                 ..LevelData::default()
-            };
-            (None, None, RefCell::new(level))
+            }
         };
+
+        if config.save_enabled {
+            storage = Some(RefCell::new(RegionFileCache::new(&world_dir)));
+        }
 
         let chunk_mgr = RefCell::new(WorldChunkManager::new(config.seed));
         let live = crate::world::live::LiveState::new(config.view_distance);
-        let initial_time = level_data.borrow().time;
+        let initial_time = level.time;
         let world_seed = config.seed;
+        let hell_generator = if is_hell {
+            Some(HellGenerator::new(world_seed))
+        } else {
+            None
+        };
+        let build_pool = |workers: usize, prefix: &str| {
+            if workers == 0 {
+                return None;
+            }
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .thread_name({
+                    let prefix = prefix.to_string();
+                    move |i| format!("{prefix}-{i}")
+                })
+                .build()
+                .ok()
+        };
+        let gen_pool = build_pool(config.gen_workers, "flintcore-gen");
+        let compression_pool = build_pool(config.compression_workers, "flintcore-compress");
 
         Self {
             config,
+            dimension,
+            is_hell,
             allow_nether: true,
             spawning: SpawningConfig::default(),
             worldgen: WorldgenConfig::default(),
             mechanics: MechanicsConfig::default(),
             fixes: FixesConfig::default(),
             world_dir,
+            hell_generator,
             chunks: HashMap::new(),
             packet_cache: RefCell::new(HashMap::new()),
             chunk_mgr,
             storage,
-            level_data,
-            _session_lock,
+            level_data: RefCell::new(level),
+            _session_lock: lock,
             suppress_physics: false,
             insta_tick: false,
             world_random: JavaRandom::new(0),
@@ -472,6 +545,8 @@ impl World {
             tick_random: JavaRandom::new(world_seed ^ 0x5DEECE66D),
             active_detector_rails: HashSet::new(),
             active_pressure_plates: HashSet::new(),
+            gen_pool,
+            compression_pool,
         }
     }
 
@@ -501,6 +576,28 @@ impl World {
 
     pub fn seed(&self) -> i64 {
         self.config.seed
+    }
+
+    /// Java portal search reads every column in a 257x257 square through
+    /// `World.getTypeId`, which synchronously loads (or generates) each chunk
+    /// it touches. The live server's `get_block` resolves missing chunks as
+    /// empty air instead, so a travelling player must prefetch the search
+    /// region before `find_or_create_portal` runs.
+    pub fn ensure_portal_search_chunks(&mut self, x: f64, z: f64) {
+        if !self.live.active {
+            return;
+        }
+        let bx = x.floor() as i32;
+        let bz = z.floor() as i32;
+        let min_cx = (bx - 128) >> 4;
+        let max_cx = (bx + 128) >> 4;
+        let min_cz = (bz - 128) >> 4;
+        let max_cz = (bz + 128) >> 4;
+        for cx in min_cx..=max_cx {
+            for cz in min_cz..=max_cz {
+                self.server_get_chunk_at(ChunkPos::new(cx, cz));
+            }
+        }
     }
 
     pub fn spawn_point(&self) -> (i32, i32, i32) {
@@ -581,14 +678,45 @@ impl World {
 
             let chunk = match loaded_chunk {
                 Some(c) => c,
-                None => {
-                    let seed = self.config.seed;
-                    with_generator(seed, |gen| gen.generate_base(pos.x, pos.z))
-                }
+                None => self.generate_base_chunk_inner(pos),
             };
             self.chunks.insert(pos, chunk);
         }
         self.chunks.get_mut(&pos).unwrap()
+    }
+
+    /// Base generation that does not insert into the chunk map. The Nether
+    /// keeps a per-world `ChunkProviderHell`-equivalent whose RNG state is
+    /// carried across calls.
+    fn generate_base_chunk_inner(&mut self, pos: ChunkPos) -> Chunk {
+        if self.is_hell {
+            let mut generator = self
+                .hell_generator
+                .take()
+                .expect("nether world initialized without a hell generator");
+            let chunk = generator.generate_base(pos.x, pos.z);
+            self.hell_generator = Some(generator);
+            chunk
+        } else {
+            let seed = self.config.seed;
+            with_generator(seed, |gen| gen.generate_base(pos.x, pos.z))
+        }
+    }
+
+    /// Dispatch the populator for the active dimension. The overworld uses the
+    /// thread-local generator (reseeded by `Generator::populate`); the Nether
+    /// continues the stateful `ChunkProviderHell` RNG.
+    pub(crate) fn populate_center(&mut self, pos: ChunkPos) {
+        if self.is_hell {
+            let mut generator = self.hell_generator.take().unwrap();
+            generator.populate(self, pos.x, pos.z);
+            self.hell_generator = Some(generator);
+        } else {
+            let seed = self.config.seed;
+            with_generator(seed, |gen| {
+                gen.populate(self, pos.x, pos.z);
+            });
+        }
     }
 
     pub fn populate_chunk(&mut self, pos: ChunkPos) {
@@ -609,10 +737,7 @@ impl World {
             chunk.state = ChunkState::Populating;
         }
 
-        let seed = self.config.seed;
-        with_generator(seed, |gen| {
-            gen.populate(self, pos.x, pos.z);
-        });
+        self.populate_center(pos);
 
         if let Some(chunk) = self.chunks.get_mut(&pos) {
             chunk.state = ChunkState::Populated;
@@ -627,9 +752,8 @@ impl World {
     /// (dirty), so the chunk is flushed by the world save even when it is
     /// never populated (spawn-search candidates, prep edges).
     pub(crate) fn generate_base_chunk(&mut self, pos: ChunkPos) -> Chunk {
-        let seed = self.config.seed;
-        let mut chunk = with_generator(seed, |gen| gen.generate_base(pos.x, pos.z));
-        if self.live.active {
+        let mut chunk = self.generate_base_chunk_inner(pos);
+        if self.live.active && !self.is_hell {
             // `Chunk.initLighting` runs inside `ChunkProviderGenerate.getOrCreateChunk`
             // before the chunk is inserted into `ChunkProviderServer.chunks`:
             // its `this.c(j, k)` loop queues sky-light updates against already
@@ -705,7 +829,9 @@ impl World {
                 }
             }
             storage.borrow_mut().flush_all()?;
-            self.level_data.borrow_mut().save_to_dir(&self.world_dir)?;
+            if self.dimension == 0 {
+                self.level_data.borrow_mut().save_to_dir(&self.world_dir)?;
+            }
         }
         Ok(())
     }
@@ -726,7 +852,7 @@ impl World {
                     }
                 }
             }
-            if saved > 0 {
+            if saved > 0 && self.dimension == 0 {
                 self.level_data.borrow_mut().save_to_dir(&self.world_dir)?;
             }
         }
@@ -744,14 +870,28 @@ impl World {
             return;
         }
 
+        if self.is_hell {
+            for pos in needed {
+                let chunk = self.generate_base_chunk_inner(pos);
+                self.chunks.insert(pos, chunk);
+            }
+            return;
+        }
+
         let seed = self.config.seed;
-        let generated: Vec<(ChunkPos, Chunk)> = needed
-            .par_iter()
-            .map(|&pos| {
-                let chunk = with_generator(seed, |gen| gen.generate_base(pos.x, pos.z));
-                (pos, chunk)
-            })
-            .collect();
+        let generate = || {
+            needed
+                .par_iter()
+                .map(|&pos| {
+                    let chunk = with_generator(seed, |gen| gen.generate_base(pos.x, pos.z));
+                    (pos, chunk)
+                })
+                .collect::<Vec<(ChunkPos, Chunk)>>()
+        };
+        let generated = match &self.gen_pool {
+            Some(pool) => pool.install(generate),
+            None => generate(),
+        };
 
         for (pos, chunk) in generated {
             self.chunks.insert(pos, chunk);
@@ -794,18 +934,24 @@ impl World {
             chunks.push(chunk);
         }
 
-        chunks
-            .par_iter()
-            .map(|&chunk| {
-                let pre = PreChunk {
-                    x: chunk.pos.x,
-                    z: chunk.pos.z,
-                    mode: true,
-                };
-                let map = MapChunk::from_chunk(chunk)?;
-                Ok((pre, map))
-            })
-            .collect()
+        let compress = || {
+            chunks
+                .par_iter()
+                .map(|&chunk| {
+                    let pre = PreChunk {
+                        x: chunk.pos.x,
+                        z: chunk.pos.z,
+                        mode: true,
+                    };
+                    let map = MapChunk::from_chunk(chunk)?;
+                    Ok((pre, map))
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        match &self.compression_pool {
+            Some(pool) => pool.install(compress),
+            None => compress(),
+        }
     }
 
     pub fn get_block(&self, x: i32, y: i32, z: i32) -> u8 {
@@ -953,21 +1099,39 @@ impl World {
         {
             let chunk = self.chunks.get_mut(&pos).unwrap();
             chunk.set_block(lx, y as usize, lz, id);
-            chunk.set_metadata(lx, y as usize, lz, data);
-            chunk.dirty = true;
+            if !self.fixes.piston_transmutation_fix {
+                chunk.dirty = true;
+            }
         }
         self.packet_cache.borrow_mut().remove(&pos);
 
-        if old_id != 0 {
+        // Poseidon `world.settings.pistons.transmutation-fix.enabled`:
+        // `Chunk.a(i,j,k,l,i1)` normally runs `Block.remove` *after* the new
+        // metadata is stored, so callbacks observe the replacement block's
+        // data. The pre-fix order let a piston mutate the old block after the
+        // replacement type had already been written.
+        if old_id != 0 && !self.fixes.piston_transmutation_fix {
             self.block_remove(old_id, old_data, x, y, z);
         }
 
-        if blocks::light_opacity(id) != 0 {
-            if y >= old_height {
-                self.chunk_height_update(pos.x, pos.z, lx, y + 1, lz);
+        {
+            let chunk = self.chunks.get_mut(&pos).unwrap();
+            chunk.set_metadata(lx, y as usize, lz, data);
+            chunk.dirty = true;
+        }
+
+        if old_id != 0 && self.fixes.piston_transmutation_fix {
+            self.block_remove(old_id, old_data, x, y, z);
+        }
+
+        if !self.is_hell {
+            if blocks::light_opacity(id) != 0 {
+                if y >= old_height {
+                    self.chunk_height_update(pos.x, pos.z, lx, y + 1, lz);
+                }
+            } else if y == old_height - 1 {
+                self.chunk_height_update(pos.x, pos.z, lx, y, lz);
             }
-        } else if y == old_height - 1 {
-            self.chunk_height_update(pos.x, pos.z, lx, y, lz);
         }
 
         if live_active {
@@ -1870,6 +2034,10 @@ impl World {
         i1: i32,
         j1: i32,
     ) {
+        // Java `World.a(...).a(...)`: the Nether has no sky light at all.
+        if self.is_hell && kind == LightType::Sky {
+            return;
+        }
         self.light_schedule_depth += 1;
         if self.light_schedule_depth < 50 {
             let k1 = (l + i) / 2;
@@ -1909,6 +2077,9 @@ impl World {
 
     /// Java `World.a(EnumSkyBlock, int i, int j, int k, int l)` (lines 576-596).
     fn java_check_neighbor_light(&mut self, kind: LightType, i: i32, j: i32, k: i32, mut l: i32) {
+        if self.is_hell && kind == LightType::Sky {
+            return;
+        }
         if !(0..CHUNK_HEIGHT as i32).contains(&j) {
             return;
         }
@@ -2443,7 +2614,9 @@ impl World {
     #[allow(clippy::if_same_then_else)]
     pub fn java_fluid_tick(&mut self, x: i32, y: i32, z: i32, random: &mut JavaRandom, lava: bool) {
         let this_id = if lava { blocks::LAVA } else { blocks::WATER };
-        let b0: i32 = if lava { 2 } else { 1 };
+        // `BlockFlowing` constructor: lava in the Nether spreads with step 1
+        // (`worldProvider.d` = isHell) instead of the overworld's 2.
+        let b0: i32 = if lava && !self.is_hell { 2 } else { 1 };
         let mut l = self.fluid_data_at(x, y, z, lava);
         trace_fa!(x, y, z, this_id as i32, l);
         let mut flag = true;

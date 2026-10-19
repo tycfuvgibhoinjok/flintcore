@@ -4,7 +4,7 @@ use crate::gameplay::blocks;
 use crate::util::noise::OctavesNoise;
 use crate::util::rng::JavaRandom;
 use crate::world::biome::{Biome, TreeKind, WorldChunkManager};
-use crate::world::caves::MapGenCaves;
+use crate::world::caves::{MapGenCaves, MapGenCavesHell};
 use crate::world::chunk::{Chunk, ChunkPos, CHUNK_HEIGHT, CHUNK_WIDTH};
 use crate::world::decorate::{self, GenWorld};
 
@@ -737,6 +737,416 @@ impl Generator {
             {
                 world.set_block_physics(k2, l2, i3, blocks::LOCKED_CHEST);
             }
+        }
+    }
+}
+
+/// Java `ChunkProviderHell`: Nether (`DIM-1`, `dimension = -1`) chunk generator and populator.
+pub struct HellGenerator {
+    seed: i64,
+    random: JavaRandom,
+    noise_i: OctavesNoise,
+    noise_j: OctavesNoise,
+    noise_k: OctavesNoise,
+    noise_l: OctavesNoise,
+    noise_m: OctavesNoise,
+    noise_a: OctavesNoise,
+    noise_b: OctavesNoise,
+    caves: MapGenCavesHell,
+}
+
+impl HellGenerator {
+    pub fn new(seed: i64) -> Self {
+        let mut random = JavaRandom::new(seed);
+        let noise_i = OctavesNoise::new(&mut random, 16);
+        let noise_j = OctavesNoise::new(&mut random, 16);
+        let noise_k = OctavesNoise::new(&mut random, 8);
+        let noise_l = OctavesNoise::new(&mut random, 4);
+        let noise_m = OctavesNoise::new(&mut random, 4);
+        let noise_a = OctavesNoise::new(&mut random, 10);
+        let noise_b = OctavesNoise::new(&mut random, 16);
+
+        Self {
+            seed,
+            random,
+            noise_i,
+            noise_j,
+            noise_k,
+            noise_l,
+            noise_m,
+            noise_a,
+            noise_b,
+            caves: MapGenCavesHell::new(),
+        }
+    }
+
+    pub fn seed(&self) -> i64 {
+        self.seed
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn initialize_noise_field(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        size_x: usize,
+        size_y: usize,
+        size_z: usize,
+    ) -> Vec<f64> {
+        let d0 = 684.412;
+        let d1 = 2053.236;
+
+        let f = self.noise_a.noise_array(
+            x as f64, y as f64, z as f64, size_x, 1, size_z, 1.0, 0.0, 1.0,
+        );
+        let g = self.noise_b.noise_array(
+            x as f64, y as f64, z as f64, size_x, 1, size_z, 100.0, 0.0, 100.0,
+        );
+        let c = self.noise_k.noise_array(
+            x as f64,
+            y as f64,
+            z as f64,
+            size_x,
+            size_y,
+            size_z,
+            d0 / 80.0,
+            d1 / 60.0,
+            d0 / 80.0,
+        );
+        let d = self.noise_i.noise_array(
+            x as f64, y as f64, z as f64, size_x, size_y, size_z, d0, d1, d0,
+        );
+        let e = self.noise_j.noise_array(
+            x as f64, y as f64, z as f64, size_x, size_y, size_z, d0, d1, d0,
+        );
+
+        let mut adouble1 = vec![0.0f64; size_y];
+        for i2 in 0..size_y {
+            adouble1[i2] = (i2 as f64 * std::f64::consts::PI * 6.0 / size_y as f64).cos() * 2.0;
+            let mut d2 = i2 as f64;
+            if i2 > size_y / 2 {
+                d2 = (size_y - 1 - i2) as f64;
+            }
+            if d2 < 4.0 {
+                d2 = 4.0 - d2;
+                adouble1[i2] -= d2 * d2 * d2 * 10.0;
+            }
+        }
+
+        let mut out = vec![0.0f64; size_x * size_y * size_z];
+        let mut k1 = 0usize;
+        let mut l1 = 0usize;
+
+        for _i2 in 0..size_x {
+            for _j2 in 0..size_z {
+                let mut d3 = (f[l1] + 256.0) / 512.0;
+                if d3 > 1.0 {
+                    d3 = 1.0;
+                }
+                let d4 = 0.0f64;
+                let mut d5 = g[l1] / 8000.0;
+                if d5 < 0.0 {
+                    d5 = -d5;
+                }
+                d5 = d5 * 3.0 - 3.0;
+                if d5 < 0.0 {
+                    d5 /= 2.0;
+                    if d5 < -1.0 {
+                        d5 = -1.0;
+                    }
+                    d5 /= 1.4;
+                    d5 /= 2.0;
+                    d3 = 0.0;
+                } else {
+                    if d5 > 1.0 {
+                        d5 = 1.0;
+                    }
+                    d5 /= 6.0;
+                }
+                let _ = (d3 + 0.5, d5 * size_y as f64 / 16.0);
+                l1 += 1;
+
+                for k2 in 0..size_y {
+                    let d7 = adouble1[k2];
+                    let d8 = d[k1] / 512.0;
+                    let d9 = e[k1] / 512.0;
+                    let d10 = (c[k1] / 10.0 + 1.0) / 2.0;
+
+                    let mut d6 = if d10 < 0.0 {
+                        d8
+                    } else if d10 > 1.0 {
+                        d9
+                    } else {
+                        d8 + (d9 - d8) * d10
+                    };
+                    d6 -= d7;
+
+                    if k2 > size_y - 4 {
+                        let d11 = ((k2 - (size_y - 4)) as f32 / 3.0f32) as f64;
+                        d6 = d6 * (1.0 - d11) + -10.0 * d11;
+                    }
+                    if (k2 as f64) < d4 {
+                        let d11 = ((d4 - k2 as f64) / 4.0).clamp(0.0, 1.0);
+                        d6 = d6 * (1.0 - d11) + -10.0 * d11;
+                    }
+
+                    out[k1] = d6;
+                    k1 += 1;
+                }
+            }
+        }
+
+        out
+    }
+
+    fn shape_terrain(&self, chunk_x: i32, chunk_z: i32, blocks: &mut [u8]) {
+        let b0 = 4usize;
+        let b1 = 32usize;
+        let k = b0 + 1;
+        let b2 = 17usize;
+        let l = b0 + 1;
+
+        let density =
+            self.initialize_noise_field(chunk_x * b0 as i32, 0, chunk_z * b0 as i32, k, b2, l);
+
+        for i1 in 0..b0 {
+            for j1 in 0..b0 {
+                for k1 in 0..16usize {
+                    let d0 = 0.125;
+                    let mut d1 = density[((i1) * l + j1) * b2 + k1];
+                    let mut d2 = density[((i1) * l + j1 + 1) * b2 + k1];
+                    let mut d3 = density[((i1 + 1) * l + j1) * b2 + k1];
+                    let mut d4 = density[((i1 + 1) * l + j1 + 1) * b2 + k1];
+                    let d5 = (density[((i1) * l + j1) * b2 + k1 + 1] - d1) * d0;
+                    let d6 = (density[((i1) * l + j1 + 1) * b2 + k1 + 1] - d2) * d0;
+                    let d7 = (density[((i1 + 1) * l + j1) * b2 + k1 + 1] - d3) * d0;
+                    let d8 = (density[((i1 + 1) * l + j1 + 1) * b2 + k1 + 1] - d4) * d0;
+
+                    for l1 in 0..8usize {
+                        let d9 = 0.25;
+                        let mut d10 = d1;
+                        let mut d11 = d2;
+                        let d12 = (d3 - d1) * d9;
+                        let d13 = (d4 - d2) * d9;
+
+                        for i2 in 0..4usize {
+                            let mut j2 = ((i2 + i1 * 4) << 11) | ((j1 * 4) << 7) | (k1 * 8 + l1);
+                            let short1 = 128usize;
+                            let d14 = 0.25;
+                            let mut d15 = d10;
+                            let d16 = (d11 - d10) * d14;
+
+                            for _k2 in 0..4usize {
+                                let mut l2 = blocks::AIR;
+                                if k1 * 8 + l1 < b1 {
+                                    l2 = blocks::STATIONARY_LAVA;
+                                }
+                                if d15 > 0.0 {
+                                    l2 = blocks::NETHERRACK;
+                                }
+                                blocks[j2] = l2;
+                                j2 += short1;
+                                d15 += d16;
+                            }
+
+                            d10 += d12;
+                            d11 += d13;
+                        }
+
+                        d1 += d5;
+                        d2 += d6;
+                        d3 += d7;
+                        d4 += d8;
+                    }
+                }
+            }
+        }
+    }
+
+    // Java `ChunkProviderHell.replaceSurface` intentionally writes bedrock from
+    // both the top and bottom checks with identical bodies.
+    #[allow(clippy::if_same_then_else)]
+    fn replace_surface(&mut self, chunk_x: i32, chunk_z: i32, blocks: &mut [u8]) {
+        let b0 = 64i32;
+        let d0 = 0.03125;
+
+        let p = self.noise_l.noise_array(
+            (chunk_x * 16) as f64,
+            (chunk_z * 16) as f64,
+            0.0,
+            16,
+            16,
+            1,
+            d0,
+            d0,
+            1.0,
+        );
+        let q = self.noise_l.noise_array(
+            (chunk_x * 16) as f64,
+            109.0134,
+            (chunk_z * 16) as f64,
+            16,
+            1,
+            16,
+            d0,
+            1.0,
+            d0,
+        );
+        let r = self.noise_m.noise_array(
+            (chunk_x * 16) as f64,
+            (chunk_z * 16) as f64,
+            0.0,
+            16,
+            16,
+            1,
+            d0 * 2.0,
+            d0 * 2.0,
+            d0 * 2.0,
+        );
+
+        for k in 0..16usize {
+            for l in 0..16usize {
+                let flag = p[k + l * 16] + self.random.next_f64() * 0.2 > 0.0;
+                let flag1 = q[k + l * 16] + self.random.next_f64() * 0.2 > 0.0;
+                let i1 = (r[k + l * 16] / 3.0 + 3.0 + self.random.next_f64() * 0.25) as i32;
+                let mut j1 = -1i32;
+                let mut b1 = blocks::NETHERRACK;
+                let mut b2 = blocks::NETHERRACK;
+
+                for k1 in (0..128i32).rev() {
+                    let l1 = (l * 16 + k) * 128 + k1 as usize;
+                    if k1 >= 127 - self.random.next_i32_bound(5) {
+                        blocks[l1] = blocks::BEDROCK;
+                    } else if k1 <= self.random.next_i32_bound(5) {
+                        blocks[l1] = blocks::BEDROCK;
+                    } else {
+                        let b3 = blocks[l1];
+                        if b3 == blocks::AIR {
+                            j1 = -1;
+                        } else if b3 == blocks::NETHERRACK {
+                            if j1 == -1 {
+                                if i1 <= 0 {
+                                    b1 = blocks::AIR;
+                                    b2 = blocks::NETHERRACK;
+                                } else if k1 >= b0 - 4 && k1 <= b0 + 1 {
+                                    b1 = blocks::NETHERRACK;
+                                    b2 = blocks::NETHERRACK;
+                                    if flag1 {
+                                        b1 = blocks::GRAVEL;
+                                    }
+                                    if flag1 {
+                                        b2 = blocks::NETHERRACK;
+                                    }
+                                    if flag {
+                                        b1 = blocks::SOUL_SAND;
+                                    }
+                                    if flag {
+                                        b2 = blocks::SOUL_SAND;
+                                    }
+                                }
+
+                                if k1 < b0 && b1 == blocks::AIR {
+                                    b1 = blocks::STATIONARY_LAVA;
+                                }
+
+                                j1 = i1;
+                                if k1 >= b0 - 1 {
+                                    blocks[l1] = b1;
+                                } else {
+                                    blocks[l1] = b2;
+                                }
+                            } else if j1 > 0 {
+                                j1 -= 1;
+                                blocks[l1] = b2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn generate_base(&mut self, chunk_x: i32, chunk_z: i32) -> Chunk {
+        let chunk_seed = (chunk_x as i64)
+            .wrapping_mul(CHUNK_SEED_X)
+            .wrapping_add((chunk_z as i64).wrapping_mul(CHUNK_SEED_Z));
+        self.random.set_seed(chunk_seed);
+
+        let mut raw = vec![0u8; BLOCKS];
+        self.shape_terrain(chunk_x, chunk_z, &mut raw);
+        self.replace_surface(chunk_x, chunk_z, &mut raw);
+        self.caves.generate(self.seed, chunk_x, chunk_z, &mut raw);
+
+        // Java `ChunkProviderHell.getOrCreateChunk`: `new Chunk(world, abyte, i, j)`.
+        // The byte-array constructor does NOT call `initLighting`; the height map
+        // starts at zero and the sky/block light nibbles stay at zero.
+        let mut chunk = Chunk::new(ChunkPos::new(chunk_x, chunk_z));
+        for x in 0..CHUNK_WIDTH {
+            for z in 0..CHUNK_WIDTH {
+                for y in 0..CHUNK_HEIGHT {
+                    let id = raw[block_index(x, y, z)];
+                    if id != blocks::AIR {
+                        chunk.set_block(x, y, z, id);
+                    }
+                }
+            }
+        }
+        chunk.state = crate::world::chunk::ChunkState::Generated;
+        chunk
+    }
+
+    /// Java `ChunkProviderHell.getChunkAt(IChunkProvider, int i, int j)`.
+    /// Note that `ChunkProviderHell.getChunkAt` does NOT re-seed `this.h` (`self.random`);
+    /// it continues from whatever state `self.random` was left in.
+    pub fn populate(&mut self, world: &mut dyn GenWorld, chunk_x: i32, chunk_z: i32) {
+        let k = chunk_x * 16;
+        let l = chunk_z * 16;
+
+        for _ in 0..8 {
+            let j1 = k + self.random.next_i32_bound(16) + 8;
+            let k1 = self.random.next_i32_bound(120) + 4;
+            let l1 = l + self.random.next_i32_bound(16) + 8;
+            decorate::generate_hell_lava(world, &mut self.random, j1, k1, l1, blocks::LAVA);
+        }
+
+        let fire_bound = self.random.next_i32_bound(10) + 1;
+        let i1 = self.random.next_i32_bound(fire_bound) + 1;
+        for _ in 0..i1 {
+            let k1 = k + self.random.next_i32_bound(16) + 8;
+            let l1 = self.random.next_i32_bound(120) + 4;
+            let i2 = l + self.random.next_i32_bound(16) + 8;
+            decorate::generate_fire(world, &mut self.random, k1, l1, i2);
+        }
+
+        let glow_bound = self.random.next_i32_bound(10) + 1;
+        let i1 = self.random.next_i32_bound(glow_bound);
+        for _ in 0..i1 {
+            let k1 = k + self.random.next_i32_bound(16) + 8;
+            let l1 = self.random.next_i32_bound(120) + 4;
+            let i2 = l + self.random.next_i32_bound(16) + 8;
+            decorate::generate_glowstone(world, &mut self.random, k1, l1, i2);
+        }
+
+        for _ in 0..10 {
+            let k1 = k + self.random.next_i32_bound(16) + 8;
+            let l1 = self.random.next_i32_bound(128);
+            let i2 = l + self.random.next_i32_bound(16) + 8;
+            decorate::generate_glowstone(world, &mut self.random, k1, l1, i2);
+        }
+
+        if self.random.next_i32_bound(1) == 0 {
+            let j1 = k + self.random.next_i32_bound(16) + 8;
+            let k1 = self.random.next_i32_bound(128);
+            let l1 = l + self.random.next_i32_bound(16) + 8;
+            decorate::generate_flowers(world, &mut self.random, j1, k1, l1, blocks::BROWN_MUSHROOM);
+        }
+
+        if self.random.next_i32_bound(1) == 0 {
+            let j1 = k + self.random.next_i32_bound(16) + 8;
+            let k1 = self.random.next_i32_bound(128);
+            let l1 = l + self.random.next_i32_bound(16) + 8;
+            decorate::generate_flowers(world, &mut self.random, j1, k1, l1, blocks::RED_MUSHROOM);
         }
     }
 }

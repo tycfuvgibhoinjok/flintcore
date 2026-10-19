@@ -56,6 +56,12 @@ pub struct Server {
     entities: EntityStore,
     tracker: EntityTracker,
     world: World,
+    /// Java `MinecraftServer.worlds` dimension -1 entry.
+    nether: Option<World>,
+    /// Which dimension currently occupies `self.world` (0 or -1). Packet
+    /// handlers swap the two worlds so the huge body of gameplay code keeps
+    /// operating on `self.world` unchanged.
+    active_dimension: i32,
     player_store: crate::world::storage::PlayerStore,
     commands: CommandMap,
     plugin_manager: PluginManager,
@@ -78,6 +84,7 @@ impl Server {
     ) -> Self {
         let mut world = World::new(config.world.clone());
         world.allow_nether = config.server.allow_nether;
+        world.live.keep_spawn_in_memory = config.world.keep_spawn_in_memory;
         world.spawning = config.spawning.clone();
         world.worldgen = config.worldgen.clone();
         world.mechanics = config.mechanics.clone();
@@ -140,6 +147,31 @@ impl Server {
         }
         let player_store = crate::world::storage::PlayerStore::new(world.world_dir());
         let view_distance = config.world.view_distance;
+
+        // Java `MinecraftServer`: the Nether world is created up front when
+        // `allow-nether` is enabled. Its seed must match the (possibly
+        // level.dat-loaded) overworld seed.
+        let nether = if config.server.allow_nether {
+            let mut nconfig = config.world.clone();
+            nconfig.seed = world.seed();
+            let mut nether = World::new_nether(nconfig);
+            nether.allow_nether = true;
+            nether.live.keep_spawn_in_memory = config.world.keep_spawn_in_memory;
+            nether.spawning = config.spawning.clone();
+            nether.worldgen = config.worldgen.clone();
+            nether.mechanics = config.mechanics.clone();
+            nether.fixes = config.fixes.clone();
+            // Beta shares the overworld's world time with DIM-1.
+            let world_time = world.world_time();
+            nether.live_time = world_time;
+            nether.level_data.borrow_mut().time = world_time;
+            if config.world.save_enabled {
+                nether.live_enable();
+            }
+            Some(nether)
+        } else {
+            None
+        };
         let whitelist_enabled = config.server.white_list;
         let ops = Self::load_list_file("ops.txt");
         let banned_players = Self::load_list_file("banned-players.txt");
@@ -154,6 +186,8 @@ impl Server {
             entities: EntityStore::new(),
             tracker: EntityTracker::new(view_distance),
             world,
+            nether,
+            active_dimension: 0,
             player_store,
             commands: CommandMap::new(),
             plugin_manager: PluginManager::new(),
@@ -224,6 +258,11 @@ impl Server {
                 let _ = self.player_store.save_player(player);
             }
             let _ = self.world.save_all();
+            if self.nether.is_some() {
+                self.with_dimension(-1, |s| {
+                    let _ = s.world.save_all();
+                });
+            }
         }
 
         log::info("simulation thread stopped");
@@ -254,6 +293,36 @@ impl Server {
             self.world.live_time = self.world.live_time.wrapping_add(extra);
             self.world.level_data.borrow_mut().time = self.world.live_time;
         }
+
+        // Tick the Nether's world-level machinery (scheduled block/fluid ticks,
+        // lighting, furnaces, random blocks) with its world active.
+        let overworld_time = self.world.world_time();
+        if self.nether.is_some() {
+            self.with_dimension(-1, |s| {
+                if s.world.live_is_active() {
+                    s.world.live_tick();
+                } else {
+                    s.world.increment_time();
+                }
+                // Keep the Nether clock in lockstep with the overworld.
+                s.world.live_time = overworld_time;
+                s.world.level_data.borrow_mut().time = overworld_time;
+                s.world.tick_furnaces();
+                let nether_players: Vec<(f64, f64)> = s
+                    .entities
+                    .iter_players()
+                    .filter(|p| p.dimension == -1 && !p.dead)
+                    .map(|p| (p.x, p.z))
+                    .collect();
+                if !nether_players.is_empty() {
+                    s.world.tick_random_blocks(&nether_players);
+                }
+                s.process_world_events();
+                s.world.flush_pending_piston_syncs();
+                while s.world.java_do_lighting() {}
+            });
+        }
+
         self.drain_inbound();
 
         // Incremental auto-save (`ChunkProviderServer.saveChunks(false, null)` — up to 24 dirty chunks)
@@ -261,6 +330,11 @@ impl Server {
         if ticks > 0 && self.config.world.save_enabled && autosave_ticks > 0 {
             if ticks % 100 == 0 {
                 let _ = self.world.save_chunks_incremental(24);
+                if self.nether.is_some() {
+                    self.with_dimension(-1, |s| {
+                        let _ = s.world.save_chunks_incremental(24);
+                    });
+                }
             }
             let player_save_every = autosave_ticks.min(1200);
             if self.config.server.save_playerdata && ticks % player_save_every == 0 {
@@ -282,13 +356,19 @@ impl Server {
         // Tick furnaces and sync open furnace windows
         self.world.tick_furnaces();
         self.sync_open_containers();
+        if self.nether.is_some() {
+            self.with_dimension(-1, |s| s.sync_open_containers());
+        }
         self.tick_held_maps(ticks);
+        if self.nether.is_some() {
+            self.with_dimension(-1, |s| s.tick_held_maps(ticks));
+        }
 
         // Random block ticks (grass, crops, saplings, reeds, leaves, ice/snow) when players online
         let player_xz: Vec<(f64, f64)> = self
             .entities
             .iter_players()
-            .filter(|p| !p.dead)
+            .filter(|p| !p.dead && p.dimension == 0)
             .map(|p| (p.x, p.z))
             .collect();
         if !player_xz.is_empty() {
@@ -300,12 +380,32 @@ impl Server {
             player.tick();
         }
         self.tick_player_environmental_damage();
+        if self.nether.is_some() {
+            self.with_dimension(-1, |s| s.tick_player_environmental_damage());
+        }
         self.tick_deferred_digging();
+        if self.nether.is_some() {
+            self.with_dimension(-1, |s| s.tick_deferred_digging());
+        }
+        self.tick_player_portals();
         self.tick_pressure_plates_and_beds();
+        if self.nether.is_some() {
+            self.with_dimension(-1, |s| s.tick_pressure_plates_and_beds());
+        }
 
         // Natural mob spawning every 20 ticks (`SpawnerCreature.spawnEntities`)
-        if ticks % 20 == 0 && self.world.live_is_active() {
-            self.tick_mob_spawner();
+        if ticks % 20 == 0 {
+            if self.world.live_is_active() {
+                self.tick_mob_spawner();
+            }
+            if self.nether.is_some()
+                && self
+                    .nether
+                    .as_ref()
+                    .is_some_and(|nether| nether.live_is_active())
+            {
+                self.with_dimension(-1, |s| s.tick_mob_spawner());
+            }
         }
         self.tick_mob_spawners();
 
@@ -322,12 +422,35 @@ impl Server {
         self.process_world_events();
         self.world.flush_pending_piston_syncs();
 
+        // Nether entity simulation. `active_dimension` makes each tick routine
+        // only consider entities tagged with this dimension.
+        if self.nether.is_some() {
+            self.with_dimension(-1, |s| {
+                s.tick_mob_spawners();
+                s.tick_boats();
+                s.tick_mobs();
+                s.tick_projectiles();
+                s.tick_primed_tnts();
+                s.tick_minecarts();
+                if ticks % 100 == 0 {
+                    s.tick_paintings();
+                }
+                s.tick_dropped_items();
+                s.process_world_events();
+                s.world.flush_pending_piston_syncs();
+                while s.world.java_do_lighting() {}
+            });
+        }
+
         while self.world.java_do_lighting() {}
         if ticks % 200 == 0 {
             self.world.compact_dirty_light_chunks();
         }
 
         self.flush_dirty_chunks();
+        if self.nether.is_some() {
+            self.with_dimension(-1, |s| s.flush_dirty_chunks());
+        }
         self.stream_chunks();
 
         // Tick entity tracking every 2 ticks (mirroring Poseidon EntityTracker)
@@ -367,14 +490,66 @@ impl Server {
     }
 
     fn run_tracker_tick(&mut self) {
-        let mut players: Vec<_> = self.entities.iter_players().cloned().collect();
-        let mut items: Vec<_> = self.entities.iter_dropped_items().cloned().collect();
-        let mut boats: Vec<_> = self.entities.iter_boats().cloned().collect();
-        let mut mobs: Vec<_> = self.entities.iter_mobs().cloned().collect();
-        let mut projectiles: Vec<_> = self.entities.iter_projectiles().cloned().collect();
-        let mut tnts: Vec<_> = self.entities.iter_primed_tnts().cloned().collect();
-        let mut minecarts: Vec<_> = self.entities.iter_minecarts().cloned().collect();
-        let paintings: Vec<_> = self.entities.iter_paintings().cloned().collect();
+        let dimensions: Vec<i32> = if self.nether.is_some() {
+            vec![0, -1]
+        } else {
+            vec![0]
+        };
+        for dimension in dimensions {
+            self.with_dimension(dimension, |s| s.run_tracker_tick_inner());
+        }
+    }
+
+    fn run_tracker_tick_inner(&mut self) {
+        let active_dimension = self.active_dimension;
+        let mut players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
+        let mut items: Vec<_> = self
+            .entities
+            .iter_dropped_items()
+            .filter(|e| self.entities.dimension_of(e.entity_id) == active_dimension)
+            .cloned()
+            .collect();
+        let mut boats: Vec<_> = self
+            .entities
+            .iter_boats()
+            .filter(|e| self.entities.dimension_of(e.entity_id) == active_dimension)
+            .cloned()
+            .collect();
+        let mut mobs: Vec<_> = self
+            .entities
+            .iter_mobs()
+            .filter(|e| self.entities.dimension_of(e.entity_id) == active_dimension)
+            .cloned()
+            .collect();
+        let mut projectiles: Vec<_> = self
+            .entities
+            .iter_projectiles()
+            .filter(|e| self.entities.dimension_of(e.entity_id) == active_dimension)
+            .cloned()
+            .collect();
+        let mut tnts: Vec<_> = self
+            .entities
+            .iter_primed_tnts()
+            .filter(|e| self.entities.dimension_of(e.entity_id) == active_dimension)
+            .cloned()
+            .collect();
+        let mut minecarts: Vec<_> = self
+            .entities
+            .iter_minecarts()
+            .filter(|e| self.entities.dimension_of(e.entity_id) == active_dimension)
+            .cloned()
+            .collect();
+        let paintings: Vec<_> = self
+            .entities
+            .iter_paintings()
+            .filter(|e| self.entities.dimension_of(e.entity_id) == active_dimension)
+            .cloned()
+            .collect();
 
         let tracking_packets = self.tracker.tick_world(
             &mut players,
@@ -402,8 +577,15 @@ impl Server {
         }
 
         for outbound in tracking_packets {
-            if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                self.send(target.conn_id, outbound.packet);
+            self.send_tracked(outbound.recipient_id, outbound.packet);
+        }
+    }
+
+    fn send_tracked(&mut self, recipient_id: i32, packet: Clientbound) {
+        let active_dimension = self.active_dimension;
+        if let Some(target) = self.entities.get_player(recipient_id) {
+            if target.dimension == active_dimension {
+                self.send(target.conn_id, packet);
             }
         }
     }
@@ -445,21 +627,63 @@ impl Server {
                 );
             }
             NetEvent::Packet { id, packet } => self.handle_packet(id, packet),
+            NetEvent::LegacyPing { id } => self.handle_legacy_ping(id),
             NetEvent::Disconnected { id } => {
                 self.remove_and_handle_disconnect(id);
             }
         }
     }
 
+    /// Answer the pre-1.7 `0xFE` server-list ping. The wire format of
+    /// `Packet0xFF` is exactly `motd§online§max`; Beta 1.7.3 expects the
+    /// unversioned three-field response.
+    fn handle_legacy_ping(&mut self, id: ConnId) {
+        let Some(connection) = self.connections.get(&id) else {
+            return;
+        };
+        if connection.state != ConnectionState::Handshaking {
+            return;
+        }
+        let max_players = self.config.server.max_players;
+        let online = self.entities.player_count().min(max_players as usize);
+        let mut response = format!(
+            "{}\u{00A7}{}\u{00A7}{}",
+            self.config.server.motd, online, max_players
+        );
+        // `Packet0xFF` caps strings at 100 UTF-16 code units.
+        while response.encode_utf16().count() > 100 {
+            response.pop();
+        }
+        let _ = connection
+            .sender
+            .send(Outbound::Packet(Clientbound::KickDisconnect(
+                KickDisconnect { reason: response },
+            )));
+        let _ = connection.sender.send(Outbound::Close);
+    }
+
     fn remove_and_handle_disconnect(&mut self, id: ConnId) {
         if let Some(conn) = self.connections.remove(&id) {
-            self.close_player_container_and_drop_transient(id, false);
-            if let Some(p) = self.entities.get_by_conn(id) {
-                let eid = p.entity_id;
-                self.dismount_player(eid);
-            }
+            let dimension = self
+                .entities
+                .get_by_conn(id)
+                .map(|p| p.dimension)
+                .unwrap_or(0);
+            self.with_dimension(dimension, |s| {
+                s.close_player_container_and_drop_transient(id, false);
+                if let Some(p) = s.entities.get_by_conn(id) {
+                    let eid = p.entity_id;
+                    s.dismount_player(eid);
+                }
+            });
             if let Some(player) = self.entities.remove_by_conn(id) {
-                if self.world.live_is_active() {
+                if self.nether.is_some() {
+                    self.with_dimension(dimension, |s| {
+                        if s.world.live_is_active() {
+                            s.world.live_player_quit(id);
+                        }
+                    });
+                } else if self.world.live_is_active() {
                     self.world.live_player_quit(id);
                 }
                 if self.config.world.save_enabled && self.config.server.save_playerdata {
@@ -469,7 +693,9 @@ impl Server {
                 let untrack_packets = self.tracker.untrack_player(player.entity_id);
                 for outbound in untrack_packets {
                     if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                        self.send(target.conn_id, outbound.packet);
+                        if target.dimension == dimension {
+                            self.send(target.conn_id, outbound.packet);
+                        }
                     }
                 }
 
@@ -497,7 +723,40 @@ impl Server {
         }
     }
 
+    /// Run `f` with the requested dimension's `World` occupying `self.world`.
+    /// The server is single-threaded, so a swap is indistinguishable from
+    /// having per-dimension world fields for the duration of a packet handler.
+    fn with_dimension<R>(&mut self, dimension: i32, f: impl FnOnce(&mut Self) -> R) -> R {
+        if self.nether.is_none()
+            || dimension == self.active_dimension
+            || !matches!(dimension, 0 | -1)
+        {
+            return f(self);
+        }
+        let previous_spawn_dimension = self.entities.spawn_dimension;
+        let previous_active_dimension = self.active_dimension;
+        self.entities.spawn_dimension = dimension;
+        std::mem::swap(&mut self.world, self.nether.as_mut().unwrap());
+        self.active_dimension = dimension;
+        let result = f(self);
+        std::mem::swap(&mut self.world, self.nether.as_mut().unwrap());
+        // Restore the *previous* dimension: `with_dimension` nests (the Nether
+        // tick calls `with_dimension(0, ...)` while the Nether is active).
+        self.active_dimension = previous_active_dimension;
+        self.entities.spawn_dimension = previous_spawn_dimension;
+        result
+    }
+
     fn handle_packet(&mut self, id: ConnId, packet: Serverbound) {
+        let dimension = self
+            .entities
+            .get_by_conn(id)
+            .map(|p| p.dimension)
+            .unwrap_or(0);
+        self.with_dimension(dimension, |s| s.handle_packet_inner(id, packet));
+    }
+
+    fn handle_packet_inner(&mut self, id: ConnId, packet: Serverbound) {
         match packet {
             Serverbound::Handshake(handshake) => {
                 let server_id = if self.config.server.online_mode {
@@ -853,6 +1112,15 @@ impl Server {
     }
 
     fn update_player_view_chunks(&mut self, id: ConnId) {
+        let dimension = self
+            .entities
+            .get_by_conn(id)
+            .map(|p| p.dimension)
+            .unwrap_or(0);
+        self.with_dimension(dimension, |s| s.update_player_view_chunks_inner(id));
+    }
+
+    fn update_player_view_chunks_inner(&mut self, id: ConnId) {
         if self.world.live_is_active() {
             let (cur_x, cur_z) = match self.entities.get_by_conn(id) {
                 Some(p) => (p.x, p.z),
@@ -983,9 +1251,11 @@ impl Server {
             }
 
             // Evict chunks far from all players when save_enabled == false
+            let active_dimension = self.active_dimension;
             let player_centers: Vec<(i32, i32)> = self
                 .entities
                 .iter_players()
+                .filter(|p| p.dimension == active_dimension)
                 .map(|p| ((p.x as i32) >> 4, (p.z as i32) >> 4))
                 .collect();
             let keep_dist = view_dist + 3;
@@ -1075,9 +1345,7 @@ impl Server {
                     let _ = self.entities.remove_boat(target_id);
                     let untrack = self.tracker.untrack_boat(target_id);
                     for outbound in untrack {
-                        if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                            self.send(target.conn_id, outbound.packet);
-                        }
+                        self.send_tracked(outbound.recipient_id, outbound.packet);
                     }
                     if self.config.mechanics.boats_drop_boat_not_wood {
                         self.spawn_dropped_item_random(
@@ -1159,9 +1427,7 @@ impl Server {
             if use_entity.attack {
                 if let Some(p) = self.entities.remove_painting(target_id) {
                     for outbound in self.tracker.untrack_painting(target_id) {
-                        if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                            self.send(target.conn_id, outbound.packet);
-                        }
+                        self.send_tracked(outbound.recipient_id, outbound.packet);
                     }
                     self.spawn_dropped_item_random(
                         p.x as f64 + 0.5,
@@ -1648,8 +1914,13 @@ impl Server {
     }
 
     fn tick_deferred_digging(&mut self) {
+        let active_dimension = self.active_dimension;
         let mut ready_breaks = Vec::new();
-        for player in self.entities.iter_players() {
+        for player in self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+        {
             if let Some(pending) = &player.pending_dig {
                 let block_id = self.world.get_block(pending.x, pending.y, pending.z);
                 if block_id != blocks::AIR {
@@ -2329,7 +2600,45 @@ impl Server {
                 true
             }
             blocks::BED => {
+                if self.world.is_hell && self.config.mechanics.nether_bed_explode {
+                    // Java `BlockBed.interact` (`BlockBed.java:35-53`): the bed
+                    // is removed and a power-5 explosion is created at the
+                    // (possibly second) head block.
+                    let directions = [(0, 1), (-1, 0), (0, -1), (1, 0)];
+                    let mut bx = x;
+                    let mut bz = z;
+                    let mut data = self.world.get_data(x, y, z);
+                    if (data & 8) == 0 {
+                        let (dx, dz) = directions[(data & 3) as usize];
+                        bx += dx;
+                        bz += dz;
+                        if self.world.get_block(bx, y, bz) != blocks::BED {
+                            return true;
+                        }
+                        data = self.world.get_data(bx, y, bz);
+                    }
+                    self.world.java_set_type_id(bx, y, bz, blocks::AIR);
+                    let (dx, dz) = directions[(data & 3) as usize];
+                    bx += dx;
+                    bz += dz;
+                    if self.world.get_block(bx, y, bz) == blocks::BED {
+                        self.world.java_set_type_id(bx, y, bz, blocks::AIR);
+                    }
+                    self.create_explosion(
+                        bx as f64 + 0.5,
+                        y as f64 + 0.5,
+                        bz as f64 + 0.5,
+                        5.0,
+                        true,
+                    );
+                    return true;
+                }
                 let meta = self.world.get_data(x, y, z);
+                // Java `EntityHuman.a(i, j, k)`: `worldProvider.c` is true in
+                // the Nether, so sleeping there is never possible.
+                if self.world.is_hell {
+                    return true;
+                }
                 let (hx, hz) = if (meta & 8) == 0 {
                     let dir = (meta & 3) as usize;
                     let (dx, dz) = [(0, 1), (-1, 0), (0, -1), (1, 0)][dir];
@@ -2767,14 +3076,27 @@ impl Server {
                 if (0..128).contains(&ty)
                     && (existing == blocks::AIR || !blocks::material(existing).is_buildable())
                 {
-                    let fluid = if stack.id == items::WATER_BUCKET {
-                        blocks::WATER
+                    if stack.id == items::WATER_BUCKET && self.world.is_hell {
+                        // ItemBucket: water evaporates in the Nether (fizz +
+                        // smoke), no fluid is placed, the bucket is returned.
+                        self.broadcast(Clientbound::LevelSound(LevelSound {
+                            effect_id: 1004,
+                            x: tx,
+                            y: ty as u8,
+                            z: tz,
+                            data: 0,
+                        }));
+                        replacement_item = Some(ItemStack::new(items::BUCKET, 1, 0));
                     } else {
-                        blocks::LAVA
-                    };
-                    self.world.java_set_type_id_and_data(tx, ty, tz, fluid, 0);
-                    self.send_block_change_to_observers(tx, ty, tz);
-                    replacement_item = Some(ItemStack::new(items::BUCKET, 1, 0));
+                        let fluid = if stack.id == items::WATER_BUCKET {
+                            blocks::WATER
+                        } else {
+                            blocks::LAVA
+                        };
+                        self.world.java_set_type_id_and_data(tx, ty, tz, fluid, 0);
+                        self.send_block_change_to_observers(tx, ty, tz);
+                        replacement_item = Some(ItemStack::new(items::BUCKET, 1, 0));
+                    }
                 }
             }
             // Bone meal (Ink Sack 351 with damage 15)
@@ -3023,14 +3345,25 @@ impl Server {
                 if (0..128).contains(&ty)
                     && (existing == blocks::AIR || !blocks::material(existing).is_buildable())
                 {
-                    let fluid = if stack.id == items::WATER_BUCKET {
-                        blocks::WATER
+                    if stack.id == items::WATER_BUCKET && self.world.is_hell {
+                        self.broadcast(Clientbound::LevelSound(LevelSound {
+                            effect_id: 1004,
+                            x: tx,
+                            y: ty as u8,
+                            z: tz,
+                            data: 0,
+                        }));
+                        new_stack = Some(Some(ItemStack::new(items::BUCKET, 1, 0)));
                     } else {
-                        blocks::LAVA
-                    };
-                    self.world.java_set_type_id_and_data(tx, ty, tz, fluid, 0);
-                    self.send_block_change_to_observers(tx, ty, tz);
-                    new_stack = Some(Some(ItemStack::new(items::BUCKET, 1, 0)));
+                        let fluid = if stack.id == items::WATER_BUCKET {
+                            blocks::WATER
+                        } else {
+                            blocks::LAVA
+                        };
+                        self.world.java_set_type_id_and_data(tx, ty, tz, fluid, 0);
+                        self.send_block_change_to_observers(tx, ty, tz);
+                        new_stack = Some(Some(ItemStack::new(items::BUCKET, 1, 0)));
+                    }
                 }
             }
         } else if stack.id == items::MILK_BUCKET {
@@ -3114,9 +3447,7 @@ impl Server {
             if let Some((hook_id, hx, hy, hz, catching, in_ground, hooked_entity)) = existing_hook {
                 if self.entities.remove_projectile(hook_id).is_some() {
                     for out in self.tracker.untrack_projectile(hook_id) {
-                        if let Some(t) = self.entities.get_player(out.recipient_id) {
-                            self.send(t.conn_id, out.packet);
-                        }
+                        self.send_tracked(out.recipient_id, out.packet);
                     }
                 }
                 let mut rod_damage = 0i16;
@@ -3164,12 +3495,16 @@ impl Server {
                         dz * 0.1,
                         0,
                     );
-                    let players: Vec<_> = self.entities.iter_players().cloned().collect();
+                    let active_dimension = self.active_dimension;
+                    let players: Vec<_> = self
+                        .entities
+                        .iter_players()
+                        .filter(|p| p.dimension == active_dimension)
+                        .cloned()
+                        .collect();
                     if let Some(dropped) = self.entities.get_dropped_item(item_id) {
                         for out in self.tracker.track_item_and_scan(dropped, &players) {
-                            if let Some(t) = self.entities.get_player(out.recipient_id) {
-                                self.send(t.conn_id, out.packet);
-                            }
+                            self.send_tracked(out.recipient_id, out.packet);
                         }
                     }
                     rod_damage = 1;
@@ -3218,13 +3553,17 @@ impl Server {
 
     fn spawn_boat_at(&mut self, x: f64, y: f64, z: f64) {
         let boat_id = self.entities.spawn_boat(x, y, z);
-        let players: Vec<_> = self.entities.iter_players().cloned().collect();
+        let active_dimension = self.active_dimension;
+        let players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
         if let Some(boat) = self.entities.get_boat(boat_id) {
             let packets = self.tracker.track_boat_and_scan(boat, &players);
             for outbound in packets {
-                if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                    self.send(target.conn_id, outbound.packet);
-                }
+                self.send_tracked(outbound.recipient_id, outbound.packet);
             }
         }
     }
@@ -3251,7 +3590,13 @@ impl Server {
     }
 
     fn tick_boats(&mut self) {
-        let boat_ids: Vec<i32> = self.entities.iter_boats().map(|b| b.entity_id).collect();
+        let active_dimension = self.active_dimension;
+        let boat_ids: Vec<i32> = self
+            .entities
+            .iter_boats()
+            .filter(|b| self.entities.dimension_of(b.entity_id) == active_dimension)
+            .map(|b| b.entity_id)
+            .collect();
         if boat_ids.is_empty() {
             return;
         }
@@ -3259,6 +3604,7 @@ impl Server {
         let players_pos: Vec<(i32, f64, f64, f64, bool)> = self
             .entities
             .iter_players()
+            .filter(|p| p.dimension == active_dimension)
             .map(|p| (p.entity_id, p.x, p.y, p.z, p.dead))
             .collect();
 
@@ -3497,9 +3843,7 @@ impl Server {
             let _ = self.entities.remove_boat(boat_id);
             let untrack = self.tracker.untrack_boat(boat_id);
             for outbound in untrack {
-                if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                    self.send(target.conn_id, outbound.packet);
-                }
+                self.send_tracked(outbound.recipient_id, outbound.packet);
             }
             if self.config.mechanics.boats_drop_boat_not_wood {
                 self.spawn_dropped_item_random(bx, by, bz, ItemStack::new(items::BOAT, 1, 0), 10);
@@ -3541,28 +3885,33 @@ impl Server {
                 );
             }
         }
-        let players: Vec<_> = self.entities.iter_players().cloned().collect();
+        let active_dimension = self.active_dimension;
+        let players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
         if let Some(mob) = self.entities.get_mob(mob_id) {
             for out in self.tracker.track_mob_and_scan(mob, &players) {
-                if let Some(target) = self.entities.get_player(out.recipient_id) {
-                    self.send(target.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
         }
         mob_id
     }
 
     fn tick_mob_spawner(&mut self) {
+        let active_dimension = self.active_dimension;
         let player_positions: Vec<(f64, f64, f64)> = self
             .entities
             .iter_players()
-            .filter(|p| !p.dead)
+            .filter(|p| !p.dead && p.dimension == active_dimension)
             .map(|p| (p.x, p.y, p.z))
             .collect();
         if player_positions.is_empty() {
             return;
         }
-        let (monsters, animals, water) = self.entities.count_mob_categories();
+        let (monsters, animals, water) = self.entities.count_mob_categories(active_dimension);
         let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
         let specs = evaluate_natural_spawns(
             &self.world,
@@ -3596,7 +3945,13 @@ impl Server {
 
     /// Java `Entity.m_()` / `EntityLiving.m_()` — environmental damage (void, suffocation, drowning, cactus, fire, lava) for players.
     fn tick_player_environmental_damage(&mut self) {
-        let player_ids: Vec<i32> = self.entities.iter_players().map(|p| p.entity_id).collect();
+        let active_dimension = self.active_dimension;
+        let player_ids: Vec<i32> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .map(|p| p.entity_id)
+            .collect();
         let mut damages: Vec<(i32, i16, &'static str)> = Vec::new();
 
         for pid in player_ids {
@@ -3721,16 +4076,25 @@ impl Server {
         }
 
         for (pid, dmg, reason) in damages {
-            self.damage_player_direct(pid, dmg, reason);
+            let dealt = self.damage_player_direct(pid, dmg, reason);
+            // Poseidon `settings.fix-drowning-push-down.enabled`: vanilla
+            // drowning damage sets `velocityChanged`, which pushes the client
+            // down. The fix preserves the pre-damage flag.
+            if dealt && reason == "drowned" && !self.config.mechanics.fix_drowning_push_down {
+                if let Some(player) = self.entities.get_player_mut(pid) {
+                    player.velocity_changed = true;
+                }
+            }
         }
     }
 
     /// Java `TileEntityMobSpawner.g_()` (`TileEntityMobSpawner.java:31-123`) — tick all loaded mob spawner tile entities.
     fn tick_mob_spawners(&mut self) {
+        let active_dimension = self.active_dimension;
         let player_positions: Vec<(f64, f64, f64)> = self
             .entities
             .iter_players()
-            .filter(|p| !p.dead)
+            .filter(|p| !p.dead && p.dimension == active_dimension)
             .map(|p| (p.x, p.y, p.z))
             .collect();
         if player_positions.is_empty() {
@@ -4307,9 +4671,7 @@ impl Server {
                 }
                 let _ = self.entities.remove_mob(mob_id);
                 for out in self.tracker.untrack_mob(mob_id) {
-                    if let Some(target) = self.entities.get_player(out.recipient_id) {
-                        self.send(target.conn_id, out.packet);
-                    }
+                    self.send_tracked(out.recipient_id, out.packet);
                 }
                 for item in drops {
                     self.spawn_dropped_item_random(mx, my + 0.2, mz, item, 10);
@@ -4334,7 +4696,13 @@ impl Server {
     }
 
     fn tick_mobs(&mut self) {
-        let mob_ids: Vec<i32> = self.entities.iter_mobs().map(|m| m.entity_id).collect();
+        let active_dimension = self.active_dimension;
+        let mob_ids: Vec<i32> = self
+            .entities
+            .iter_mobs()
+            .filter(|m| self.entities.dimension_of(m.entity_id) == active_dimension)
+            .map(|m| m.entity_id)
+            .collect();
         if mob_ids.is_empty() {
             return;
         }
@@ -4343,6 +4711,7 @@ impl Server {
         let players_snapshot: Vec<(i32, String, f64, f64, f64, bool)> = self
             .entities
             .iter_players()
+            .filter(|p| p.dimension == active_dimension)
             .map(|p| (p.entity_id, p.username.clone(), p.x, p.y, p.z, p.dead))
             .collect();
 
@@ -5224,9 +5593,7 @@ impl Server {
         for mob_id in despawn_list {
             let _ = self.entities.remove_mob(mob_id);
             for out in self.tracker.untrack_mob(mob_id) {
-                if let Some(target) = self.entities.get_player(out.recipient_id) {
-                    self.send(target.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
         }
 
@@ -5304,9 +5671,7 @@ impl Server {
         for (creeper_id, cx, cy, cz, radius) in creeper_explosions {
             let _ = self.entities.remove_mob(creeper_id);
             for out in self.tracker.untrack_mob(creeper_id) {
-                if let Some(target) = self.entities.get_player(out.recipient_id) {
-                    self.send(target.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
             let allow_blocks = self.config.mechanics.creeper_block_damage;
             self.create_explosion_ex(cx, cy, cz, radius, false, allow_blocks);
@@ -5527,20 +5892,26 @@ impl Server {
             mot_y,
             mot_z,
         );
-        let players: Vec<_> = self.entities.iter_players().cloned().collect();
+        let active_dimension = self.active_dimension;
+        let players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
         if let Some(proj) = self.entities.get_projectile(pid) {
             for out in self.tracker.track_projectile_and_scan(proj, &players) {
-                if let Some(t) = self.entities.get_player(out.recipient_id) {
-                    self.send(t.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
         }
     }
 
     fn tick_projectiles(&mut self) {
+        let active_dimension = self.active_dimension;
         let proj_ids: Vec<i32> = self
             .entities
             .iter_projectiles()
+            .filter(|p| self.entities.dimension_of(p.entity_id) == active_dimension)
             .map(|p| p.entity_id)
             .collect();
         if proj_ids.is_empty() {
@@ -5626,6 +5997,7 @@ impl Server {
                         let allow_others = self.config.mechanics.arrows_pickup_by_others;
                         let collector = self.entities.iter_players().find_map(|p| {
                             if !p.dead
+                                && p.dimension == self.active_dimension
                                 && (allow_others || proj_snapshot.shooter_id == Some(p.entity_id))
                                 && (p.x - proj_snapshot.x).abs() <= 1.2
                                 && (p.y - proj_snapshot.y).abs() <= 1.8
@@ -5704,6 +6076,7 @@ impl Server {
 
             let hit_player = self.entities.iter_players().find_map(|p| {
                 if p.dead
+                    || p.dimension != self.active_dimension
                     || (Some(p.entity_id) == proj_snapshot.shooter_id
                         && proj_snapshot.ticks_in_air < 5)
                 {
@@ -5867,9 +6240,7 @@ impl Server {
         for pid in to_remove {
             let _ = self.entities.remove_projectile(pid);
             for out in self.tracker.untrack_projectile(pid) {
-                if let Some(t) = self.entities.get_player(out.recipient_id) {
-                    self.send(t.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
         }
 
@@ -5908,20 +6279,26 @@ impl Server {
 
     fn spawn_primed_tnt_at(&mut self, x: f64, y: f64, z: f64, fuse: i32) {
         let tid = self.entities.spawn_primed_tnt(x, y, z, fuse);
-        let players: Vec<_> = self.entities.iter_players().cloned().collect();
+        let active_dimension = self.active_dimension;
+        let players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
         if let Some(tnt) = self.entities.get_primed_tnt(tid) {
             for out in self.tracker.track_tnt_and_scan(tnt, &players) {
-                if let Some(t) = self.entities.get_player(out.recipient_id) {
-                    self.send(t.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
         }
     }
 
     fn tick_primed_tnts(&mut self) {
+        let active_dimension = self.active_dimension;
         let tnt_ids: Vec<i32> = self
             .entities
             .iter_primed_tnts()
+            .filter(|t| self.entities.dimension_of(t.entity_id) == active_dimension)
             .map(|t| t.entity_id)
             .collect();
         if tnt_ids.is_empty() {
@@ -5988,9 +6365,7 @@ impl Server {
         for (tid, tx, ty, tz) in exploded {
             let _ = self.entities.remove_primed_tnt(tid);
             for out in self.tracker.untrack_tnt(tid) {
-                if let Some(t) = self.entities.get_player(out.recipient_id) {
-                    self.send(t.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
             let allow_blocks = self.config.mechanics.tnt_block_damage;
             self.create_explosion_ex(tx, ty, tz, 4.0, false, allow_blocks);
@@ -6003,12 +6378,16 @@ impl Server {
             cart.max_speed = self.config.mechanics.minecart_max_speed;
             cart.slow_when_empty = self.config.mechanics.minecart_slow_when_empty;
         }
-        let players: Vec<_> = self.entities.iter_players().cloned().collect();
+        let active_dimension = self.active_dimension;
+        let players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
         if let Some(cart) = self.entities.get_minecart(cid) {
             for out in self.tracker.track_minecart_and_scan(cart, &players) {
-                if let Some(t) = self.entities.get_player(out.recipient_id) {
-                    self.send(t.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
         }
     }
@@ -6165,9 +6544,7 @@ impl Server {
             }
             let _ = self.entities.remove_minecart(cart_id);
             for out in self.tracker.untrack_minecart(cart_id) {
-                if let Some(t) = self.entities.get_player(out.recipient_id) {
-                    self.send(t.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
             self.spawn_dropped_item_random(cx, cy, cz, ItemStack::new(items::MINECART, 1, 0), 10);
             if ctype == 1 {
@@ -6207,10 +6584,12 @@ impl Server {
 
     #[allow(clippy::type_complexity)]
     fn tick_minecarts(&mut self) {
+        let active_dimension = self.active_dimension;
         self.world.active_detector_rails.clear();
         let cart_ids: Vec<i32> = self
             .entities
             .iter_minecarts()
+            .filter(|c| self.entities.dimension_of(c.entity_id) == active_dimension)
             .map(|c| c.entity_id)
             .collect();
         if cart_ids.is_empty() {
@@ -6277,14 +6656,14 @@ impl Server {
         let player_boxes: Vec<(i32, f64, f64, f64, Option<i32>)> = self
             .entities
             .iter_players()
-            .filter(|p| !p.dead)
+            .filter(|p| !p.dead && p.dimension == self.active_dimension)
             .map(|p| (p.entity_id, p.x, p.y, p.z, p.vehicle_id))
             .collect();
 
         let mob_boxes: Vec<(i32, f64, f64, f64, f32, f32, Option<i32>, Option<i32>)> = self
             .entities
             .iter_mobs()
-            .filter(|m| !m.dead)
+            .filter(|m| !m.dead && self.entities.dimension_of(m.entity_id) == self.active_dimension)
             .map(|m| {
                 let (w, h) = m.size();
                 (
@@ -6533,9 +6912,7 @@ impl Server {
             }
             let _ = self.entities.remove_minecart(cid);
             for out in self.tracker.untrack_minecart(cid) {
-                if let Some(t) = self.entities.get_player(out.recipient_id) {
-                    self.send(t.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
         }
     }
@@ -6583,9 +6960,10 @@ impl Server {
     }
 
     fn tick_paintings(&mut self) {
+        let active_dimension = self.active_dimension;
         let mut broken = Vec::new();
         for p in self.entities.iter_paintings() {
-            if p.dead {
+            if p.dead || self.entities.dimension_of(p.entity_id) != active_dimension {
                 continue;
             }
             if !self.world.is_chunk_loaded(p.chunk_pos()) {
@@ -6598,9 +6976,7 @@ impl Server {
         for (pid, x, y, z) in broken {
             if self.entities.remove_painting(pid).is_some() {
                 for outbound in self.tracker.untrack_painting(pid) {
-                    if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                        self.send(target.conn_id, outbound.packet);
-                    }
+                    self.send_tracked(outbound.recipient_id, outbound.packet);
                 }
                 self.spawn_dropped_item_random(
                     x as f64 + 0.5,
@@ -6615,20 +6991,25 @@ impl Server {
 
     fn spawn_painting_at(&mut self, title: String, x: i32, y: i32, z: i32, direction: i32) {
         let pid = self.entities.spawn_painting(title, x, y, z, direction);
-        let players: Vec<_> = self.entities.iter_players().cloned().collect();
+        let active_dimension = self.active_dimension;
+        let players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
         if let Some(p) = self.entities.get_painting(pid) {
             for out in self.tracker.track_painting_and_scan(p, &players) {
-                if let Some(t) = self.entities.get_player(out.recipient_id) {
-                    self.send(t.conn_id, out.packet);
-                }
+                self.send_tracked(out.recipient_id, out.packet);
             }
         }
     }
 
     fn tick_pressure_plates_and_beds(&mut self) {
+        let active_dimension = self.active_dimension;
         let mut plate_positions = Vec::new();
         for p in self.entities.iter_players() {
-            if p.dead {
+            if p.dead || p.dimension != active_dimension {
                 continue;
             }
             let bx = p.x.floor() as i32;
@@ -6640,7 +7021,7 @@ impl Server {
             }
         }
         for m in self.entities.iter_mobs() {
-            if m.dead {
+            if m.dead || self.entities.dimension_of(m.entity_id) != active_dimension {
                 continue;
             }
             let bx = m.x.floor() as i32;
@@ -6652,7 +7033,7 @@ impl Server {
             }
         }
         for it in self.entities.iter_dropped_items() {
-            if it.dead {
+            if it.dead || self.entities.dimension_of(it.entity_id) != active_dimension {
                 continue;
             }
             let bx = it.x.floor() as i32;
@@ -6663,7 +7044,7 @@ impl Server {
             }
         }
         for pr in self.entities.iter_projectiles() {
-            if pr.dead {
+            if pr.dead || self.entities.dimension_of(pr.entity_id) != active_dimension {
                 continue;
             }
             let bx = pr.x.floor() as i32;
@@ -6674,6 +7055,9 @@ impl Server {
             }
         }
         for bt in self.entities.iter_boats() {
+            if self.entities.dimension_of(bt.entity_id) != active_dimension {
+                continue;
+            }
             let bx = bt.x.floor() as i32;
             let by = bt.y.floor() as i32;
             let bz = bt.z.floor() as i32;
@@ -6682,7 +7066,7 @@ impl Server {
             }
         }
         for ct in self.entities.iter_minecarts() {
-            if ct.dead {
+            if ct.dead || self.entities.dimension_of(ct.entity_id) != active_dimension {
                 continue;
             }
             let bx = ct.x.floor() as i32;
@@ -6700,6 +7084,12 @@ impl Server {
         for (px, py, pz, pid) in plate_positions {
             self.world.active_pressure_plates.insert((px, py, pz));
             self.world.set_pressure_plate_state(px, py, pz, pid, true);
+        }
+
+        // Beds only exist in the overworld; skip the sleep/wake logic while
+        // the Nether world is the active one.
+        if self.active_dimension != 0 {
+            return;
         }
 
         // Wake players whose bed block was destroyed (`EntityHuman.java:88-93`)
@@ -6731,11 +7121,15 @@ impl Server {
                 p.sleep_ticks += 1;
             }
         }
-        let all_sleeping = self.entities.player_count() > 0
-            && self
-                .entities
-                .iter_players()
-                .all(|p| !p.dead && p.sleeping && p.sleep_ticks >= 1);
+        let mut overworld_players = 0usize;
+        let mut all_sleeping = true;
+        for p in self.entities.iter_players().filter(|p| p.dimension == 0) {
+            overworld_players += 1;
+            if p.dead || !p.sleeping || p.sleep_ticks < 1 {
+                all_sleeping = false;
+            }
+        }
+        let all_sleeping = overworld_players > 0 && all_sleeping;
         if all_sleeping {
             let cur_time = self.world.world_time();
             let next_morning = (cur_time + 24000) - (cur_time + 24000).rem_euclid(24000);
@@ -6787,6 +7181,7 @@ impl Server {
             .iter_players()
             .filter(|p| {
                 !p.dead
+                    && p.dimension == self.active_dimension
                     && (p.x - fx).abs() <= 3.0
                     && p.y >= fy - 3.0
                     && p.y <= fy + 9.0
@@ -6828,9 +7223,7 @@ impl Server {
                     // EntityPig.java:67-85 — transform Pig into PigZombie!
                     let _ = self.entities.remove_mob(mid);
                     for out in self.tracker.untrack_mob(mid) {
-                        if let Some(target) = self.entities.get_player(out.recipient_id) {
-                            self.send(target.conn_id, out.packet);
-                        }
+                        self.send_tracked(out.recipient_id, out.packet);
                     }
                     let pz_id = self.spawn_mob_at(MobType::PigZombie, mx, my, mz);
                     if let Some(pz) = self.entities.get_mob_mut(pz_id) {
@@ -6870,12 +7263,16 @@ impl Server {
                     let item_id = self
                         .entities
                         .spawn_dropped_item(item, x, y, z, mot_x, 0.2, mot_z, 10);
-                    let players: Vec<_> = self.entities.iter_players().cloned().collect();
+                    let active_dimension = self.active_dimension;
+                    let players: Vec<_> = self
+                        .entities
+                        .iter_players()
+                        .filter(|p| p.dimension == active_dimension)
+                        .cloned()
+                        .collect();
                     if let Some(dropped) = self.entities.get_dropped_item(item_id) {
                         for out in self.tracker.track_item_and_scan(dropped, &players) {
-                            if let Some(t) = self.entities.get_player(out.recipient_id) {
-                                self.send(t.conn_id, out.packet);
-                            }
+                            self.send_tracked(out.recipient_id, out.packet);
                         }
                     }
                 }
@@ -7024,7 +7421,12 @@ impl Server {
 
         // Entity damage within `radius * 2.0` with block exposure raycasting (`Explosion.java:127-150`)
         let blast_size = (radius * 2.0) as f64;
-        let player_ids: Vec<i32> = self.entities.iter_players().map(|p| p.entity_id).collect();
+        let player_ids: Vec<i32> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == self.active_dimension)
+            .map(|p| p.entity_id)
+            .collect();
         for pid in player_ids {
             let dist_info = self.entities.get_player(pid).and_then(|p| {
                 if p.dead {
@@ -7241,7 +7643,7 @@ impl Server {
         });
         let cpos = ChunkPos::new(x >> 4, z >> 4);
         for p in self.entities.iter_players() {
-            if p.sent_chunks.contains(&cpos) {
+            if p.dimension == self.active_dimension && p.sent_chunks.contains(&cpos) {
                 self.send(p.conn_id, change.clone());
             }
         }
@@ -7428,16 +7830,25 @@ impl Server {
 
     #[allow(clippy::type_complexity)]
     fn sync_open_containers(&mut self) {
+        let active_dimension = self.active_dimension;
         let mut updates = Vec::new();
         let mut force_closes = Vec::new();
         let cart_snapshots: HashMap<i32, (f64, f64, f64, [Option<ItemStack>; 27])> = self
             .entities
             .iter_minecarts()
-            .filter(|c| !c.dead && c.cart_type == 1)
+            .filter(|c| {
+                !c.dead
+                    && c.cart_type == 1
+                    && self.entities.dimension_of(c.entity_id) == active_dimension
+            })
             .map(|c| (c.entity_id, (c.x, c.y, c.z, c.cargo)))
             .collect();
 
-        for player in self.entities.iter_players_mut() {
+        for player in self
+            .entities
+            .iter_players_mut()
+            .filter(|p| p.dimension == active_dimension)
+        {
             let (px, py, pz) = (player.x, player.y, player.z);
             let max_dist_sq = if self.config.fixes.container_interaction_check_enabled {
                 let d = (self.config.fixes.container_interaction_max_distance.max(1) as f64) + 1.5;
@@ -7661,7 +8072,7 @@ impl Server {
             .entities
             .iter_players()
             .filter_map(|p| {
-                if p.dead {
+                if p.dead || p.dimension != self.active_dimension {
                     return None;
                 }
                 let stack = p.inventory.item_in_hand()?;
@@ -7676,8 +8087,10 @@ impl Server {
             return;
         }
 
-        let center_x = self.config.world.spawn_x;
-        let center_z = self.config.world.spawn_z;
+        // Java `ItemWorldMap`: the map centre belongs to the world the map was
+        // created in (`worldmap.map = world.worldProvider.dimension`), so the
+        // Nether uses the Nether spawn as its centre.
+        let (center_x, _, center_z) = self.world.spawn_point();
         let scale = 3i32; // 1 << 3 = 8 blocks per pixel
         let step = 1i32 << scale;
 
@@ -7821,7 +8234,7 @@ impl Server {
         let cpos = ChunkPos::new(x >> 4, z >> 4);
         let pkt = Clientbound::UpdateSign(sign);
         for p in self.entities.iter_players() {
-            if p.sent_chunks.contains(&cpos) {
+            if p.dimension == self.active_dimension && p.sent_chunks.contains(&cpos) {
                 self.send(p.conn_id, pkt.clone());
             }
         }
@@ -7861,13 +8274,17 @@ impl Server {
             mot_z,
             pickup_delay,
         );
-        let players: Vec<_> = self.entities.iter_players().cloned().collect();
+        let active_dimension = self.active_dimension;
+        let players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
         if let Some(dropped) = self.entities.get_dropped_item(item_id) {
             let packets = self.tracker.track_item_and_scan(dropped, &players);
             for outbound in packets {
-                if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                    self.send(target.conn_id, outbound.packet);
-                }
+                self.send_tracked(outbound.recipient_id, outbound.packet);
             }
         }
     }
@@ -7887,21 +8304,27 @@ impl Server {
         let item_id = self
             .entities
             .spawn_dropped_item(item, x, spawn_y, z, mot_x, mot_y, mot_z, 40);
-        let players: Vec<_> = self.entities.iter_players().cloned().collect();
+        let active_dimension = self.active_dimension;
+        let players: Vec<_> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .cloned()
+            .collect();
         if let Some(dropped) = self.entities.get_dropped_item(item_id) {
             let packets = self.tracker.track_item_and_scan(dropped, &players);
             for outbound in packets {
-                if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                    self.send(target.conn_id, outbound.packet);
-                }
+                self.send_tracked(outbound.recipient_id, outbound.packet);
             }
         }
     }
 
     fn tick_dropped_items(&mut self) {
+        let active_dimension = self.active_dimension;
         let item_ids: Vec<i32> = self
             .entities
             .iter_dropped_items()
+            .filter(|i| self.entities.dimension_of(i.entity_id) == active_dimension)
             .map(|i| i.entity_id)
             .collect();
         let mut to_remove = Vec::new();
@@ -8015,7 +8438,7 @@ impl Server {
             }
 
             let collector = self.entities.iter_players().find_map(|p| {
-                if p.dead {
+                if p.dead || p.dimension != self.active_dimension {
                     return None;
                 }
                 if (ix - p.x).abs() <= 1.3
@@ -8071,9 +8494,7 @@ impl Server {
             let _ = self.entities.remove_dropped_item(item_id);
             let untrack = self.tracker.untrack_item(item_id);
             for outbound in untrack {
-                if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                    self.send(target.conn_id, outbound.packet);
-                }
+                self.send_tracked(outbound.recipient_id, outbound.packet);
             }
         }
     }
@@ -8090,10 +8511,9 @@ impl Server {
                 if let Ok((pre, map)) = self.world.prepare_chunk_packets(pos) {
                     let pkt = Clientbound::MapChunk(map);
                     for conn_id in watchers {
-                        let should_send = self
-                            .entities
-                            .get_by_conn(conn_id)
-                            .is_some_and(|p| p.sent_chunks.contains(&pos));
+                        let should_send = self.entities.get_by_conn(conn_id).is_some_and(|p| {
+                            p.dimension == self.active_dimension && p.sent_chunks.contains(&pos)
+                        });
                         if should_send {
                             let need_pre = self
                                 .entities
@@ -8166,11 +8586,9 @@ impl Server {
                     metadata,
                 });
                 for conn_id in watchers {
-                    if self
-                        .entities
-                        .get_by_conn(conn_id)
-                        .is_some_and(|p| p.sent_chunks.contains(&pos))
-                    {
+                    if self.entities.get_by_conn(conn_id).is_some_and(|p| {
+                        p.dimension == self.active_dimension && p.sent_chunks.contains(&pos)
+                    }) {
                         self.send(conn_id, pkt.clone());
                     }
                 }
@@ -8209,38 +8627,267 @@ impl Server {
         None
     }
 
+    /// Java `BlockPortal.a(World, i, j, k, Entity)`: does the player's bounding
+    /// box intersect a portal block?
+    fn player_touches_portal(&self, x: f64, y: f64, z: f64) -> bool {
+        let min_x = (x - 0.3).floor() as i32;
+        let max_x = (x + 0.3).floor() as i32;
+        let min_y = y.floor() as i32;
+        let max_y = (y + 1.8).floor() as i32;
+        let min_z = (z - 0.3).floor() as i32;
+        let max_z = (z + 0.3).floor() as i32;
+        for bx in min_x..=max_x {
+            for by in min_y..=max_y {
+                for bz in min_z..=max_z {
+                    if self.world.get_block(bx, by, bz) == blocks::PORTAL {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Java `EntityPlayer.m_()` portal section (`F`, `D`, `E`) combined with
+    /// `EntityHuman.P()`: 80 ticks in a portal (0.0125/tick), then
+    /// `ServerConfigurationManager.f`.
+    fn tick_player_portals(&mut self) {
+        let ids: Vec<i32> = self.entities.iter_players().map(|p| p.entity_id).collect();
+        for entity_id in ids {
+            let Some(player) = self.entities.get_player(entity_id) else {
+                continue;
+            };
+            if player.dead {
+                continue;
+            }
+            let (dimension, x, y, z, conn_id) = (
+                player.dimension,
+                player.x,
+                player.y,
+                player.z,
+                player.conn_id,
+            );
+            let touching = self.with_dimension(dimension, |s| s.player_touches_portal(x, y, z));
+
+            let mut travel = false;
+            let mut close_container = false;
+            let mut close_window = None;
+            if let Some(player) = self.entities.get_player_mut(entity_id) {
+                if touching {
+                    // Java `EntityHuman.P()`: while the cooldown is active it
+                    // is refreshed to 10 every tick the player still stands in
+                    // a portal, so re-entry only happens after leaving it.
+                    if player.portal_cooldown > 0 {
+                        player.portal_cooldown = 10;
+                    } else {
+                        player.in_portal = true;
+                    }
+                    if let Some(container) = &player.open_container {
+                        close_container = true;
+                        close_window = Some(container.window_id());
+                    }
+                }
+                if player.in_portal {
+                    if player.vehicle_id.is_none() {
+                        player.portal_time += 0.0125;
+                        if player.portal_time >= 1.0 {
+                            player.portal_time = 1.0;
+                            player.portal_cooldown = 10;
+                            travel = true;
+                        }
+                    }
+                } else if player.portal_time > 0.0 {
+                    player.portal_time = (player.portal_time - 0.05).max(0.0);
+                }
+                player.in_portal = false;
+                if player.portal_cooldown > 0 {
+                    player.portal_cooldown -= 1;
+                }
+            }
+            if close_container {
+                self.with_dimension(dimension, |s| {
+                    s.close_player_container_and_drop_transient(conn_id, true)
+                });
+                if let Some(window_id) = close_window {
+                    self.send(conn_id, Clientbound::CloseWindow(CloseWindow { window_id }));
+                }
+            }
+            if travel {
+                self.travel_player(entity_id);
+            }
+        }
+    }
+
+    /// Java `ServerConfigurationManager.f(EntityPlayer)` for the vanilla
+    /// (plugin-free) path: scale by 1/8 or 8, find/create the destination
+    /// portal, then `moveToWorld` with Poseidon's double `Packet9Respawn`.
+    fn travel_player(&mut self, entity_id: i32) {
+        let Some(player) = self.entities.get_player(entity_id) else {
+            return;
+        };
+        let from_dimension = player.dimension;
+        if !matches!(from_dimension, 0 | -1) {
+            return;
+        }
+        let to_dimension = if from_dimension == -1 { 0 } else { -1 };
+        if to_dimension == -1 && self.nether.is_none() {
+            return;
+        }
+        let ratio = if from_dimension == -1 { 8.0 } else { 0.125 };
+        let (x, y, z, yaw, pitch, conn_id) = (
+            player.x,
+            player.y,
+            player.z,
+            player.yaw,
+            player.pitch,
+            player.conn_id,
+        );
+        let target_x = x * ratio;
+        let target_z = z * ratio;
+
+        let (dest_x, dest_y, dest_z) = self.with_dimension(to_dimension, |s| {
+            s.world.ensure_portal_search_chunks(target_x, target_z);
+            s.world.find_or_create_portal(target_x, y, target_z)
+        });
+
+        // Release the player's chunk view in the source world.
+        self.with_dimension(from_dimension, |s| {
+            if s.world.live_is_active() {
+                s.world.live_player_quit(conn_id);
+            }
+        });
+
+        // Untrack before moving so old-dimension observers destroy the entity.
+        let untrack = self.tracker.untrack_player(entity_id);
+        for outbound in untrack {
+            if let Some(target) = self.entities.get_player(outbound.recipient_id) {
+                self.send(target.conn_id, outbound.packet);
+            }
+        }
+
+        let old_chunk = {
+            let player = self.entities.get_player(entity_id).unwrap();
+            player.chunk_pos()
+        };
+        if let Some(player) = self.entities.get_player_mut(entity_id) {
+            player.dimension = to_dimension;
+            player.x = dest_x;
+            player.y = dest_y;
+            player.z = dest_z;
+            player.prev_x = dest_x;
+            player.prev_y = dest_y;
+            player.prev_z = dest_z;
+            player.stance = dest_y;
+            player.yaw = yaw;
+            player.pitch = pitch;
+            player.mot_x = 0.0;
+            player.mot_y = 0.0;
+            player.mot_z = 0.0;
+            player.velocity_changed = false;
+            player.portal_time = 1.0;
+            player.in_portal = false;
+            player.open_container = None;
+            player.editing_sign = None;
+            player.digging = None;
+            player.pending_dig = None;
+            player.sleeping = false;
+            player.last_eval_x = dest_x;
+            player.last_eval_z = dest_z;
+            player.sent_chunks.clear();
+            player.pre_chunk_sent.clear();
+            player.chunk_queue.clear();
+        }
+        let new_chunk = {
+            let player = self.entities.get_player(entity_id).unwrap();
+            player.chunk_pos()
+        };
+        self.entities
+            .update_player_chunk(entity_id, old_chunk, new_chunk);
+
+        // Poseidon: send the opposite dimension first, then the actual one.
+        let opposite = if to_dimension >= 0 { -1 } else { 0 };
+        self.send(
+            conn_id,
+            Clientbound::Respawn(Respawn {
+                dimension: opposite,
+            }),
+        );
+        self.send(
+            conn_id,
+            Clientbound::Respawn(Respawn {
+                dimension: to_dimension as i8,
+            }),
+        );
+
+        self.with_dimension(to_dimension, |s| {
+            // `ServerConfigurationManager.a(EntityPlayer, WorldServer)`:
+            // update the world clock and weather, not the bed/spawn compass.
+            let world_time = s.world.world_time();
+            s.send(
+                conn_id,
+                Clientbound::UpdateTime(UpdateTime { time: world_time }),
+            );
+            if to_dimension == 0 && s.world.is_raining() {
+                s.send(conn_id, Clientbound::Bed(Bed { reason: 1 }));
+            }
+            s.stream_initial_chunks(conn_id);
+        });
+
+        if let Some(player) = self.entities.get_player(entity_id) {
+            self.tracker.track_player(player);
+        }
+    }
+
     fn handle_respawn(&mut self, id: ConnId) {
-        if self.world.live_is_active() {
+        let Some(from_dimension) = self.entities.get_by_conn(id).map(|p| p.dimension) else {
+            return;
+        };
+        if self.nether.is_some() {
+            self.with_dimension(from_dimension, |s| {
+                if s.world.live_is_active() {
+                    s.world.live_player_quit(id);
+                }
+            });
+        } else if self.world.live_is_active() {
             self.world.live_player_quit(id);
         }
+
+        // Java `NetServerHandler.a(Packet9Respawn)` always calls
+        // `moveToWorld(player, 0)`: death respawns in the overworld, using the
+        // bed if it is still valid (`ServerConfigurationManager.java:253-278`).
         let saved_bed = self.entities.get_by_conn(id).and_then(|p| p.spawn_bed);
         let mut invalid_bed = false;
-        let (spawn_x, spawn_y, spawn_z) = if let Some((bx, by, bz)) = saved_bed {
-            if let Some(pos) = self.find_safe_bed_respawn(bx, by, bz) {
-                pos
+        let (spawn_x, spawn_y, spawn_z) = self.with_dimension(0, |s| {
+            if let Some((bx, by, bz)) = saved_bed {
+                if let Some(pos) = s.find_safe_bed_respawn(bx, by, bz) {
+                    pos
+                } else {
+                    invalid_bed = true;
+                    s.world.safe_spawn_point()
+                }
             } else {
-                invalid_bed = true;
-                self.world.safe_spawn_point()
+                s.world.safe_spawn_point()
             }
-        } else {
-            self.world.safe_spawn_point()
-        };
+        });
 
         // Untrack player in EntityTracker before respawn (`ServerConfigurationManager.moveToWorld`)
         // so both the respawned player and all observers clear stale tracked_players state
         // and re-receive NamedEntitySpawn packets after respawn!
         if let Some(p) = self.entities.get_by_conn(id) {
             let eid = p.entity_id;
-            self.dismount_player(eid);
+            self.with_dimension(from_dimension, |s| s.dismount_player(eid));
             let untrack = self.tracker.untrack_player(eid);
             for outbound in untrack {
                 if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                    self.send(target.conn_id, outbound.packet);
+                    if target.dimension == from_dimension {
+                        self.send(target.conn_id, outbound.packet);
+                    }
                 }
             }
         }
 
-        // Poseidon double-respawn client hack: send opposite dimension first, then dimension 0
+        // Poseidon double-respawn client hack: send opposite dimension first,
+        // then the actual destination dimension (always 0 here).
         self.send(id, Clientbound::Respawn(Respawn { dimension: -1 }));
         self.send(id, Clientbound::Respawn(Respawn { dimension: 0 }));
         if invalid_bed {
@@ -8252,9 +8899,16 @@ impl Server {
         let spawn_pitch = self.config.world.spawn_pitch;
         if let Some(player) = self.entities.get_by_conn_mut(id) {
             let old_chunk = player.chunk_pos();
+            player.dimension = 0;
+            player.portal_cooldown = 0;
+            player.portal_time = 0.0;
+            player.in_portal = false;
             player.respawn(spawn_x as f64 + 0.5, spawn_y as f64, spawn_z as f64 + 0.5);
             player.yaw = spawn_yaw;
             player.pitch = spawn_pitch;
+            player.sent_chunks.clear();
+            player.pre_chunk_sent.clear();
+            player.chunk_queue.clear();
             let new_chunk = player.chunk_pos();
             let entity_id = player.entity_id;
             respawned_eid = Some(entity_id);
@@ -8262,7 +8916,7 @@ impl Server {
                 .update_player_chunk(entity_id, old_chunk, new_chunk);
         }
 
-        self.stream_initial_chunks(id);
+        self.with_dimension(0, |s| s.stream_initial_chunks(id));
 
         if let Some(eid) = respawned_eid {
             if let Some(player) = self.entities.get_player(eid) {
@@ -8270,6 +8924,11 @@ impl Server {
             }
         }
 
+        // `moveToWorld` updates the world clock/weather; the respawn point is
+        // the overworld spawn (or the bed, when one is valid). The respawn
+        // world is always the overworld.
+        let (world_time, raining) =
+            self.with_dimension(0, |s| (s.world.world_time(), s.world.is_raining()));
         self.send(
             id,
             Clientbound::SpawnPosition(SpawnPosition {
@@ -8278,7 +8937,10 @@ impl Server {
                 z: spawn_z,
             }),
         );
-        self.send(id, Clientbound::UpdateTime(UpdateTime { time: 0 }));
+        self.send(id, Clientbound::UpdateTime(UpdateTime { time: world_time }));
+        if raining {
+            self.send(id, Clientbound::Bed(Bed { reason: 1 }));
+        }
         self.send(id, Clientbound::UpdateHealth(UpdateHealth { health: 20 }));
 
         if let Some(player) = self.entities.get_by_conn(id) {
@@ -8489,28 +9151,87 @@ impl Server {
 
         log::info(&format!("{name} logged in with entity id {entity_id}"));
 
-        self.send(
-            id,
-            Clientbound::Login(Login {
-                protocol: entity_id,
-                username: String::new(),
-                map_seed: seed,
-                dimension: 0,
-            }),
-        );
-        self.send(
-            id,
-            Clientbound::SpawnPosition(SpawnPosition {
-                x: spawn_x,
-                y: spawn_y,
-                z: spawn_z,
-            }),
-        );
-        let world_time = self.world.world_time();
-        self.send(id, Clientbound::UpdateTime(UpdateTime { time: world_time }));
+        // Java `NetLoginHandler.finishLogin`: the login packet carries the
+        // player's saved dimension, and every subsequent chunk/teleport packet
+        // comes from that world's chunk provider.
+        let saved_dimension = self
+            .entities
+            .get_player(entity_id)
+            .map(|p| p.dimension)
+            .unwrap_or(0);
+        let mut login_dimension = saved_dimension;
+        let mut reset_position = false;
+        if !matches!(login_dimension, 0 | -1) {
+            login_dimension = 0;
+            reset_position = true;
+        }
+        if login_dimension == -1 && self.nether.is_none() {
+            login_dimension = 0;
+            reset_position = true;
+        }
+        if reset_position {
+            // The saved dimension is unavailable; fall back to the overworld
+            // spawn instead of leaving the player at stored Nether coordinates.
+            let (spawn_x, spawn_y, spawn_z) = self.world.safe_spawn_point();
+            let mut chunk_shift = None;
+            if let Some(player) = self.entities.get_player_mut(entity_id) {
+                let old_chunk = player.chunk_pos();
+                player.x = spawn_x as f64 + 0.5;
+                player.y = spawn_y as f64;
+                player.z = spawn_z as f64 + 0.5;
+                player.stance = player.y;
+                player.prev_x = player.x;
+                player.prev_y = player.y;
+                player.prev_z = player.z;
+                player.last_eval_x = player.x;
+                player.last_eval_z = player.z;
+                let new_chunk = player.chunk_pos();
+                if old_chunk != new_chunk {
+                    chunk_shift = Some((old_chunk, new_chunk));
+                }
+            }
+            if let Some((old_chunk, new_chunk)) = chunk_shift {
+                self.entities
+                    .update_player_chunk(entity_id, old_chunk, new_chunk);
+            }
+        }
+        if let Some(player) = self.entities.get_player_mut(entity_id) {
+            player.dimension = login_dimension;
+        }
 
-        // Stream initial spawn area chunks and send spawn teleport
-        self.stream_initial_chunks(id);
+        self.with_dimension(login_dimension, |s| {
+            // `NetLoginHandler.b`: the login packet carries the player's world
+            // seed and dimension, the spawn position packet the raw world
+            // spawn (`World.getSpawn()`, not the "safe" block-adjusted one).
+            let world_id = s.world.dimension as i8;
+            s.send(
+                id,
+                Clientbound::Login(Login {
+                    protocol: entity_id,
+                    username: String::new(),
+                    map_seed: seed,
+                    dimension: world_id,
+                }),
+            );
+            let (spawn_x, spawn_y, spawn_z) = s.world.spawn_point();
+            s.send(
+                id,
+                Clientbound::SpawnPosition(SpawnPosition {
+                    x: spawn_x,
+                    y: spawn_y,
+                    z: spawn_z,
+                }),
+            );
+            let world_time = s.world.world_time();
+            s.send(id, Clientbound::UpdateTime(UpdateTime { time: world_time }));
+
+            // Stream initial spawn area chunks and send spawn teleport
+            s.stream_initial_chunks(id);
+
+            if login_dimension == 0 && s.world.live_is_active() && s.world.is_raining() {
+                s.send(id, Clientbound::Bed(Bed { reason: 1 }));
+            }
+        });
 
         // Sync initial inventory to client
         if let Some(player) = self.entities.get_player(entity_id) {
@@ -8531,10 +9252,6 @@ impl Server {
             .map(|p| p.health)
             .unwrap_or(20);
         self.send(id, Clientbound::UpdateHealth(UpdateHealth { health }));
-
-        if self.world.live_is_active() && self.world.is_raining() {
-            self.send(id, Clientbound::Bed(Bed { reason: 1 }));
-        }
 
         // Poseidon: PlayerJoinEvent -> broadcast join message to other players
         let default_join = crate::config::ServerConfig::default().join_message;
@@ -8675,10 +9392,27 @@ impl Server {
     }
 
     fn stream_chunks(&mut self) {
+        let dimensions: Vec<i32> = if self.nether.is_some() {
+            vec![0, -1]
+        } else {
+            vec![0]
+        };
+        for dimension in dimensions {
+            self.with_dimension(dimension, |s| s.stream_chunks_inner());
+        }
+    }
+
+    fn stream_chunks_inner(&mut self) {
+        let active_dimension = self.active_dimension;
         let max_per_tick = if self.world.live_is_active() { 16 } else { 2 };
         let chunks_per_tick = self.config.world.chunks_per_tick.clamp(1, max_per_tick);
 
-        let player_ids: Vec<ConnId> = self.entities.iter_players().map(|p| p.conn_id).collect();
+        let player_ids: Vec<ConnId> = self
+            .entities
+            .iter_players()
+            .filter(|p| p.dimension == active_dimension)
+            .map(|p| p.conn_id)
+            .collect();
         let mut populated_this_tick = 0;
 
         for id in player_ids {
@@ -8928,41 +9662,56 @@ impl Server {
                     .entities
                     .iter_players()
                     .find(|p| p.username.eq_ignore_ascii_case(&target))
-                    .map(|p| (p.x, p.y, p.z, p.yaw, p.pitch));
+                    .map(|p| (p.x, p.y, p.z, p.yaw, p.pitch, p.dimension));
                 let victim_info = self
                     .entities
                     .iter_players()
                     .find(|p| p.username.eq_ignore_ascii_case(&victim))
-                    .map(|p| (p.conn_id, p.entity_id));
-                if let (Some((tx, ty, tz, tyaw, tpitch)), Some((vconn, veid))) =
-                    (target_pos, victim_info)
+                    .map(|p| (p.conn_id, p.entity_id, p.dimension));
+                if let (
+                    Some((tx, ty, tz, tyaw, tpitch, target_dimension)),
+                    Some((vconn, veid, victim_dimension)),
+                ) = (target_pos, victim_info)
                 {
-                    self.dismount_player(veid);
-                    if let Some(vp) = self.entities.get_player_mut(veid) {
-                        let old_c = vp.chunk_pos();
-                        vp.update_position(tx, ty, ty, tz, tyaw, tpitch, false);
-                        vp.fall_distance = 0.0;
-                        let new_c = vp.chunk_pos();
-                        self.entities.update_player_chunk(veid, old_c, new_c);
+                    // A teleport never changes the dimension: the victim keeps
+                    // its own world and the coordinates are interpreted there.
+                    if target_dimension != victim_dimension {
+                        self.send(
+                            vconn,
+                            Clientbound::Chat(Chat {
+                                message: "Cannot teleport across dimensions!".to_string(),
+                            }),
+                        );
+                    } else {
+                        self.with_dimension(victim_dimension, |s| {
+                            s.dismount_player(veid);
+                            if let Some(vp) = s.entities.get_player_mut(veid) {
+                                let old_c = vp.chunk_pos();
+                                vp.update_position(tx, ty, ty, tz, tyaw, tpitch, false);
+                                vp.fall_distance = 0.0;
+                                let new_c = vp.chunk_pos();
+                                s.entities.update_player_chunk(veid, old_c, new_c);
+                            }
+                            s.send(
+                                vconn,
+                                Clientbound::PlayerLookMove(PlayerLookMove {
+                                    x: tx,
+                                    y: ty + 1.62,
+                                    stance: ty,
+                                    z: tz,
+                                    yaw: tyaw,
+                                    pitch: tpitch,
+                                    on_ground: false,
+                                }),
+                            );
+                            s.handle_movement(
+                                vconn,
+                                Some((tx, ty, ty, tz)),
+                                Some((tyaw, tpitch)),
+                                false,
+                            );
+                        });
                     }
-                    self.send(
-                        vconn,
-                        Clientbound::PlayerLookMove(PlayerLookMove {
-                            x: tx,
-                            y: ty + 1.62,
-                            stance: ty,
-                            z: tz,
-                            yaw: tyaw,
-                            pitch: tpitch,
-                            on_ground: false,
-                        }),
-                    );
-                    self.handle_movement(
-                        vconn,
-                        Some((tx, ty, ty, tz)),
-                        Some((tyaw, tpitch)),
-                        false,
-                    );
                 }
             }
             CommandAction::TeleportToCoords { victim, x, y, z } => {
@@ -8970,41 +9719,55 @@ impl Server {
                     .entities
                     .iter_players()
                     .find(|p| p.username.eq_ignore_ascii_case(&victim))
-                    .map(|p| (p.conn_id, p.entity_id, p.yaw, p.pitch));
-                if let Some((vconn, veid, vyaw, vpitch)) = victim_info {
-                    self.dismount_player(veid);
-                    if let Some(vp) = self.entities.get_player_mut(veid) {
-                        let old_c = vp.chunk_pos();
-                        vp.update_position(x, y, y, z, vyaw, vpitch, false);
-                        vp.fall_distance = 0.0;
-                        let new_c = vp.chunk_pos();
-                        self.entities.update_player_chunk(veid, old_c, new_c);
-                    }
-                    self.send(
-                        vconn,
-                        Clientbound::PlayerLookMove(PlayerLookMove {
-                            x,
-                            y: y + 1.62,
-                            stance: y,
-                            z,
-                            yaw: vyaw,
-                            pitch: vpitch,
-                            on_ground: false,
-                        }),
-                    );
-                    self.handle_movement(vconn, Some((x, y, y, z)), Some((vyaw, vpitch)), false);
+                    .map(|p| (p.conn_id, p.entity_id, p.yaw, p.pitch, p.dimension));
+                if let Some((vconn, veid, vyaw, vpitch, victim_dimension)) = victim_info {
+                    self.with_dimension(victim_dimension, |s| {
+                        s.dismount_player(veid);
+                        if let Some(vp) = s.entities.get_player_mut(veid) {
+                            let old_c = vp.chunk_pos();
+                            vp.update_position(x, y, y, z, vyaw, vpitch, false);
+                            vp.fall_distance = 0.0;
+                            let new_c = vp.chunk_pos();
+                            s.entities.update_player_chunk(veid, old_c, new_c);
+                        }
+                        s.send(
+                            vconn,
+                            Clientbound::PlayerLookMove(PlayerLookMove {
+                                x,
+                                y: y + 1.62,
+                                stance: y,
+                                z,
+                                yaw: vyaw,
+                                pitch: vpitch,
+                                on_ground: false,
+                            }),
+                        );
+                        s.handle_movement(vconn, Some((x, y, y, z)), Some((vyaw, vpitch)), false);
+                    });
                 }
             }
             CommandAction::SetTime(t) => {
                 self.world.live_time = t;
                 self.world.level_data.borrow_mut().time = t;
-                self.broadcast(Clientbound::UpdateTime(UpdateTime { time: t }));
+                if self.nether.is_some() {
+                    self.with_dimension(-1, |s| {
+                        s.world.live_time = t;
+                        s.world.level_data.borrow_mut().time = t;
+                    });
+                }
+                self.broadcast_all(Clientbound::UpdateTime(UpdateTime { time: t }));
             }
             CommandAction::AddTime(delta) => {
                 let t = self.world.world_time().wrapping_add(delta);
                 self.world.live_time = t;
                 self.world.level_data.borrow_mut().time = t;
-                self.broadcast(Clientbound::UpdateTime(UpdateTime { time: t }));
+                if self.nether.is_some() {
+                    self.with_dimension(-1, |s| {
+                        s.world.live_time = t;
+                        s.world.level_data.borrow_mut().time = t;
+                    });
+                }
+                self.broadcast_all(Clientbound::UpdateTime(UpdateTime { time: t }));
             }
             CommandAction::Kill(target) => {
                 let target_eid = self
@@ -9013,7 +9776,15 @@ impl Server {
                     .find(|p| p.username.eq_ignore_ascii_case(&target))
                     .map(|p| p.entity_id);
                 if let Some(eid) = target_eid {
-                    self.damage_player_direct(eid, 1000, "died");
+                    // The death packets belong to the victim's dimension.
+                    let victim_dimension = self
+                        .entities
+                        .get_player(eid)
+                        .map(|p| p.dimension)
+                        .unwrap_or(0);
+                    self.with_dimension(victim_dimension, |s| {
+                        s.damage_player_direct(eid, 1000, "died");
+                    });
                 }
             }
             CommandAction::Kick { target, reason } => {
@@ -9097,6 +9868,11 @@ impl Server {
                     let _ = self.player_store.save_player(player);
                 }
                 let _ = self.world.save_all();
+                if self.nether.is_some() {
+                    self.with_dimension(-1, |s| {
+                        let _ = s.world.save_all();
+                    });
+                }
             }
             CommandAction::SaveOn => {
                 self.config.world.save_enabled = true;
@@ -9111,6 +9887,11 @@ impl Server {
                     }
                 }
                 let _ = self.world.save_all();
+                if self.nether.is_some() {
+                    self.with_dimension(-1, |s| {
+                        let _ = s.world.save_all();
+                    });
+                }
                 let conn_ids: Vec<ConnId> = self.connections.keys().copied().collect();
                 let msg = self.config.messages.kick_shutdown.clone();
                 for cid in conn_ids {
@@ -9155,7 +9936,7 @@ impl Server {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '?')
     }
 
-    fn damage_player_direct(&mut self, entity_id: i32, damage: i16, reason: &str) {
+    fn damage_player_direct(&mut self, entity_id: i32, damage: i16, reason: &str) -> bool {
         let keep_inv = self.config.mechanics.keep_inventory_on_death;
         let (conn_id, username, health, died, drops) = {
             if let Some(player) = self.entities.get_player_mut(entity_id) {
@@ -9182,10 +9963,10 @@ impl Server {
                         drops,
                     )
                 } else {
-                    return;
+                    return false;
                 }
             } else {
-                return;
+                return false;
             }
         };
 
@@ -9208,6 +9989,7 @@ impl Server {
                 status: 3,
             }));
         }
+        true
     }
 
     #[allow(dead_code)]
@@ -9266,7 +10048,27 @@ impl Server {
         }
     }
 
+    /// Send a world-scoped packet to players in the currently active
+    /// dimension only (sounds, explosions, entity status, weather, ...).
     fn broadcast(&self, packet: Clientbound) {
+        let active_dimension = self.active_dimension;
+        for (&conn_id, connection) in &self.connections {
+            if connection.state != ConnectionState::Playing {
+                continue;
+            }
+            if self
+                .entities
+                .get_by_conn(conn_id)
+                .is_some_and(|p| p.dimension == active_dimension)
+            {
+                let _ = connection.sender.send(Outbound::Packet(packet.clone()));
+            }
+        }
+    }
+
+    /// Send a packet to every logged-in player regardless of dimension
+    /// (chat, time-of-day, keep-alive, ...).
+    fn broadcast_all(&self, packet: Clientbound) {
         for connection in self.connections.values() {
             if connection.state == ConnectionState::Playing {
                 let _ = connection.sender.send(Outbound::Packet(packet.clone()));
@@ -9325,6 +10127,160 @@ impl Server {
                     },
                 )));
             let _ = connection.sender.send(Outbound::Close);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_server() -> Server {
+        let mut config = Config::default();
+        config.world.save_enabled = false;
+        config.world.view_distance = 2;
+        config.server.allow_nether = true;
+        let (_tx, rx) = mpsc::channel(8);
+        Server::new(config, rx, Arc::new(AtomicBool::new(true)))
+    }
+
+    #[test]
+    fn portal_travel_round_trips_between_overworld_and_nether() {
+        let mut server = test_server();
+
+        // Offline worlds need their chunks present before block writes/portal
+        // scans touch them.
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                server.world.ensure_chunk_base(ChunkPos::new(cx, cz));
+                server
+                    .nether
+                    .as_mut()
+                    .unwrap()
+                    .ensure_chunk_base(ChunkPos::new(cx, cz));
+            }
+        }
+
+        // 4x5 obsidian frame with a 2x3 interior at z = 0.
+        for x in 0..=3 {
+            for y in 63..=67 {
+                let edge = x == 0 || x == 3 || y == 63 || y == 67;
+                server.world.set_block(
+                    x,
+                    y,
+                    0,
+                    if edge {
+                        blocks::OBSIDIAN
+                    } else {
+                        blocks::PORTAL
+                    },
+                );
+            }
+        }
+
+        let eid = server
+            .entities
+            .insert_player(1, "Tester".to_string(), 2.0, 64.0, 0.5);
+        {
+            let player = server.entities.get_player_mut(eid).unwrap();
+            player.dimension = 0;
+            player.chunk_queue.clear();
+        }
+
+        server.travel_player(eid);
+        {
+            let player = server.entities.get_player(eid).unwrap();
+            assert_eq!(player.dimension, -1);
+        }
+
+        // A destination portal must have been created near the scaled
+        // coordinates (2 * 0.125, 0.5 * 0.125).
+        let nether = server.nether.as_mut().unwrap();
+        let mut found_portal = false;
+        for x in -20..=20 {
+            for z in -20..=20 {
+                for y in 60..=80 {
+                    if nether.get_block(x, y, z) == blocks::PORTAL {
+                        found_portal = true;
+                    }
+                }
+            }
+        }
+        assert!(found_portal, "nether portal was not created");
+
+        server.travel_player(eid);
+        {
+            let player = server.entities.get_player(eid).unwrap();
+            assert_eq!(player.dimension, 0);
+            // Snapped back onto the bottom-center of the original portal.
+            assert_eq!((player.x, player.y, player.z), (2.0, 64.5, 0.5));
+        }
+    }
+
+    /// Build an obsidian-framed portal with a 2x3 interior at `z = 0` and a
+    /// player standing in it.
+    fn build_test_portal(server: &mut Server, eid: i32) {
+        for x in 0..=3 {
+            for y in 63..=67 {
+                let edge = x == 0 || x == 3 || y == 63 || y == 67;
+                server.world.set_block(
+                    x,
+                    y,
+                    0,
+                    if edge {
+                        blocks::OBSIDIAN
+                    } else {
+                        blocks::PORTAL
+                    },
+                );
+            }
+        }
+        if let Some(player) = server.entities.get_player_mut(eid) {
+            player.dimension = 0;
+            player.chunk_queue.clear();
+            player.x = 2.0;
+            player.y = 64.0;
+            player.z = 0.5;
+        }
+    }
+
+    #[test]
+    fn portal_cooldown_blocks_immediate_re_entry() {
+        let mut server = test_server();
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                server.world.ensure_chunk_base(ChunkPos::new(cx, cz));
+                server
+                    .nether
+                    .as_mut()
+                    .unwrap()
+                    .ensure_chunk_base(ChunkPos::new(cx, cz));
+            }
+        }
+
+        let eid = server
+            .entities
+            .insert_player(1, "Tester".to_string(), 2.0, 64.0, 0.5);
+        build_test_portal(&mut server, eid);
+
+        // Java `EntityHuman.m_()`: the portal timer only advances while the
+        // player stands in a portal. `F += 0.0125F` is a `float`, so the
+        // accumulator only reaches 1.0 on the 81st tick.
+        for _ in 0..80 {
+            server.tick_player_portals();
+        }
+        {
+            let player = server.entities.get_player(eid).unwrap();
+            assert_eq!(
+                player.dimension, 0,
+                "travel must not happen before the portal timer fills"
+            );
+        }
+
+        server.tick_player_portals();
+        {
+            let player = server.entities.get_player(eid).unwrap();
+            assert_eq!(player.dimension, -1, "travel must happen when F >= 1.0");
         }
     }
 }

@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use crate::gameplay::blocks;
 use crate::util::rng::JavaRandom;
 use crate::world::chunk::{ChunkPos, ChunkState};
-use crate::world::world::{with_generator, World};
+use crate::world::world::World;
 
 #[derive(Debug, Clone)]
 pub struct DirtyChunk {
@@ -161,7 +161,13 @@ impl World {
     /// `World.canSpawn(x, z)` -> `WorldProvider.canSpawn`: the top block of the
     /// column is sand.
     fn live_can_spawn(&mut self, x: i32, z: i32) -> bool {
-        self.live_world_top_block(x, z) == blocks::SAND
+        let top = self.live_world_top_block(x, z);
+        if self.is_hell {
+            // WorldProviderHell.canSpawn: non-air, non-bedrock, Block.o[id].
+            top != blocks::BEDROCK && top != blocks::AIR && blocks::is_spawnable(top)
+        } else {
+            top == blocks::SAND
+        }
     }
 
     /// Java `World.a(i, j)`: scan up from `y = 63` to the first empty cell and
@@ -315,11 +321,7 @@ impl World {
             return;
         }
         self.chunks.get_mut(&pos).unwrap().state = ChunkState::Populating;
-
-        let seed = self.seed();
-        with_generator(seed, |gen| {
-            gen.populate(self, pos.x, pos.z);
-        });
+        self.populate_center(pos);
 
         let chunk = self.chunks.get_mut(&pos).unwrap();
         chunk.state = ChunkState::Populated;
