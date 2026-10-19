@@ -463,15 +463,30 @@ pub fn is_solid(id: u8) -> bool {
             | LAVA
             | STATIONARY_LAVA
             | SAPLING
+            | POWERED_RAIL
+            | DETECTOR_RAIL
+            | WEB
             | TALL_GRASS
             | DEAD_BUSH
             | YELLOW_FLOWER
             | RED_ROSE
             | BROWN_MUSHROOM
             | RED_MUSHROOM
-            | CROPS
-            | SNOW
+            | TORCH
             | FIRE
+            | REDSTONE_WIRE
+            | CROPS
+            | SIGN
+            | RAIL
+            | WALL_SIGN
+            | LEVER
+            | STONE_PLATE
+            | WOOD_PLATE
+            | REDSTONE_TORCH_OFF
+            | REDSTONE_TORCH_ON
+            | STONE_BUTTON
+            | SNOW
+            | REED
             | PORTAL
     )
 }

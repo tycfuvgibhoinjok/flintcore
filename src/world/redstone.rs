@@ -1553,6 +1553,541 @@ impl World {
     }
 
     // ---------------------------------------------------------------------
+    // Minecart Physics (`EntityMinecart.java`: `h`, `move`, `m_`)
+    // ---------------------------------------------------------------------
+
+    /// Java `EntityMinecart.h(double d0, double d1, double d2)` (`EntityMinecart.java:592-656`).
+    pub fn snap_to_rail_h(&self, mut d0: f64, mut d1: f64, mut d2: f64) -> Option<(f64, f64, f64)> {
+        let i = d0.floor() as i32;
+        let mut j = d1.floor() as i32;
+        let k = d2.floor() as i32;
+
+        if self.is_rail_at(i, j - 1, k) {
+            j -= 1;
+        }
+
+        let l = self.get_block(i, j, k);
+        if Self::is_rail_block(l) {
+            let mut i1 = self.get_data(i, j, k);
+            if l == blocks::POWERED_RAIL || l == blocks::DETECTOR_RAIL {
+                i1 &= 7;
+            }
+
+            let aint = crate::entity::projectile::RAIL_MATRIX[(i1 as usize).min(9)];
+            let d4 = i as f64 + 0.5 + (aint[0][0] as f64) * 0.5;
+            let d5 = j as f64 + 0.5 + (aint[0][1] as f64) * 0.5;
+            let d6 = k as f64 + 0.5 + (aint[0][2] as f64) * 0.5;
+            let d7 = i as f64 + 0.5 + (aint[1][0] as f64) * 0.5;
+            let d8 = j as f64 + 0.5 + (aint[1][1] as f64) * 0.5;
+            let d9 = k as f64 + 0.5 + (aint[1][2] as f64) * 0.5;
+            let d10 = d7 - d4;
+            let d11 = (d8 - d5) * 2.0;
+            let d12 = d9 - d6;
+
+            let d3 = if d10 == 0.0 {
+                d2 - k as f64
+            } else if d12 == 0.0 {
+                d0 - i as f64
+            } else {
+                let d13 = d0 - d4;
+                let d14 = d2 - d6;
+                (d13 * d10 + d14 * d12) * 2.0
+            };
+
+            d0 = d4 + d10 * d3;
+            d1 = d5 + d11 * d3;
+            d2 = d6 + d12 * d3;
+            if d11 < 0.0 {
+                d1 += 1.0;
+            }
+            if d11 > 0.0 {
+                d1 += 0.5;
+            }
+            Some((d0, d1, d2))
+        } else {
+            None
+        }
+    }
+
+    /// Java `Entity.move(double d0, double d1, double d2)` (`Entity.java:353-641`) for `EntityMinecart`.
+    /// Returns `Some(fall_damage)` if the minecart landed from a fall and should transfer damage to its passenger.
+    pub fn move_minecart_aabb(
+        &mut self,
+        cart: &mut crate::entity::projectile::Minecart,
+        mut d0: f64,
+        mut d1: f64,
+        mut d2: f64,
+    ) -> Option<i16> {
+        let d5 = d0;
+        let d6 = d1;
+        let d7 = d2;
+        let (mut bb_a, mut bb_b, mut bb_c, mut bb_d, mut bb_e, mut bb_f) = cart.bounding_box();
+
+        let qa = bb_a + d0.min(0.0);
+        let qb = bb_b + d1.min(0.0);
+        let qc = bb_c + d2.min(0.0);
+        let qd = bb_d + d0.max(0.0);
+        let qe = bb_e + d1.max(0.0);
+        let qf = bb_f + d2.max(0.0);
+
+        let min_bx = qa.floor() as i32;
+        let max_bx = (qd + 1.0).floor() as i32;
+        let min_by = qb.floor() as i32 - 1;
+        let max_by = (qe + 1.0).floor() as i32;
+        let min_bz = qc.floor() as i32;
+        let max_bz = (qf + 1.0).floor() as i32;
+
+        let mut block_bbs = Vec::new();
+        for bx in min_bx..max_bx {
+            for bz in min_bz..max_bz {
+                if !self.is_chunk_loaded(ChunkPos::new(bx >> 4, bz >> 4)) {
+                    continue;
+                }
+                for by in min_by..max_by {
+                    if !(0..128).contains(&by) {
+                        continue;
+                    }
+                    let bid = self.get_block(bx, by, bz);
+                    if !blocks::is_solid(bid) {
+                        continue;
+                    }
+                    let ba = bx as f64;
+                    let bb = by as f64;
+                    let bc = bz as f64;
+                    let bd = (bx + 1) as f64;
+                    let bf = (bz + 1) as f64;
+                    let be = match bid {
+                        blocks::STEP => by as f64 + 0.5,
+                        blocks::SOUL_SAND => by as f64 + 0.875,
+                        blocks::FENCE => by as f64 + 1.5,
+                        blocks::BED => by as f64 + 0.5625,
+                        _ => (by + 1) as f64,
+                    };
+                    if qd > ba && qa < bd && qe > bb && qb < be && qf > bc && qc < bf {
+                        block_bbs.push((ba, bb, bc, bd, be, bf));
+                    }
+                }
+            }
+        }
+
+        // 1. Sweep Y (`AxisAlignedBB.b`)
+        for &(ba, bb, bc, bd, be, bf) in &block_bbs {
+            if bb_d > ba && bb_a < bd && bb_f > bc && bb_c < bf {
+                if d1 > 0.0 && bb_e <= bb {
+                    let diff = bb - bb_e;
+                    if diff < d1 {
+                        d1 = diff;
+                    }
+                }
+                if d1 < 0.0 && bb_b >= be {
+                    let diff = be - bb_b;
+                    if diff > d1 {
+                        d1 = diff;
+                    }
+                }
+            }
+        }
+        bb_b += d1;
+        bb_e += d1;
+
+        // 2. Sweep X (`AxisAlignedBB.a`)
+        for &(ba, bb, bc, bd, be, bf) in &block_bbs {
+            if bb_e > bb && bb_b < be && bb_f > bc && bb_c < bf {
+                if d0 > 0.0 && bb_d <= ba {
+                    let diff = ba - bb_d;
+                    if diff < d0 {
+                        d0 = diff;
+                    }
+                }
+                if d0 < 0.0 && bb_a >= bd {
+                    let diff = bd - bb_a;
+                    if diff > d0 {
+                        d0 = diff;
+                    }
+                }
+            }
+        }
+        bb_a += d0;
+        bb_d += d0;
+
+        // 3. Sweep Z (`AxisAlignedBB.c`)
+        for &(ba, bb, bc, bd, be, bf) in &block_bbs {
+            if bb_d > ba && bb_a < bd && bb_e > bb && bb_b < be {
+                if d2 > 0.0 && bb_f <= bc {
+                    let diff = bc - bb_f;
+                    if diff < d2 {
+                        d2 = diff;
+                    }
+                }
+                if d2 < 0.0 && bb_c >= bf {
+                    let diff = bf - bb_c;
+                    if diff > d2 {
+                        d2 = diff;
+                    }
+                }
+            }
+        }
+        bb_c += d2;
+        bb_f += d2;
+
+        cart.x = (bb_a + bb_d) / 2.0;
+        cart.y = bb_b + crate::entity::projectile::MINECART_HEIGHT_OFFSET;
+        cart.z = (bb_c + bb_f) / 2.0;
+        cart.on_ground = d6 != d1 && d6 < 0.0;
+
+        let mut passenger_fall_dmg = None;
+        if cart.on_ground {
+            if cart.fall_distance > 0.0 {
+                let dmg = ((cart.fall_distance - 3.0).ceil() as i16).max(0);
+                if dmg > 0 {
+                    passenger_fall_dmg = Some(dmg);
+                }
+                cart.fall_distance = 0.0;
+            }
+        } else if d1 < 0.0 {
+            cart.fall_distance -= d1 as f32;
+        }
+
+        if d5 != d0 {
+            cart.mot_x = 0.0;
+        }
+        if d6 != d1 {
+            cart.mot_y = 0.0;
+        }
+        if d7 != d2 {
+            cart.mot_z = 0.0;
+        }
+
+        // Entity.java:592-611 — invoke `Block.a` on blocks overlapping `boundingBox`
+        let l = (bb_a + 0.001).floor() as i32;
+        let i1 = (bb_b + 0.001).floor() as i32;
+        let j1 = (bb_c + 0.001).floor() as i32;
+        let k = (bb_d - 0.001).floor() as i32;
+        let k1 = (bb_e - 0.001).floor() as i32;
+        let l1 = (bb_f - 0.001).floor() as i32;
+
+        if self.chunks_area_loaded(l, i1.max(0), j1, k, k1.min(127), l1) {
+            for ix in l..=k {
+                for iy in i1.max(0)..=k1.min(127) {
+                    for iz in j1..=l1 {
+                        if self.get_block(ix, iy, iz) == blocks::DETECTOR_RAIL {
+                            // BlockMinecartDetector.f: AABB `[ix + 0.125 .. ix + 0.875, iy .. iy + 0.25, iz + 0.125 .. iz + 0.875]`
+                            if bb_d > ix as f64 + 0.125
+                                && bb_a < ix as f64 + 0.875
+                                && bb_e > iy as f64
+                                && bb_b < iy as f64 + 0.25
+                                && bb_f > iz as f64 + 0.125
+                                && bb_c < iz as f64 + 0.875
+                            {
+                                self.active_detector_rails.insert((ix, iy, iz));
+                                let meta = self.get_data(ix, iy, iz);
+                                if (meta & 8) == 0 {
+                                    self.java_set_data(ix, iy, iz, meta | 8);
+                                    self.java_apply_physics(
+                                        ix,
+                                        iy,
+                                        iz,
+                                        blocks::DETECTOR_RAIL as i32,
+                                    );
+                                    self.java_apply_physics(
+                                        ix,
+                                        iy - 1,
+                                        iz,
+                                        blocks::DETECTOR_RAIL as i32,
+                                    );
+                                    self.java_schedule_tick(ix, iy, iz, blocks::DETECTOR_RAIL, 20);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        passenger_fall_dmg
+    }
+
+    /// Java `EntityMinecart.m_()` (`EntityMinecart.java:209-590`).
+    /// Returns `Some(fall_damage)` if the minecart landed and transferred fall damage to its passenger.
+    pub fn tick_single_minecart(
+        &mut self,
+        cart: &mut crate::entity::projectile::Minecart,
+    ) -> Option<i16> {
+        if cart.time_since_hit > 0 {
+            cart.time_since_hit -= 1;
+        }
+        if cart.damage > 0 {
+            cart.damage -= 1;
+        }
+        if cart.y < -64.0 {
+            cart.dead = true;
+            return None;
+        }
+
+        cart.last_x = cart.x;
+        cart.last_y = cart.y;
+        cart.last_z = cart.z;
+        cart.mot_y -= 0.03999999910593033;
+
+        let i = cart.x.floor() as i32;
+        let mut j = cart.y.floor() as i32;
+        let k = cart.z.floor() as i32;
+
+        if self.is_rail_at(i, j - 1, k) {
+            j -= 1;
+        }
+
+        let d4 = cart.max_speed;
+        let mut flag = false;
+        let d0 = 0.0078125_f64;
+        let l = self.get_block(i, j, k);
+        let passenger_fall_dmg;
+
+        if Self::is_rail_block(l) {
+            let vec3d = self.snap_to_rail_h(cart.x, cart.y, cart.z);
+            let mut i1 = self.get_data(i, j, k);
+            cart.y = j as f64;
+            let mut flag1 = false;
+            let mut flag2 = false;
+
+            if l == blocks::POWERED_RAIL {
+                flag1 = (i1 & 8) != 0;
+                flag2 = !flag1;
+            }
+            if l == blocks::POWERED_RAIL || l == blocks::DETECTOR_RAIL {
+                i1 &= 7;
+            }
+            if (2..=5).contains(&i1) {
+                cart.y = (j + 1) as f64;
+            }
+
+            if i1 == 2 {
+                cart.mot_x -= d0;
+            }
+            if i1 == 3 {
+                cart.mot_x += d0;
+            }
+            if i1 == 4 {
+                cart.mot_z += d0;
+            }
+            if i1 == 5 {
+                cart.mot_z -= d0;
+            }
+
+            let aint = crate::entity::projectile::RAIL_MATRIX[(i1 as usize).min(9)];
+            let mut d5 = (aint[1][0] - aint[0][0]) as f64;
+            let mut d6 = (aint[1][2] - aint[0][2]) as f64;
+            let d7 = (d5 * d5 + d6 * d6).sqrt();
+            let d8 = cart.mot_x * d5 + cart.mot_z * d6;
+            if d8 < 0.0 {
+                d5 = -d5;
+                d6 = -d6;
+            }
+
+            let mut d9 = (cart.mot_x * cart.mot_x + cart.mot_z * cart.mot_z).sqrt();
+            cart.mot_x = d9 * d5 / d7;
+            cart.mot_z = d9 * d6 / d7;
+
+            if flag2 {
+                let d10_spd = (cart.mot_x * cart.mot_x + cart.mot_z * cart.mot_z).sqrt();
+                if d10_spd < 0.03 {
+                    cart.mot_x *= 0.0;
+                    cart.mot_y *= 0.0;
+                    cart.mot_z *= 0.0;
+                } else {
+                    cart.mot_x *= 0.5;
+                    cart.mot_y *= 0.0;
+                    cart.mot_z *= 0.5;
+                }
+            }
+
+            let d11 = i as f64 + 0.5 + (aint[0][0] as f64) * 0.5;
+            let d12 = k as f64 + 0.5 + (aint[0][2] as f64) * 0.5;
+            let d13 = i as f64 + 0.5 + (aint[1][0] as f64) * 0.5;
+            let d14 = k as f64 + 0.5 + (aint[1][2] as f64) * 0.5;
+            d5 = d13 - d11;
+            d6 = d14 - d12;
+
+            let d10 = if d5 == 0.0 {
+                cart.x = i as f64 + 0.5;
+                cart.z - k as f64
+            } else if d6 == 0.0 {
+                cart.z = k as f64 + 0.5;
+                cart.x - i as f64
+            } else {
+                let d16 = cart.x - d11;
+                let d15 = cart.z - d12;
+                (d16 * d5 + d15 * d6) * 2.0
+            };
+
+            cart.x = d11 + d5 * d10;
+            cart.z = d12 + d6 * d10;
+            cart.set_position(
+                cart.x,
+                cart.y + crate::entity::projectile::MINECART_HEIGHT_OFFSET,
+                cart.z,
+            );
+
+            let mut d16 = cart.mot_x;
+            let mut d15 = cart.mot_z;
+            if cart.passenger_id.is_some() {
+                d16 *= 0.75;
+                d15 *= 0.75;
+            }
+            d16 = d16.clamp(-d4, d4);
+            d15 = d15.clamp(-d4, d4);
+
+            passenger_fall_dmg = self.move_minecart_aabb(cart, d16, 0.0, d15);
+
+            if aint[0][1] != 0
+                && (cart.x.floor() as i32) - i == aint[0][0]
+                && (cart.z.floor() as i32) - k == aint[0][2]
+            {
+                cart.set_position(cart.x, cart.y + aint[0][1] as f64, cart.z);
+            } else if aint[1][1] != 0
+                && (cart.x.floor() as i32) - i == aint[1][0]
+                && (cart.z.floor() as i32) - k == aint[1][2]
+            {
+                cart.set_position(cart.x, cart.y + aint[1][1] as f64, cart.z);
+            }
+
+            if cart.passenger_id.is_some() || !cart.slow_when_empty {
+                cart.mot_x *= 0.996999979019165;
+                cart.mot_y *= 0.0;
+                cart.mot_z *= 0.996999979019165;
+            } else {
+                if cart.cart_type == 2 {
+                    let d17 = ((cart.push_x * cart.push_x + cart.push_z * cart.push_z).sqrt()
+                        as f32) as f64;
+                    if d17 > 0.01 {
+                        flag = true;
+                        cart.push_x /= d17;
+                        cart.push_z /= d17;
+                        let d18 = 0.04;
+                        cart.mot_x *= 0.800000011920929;
+                        cart.mot_y *= 0.0;
+                        cart.mot_z *= 0.800000011920929;
+                        cart.mot_x += cart.push_x * d18;
+                        cart.mot_z += cart.push_z * d18;
+                    } else {
+                        cart.mot_x *= 0.8999999761581421;
+                        cart.mot_y *= 0.0;
+                        cart.mot_z *= 0.8999999761581421;
+                    }
+                }
+                cart.mot_x *= 0.9599999785423279;
+                cart.mot_y *= 0.0;
+                cart.mot_z *= 0.9599999785423279;
+            }
+
+            let vec3d1 = self.snap_to_rail_h(cart.x, cart.y, cart.z);
+            if let (Some(v1), Some(v0)) = (vec3d1, vec3d) {
+                let d19 = (v0.1 - v1.1) * 0.05;
+                d9 = (cart.mot_x * cart.mot_x + cart.mot_z * cart.mot_z).sqrt();
+                if d9 > 0.0 {
+                    cart.mot_x = cart.mot_x / d9 * (d9 + d19);
+                    cart.mot_z = cart.mot_z / d9 * (d9 + d19);
+                }
+                cart.set_position(cart.x, v1.1, cart.z);
+            }
+
+            let j1 = cart.x.floor() as i32;
+            let k1 = cart.z.floor() as i32;
+            if j1 != i || k1 != k {
+                d9 = (cart.mot_x * cart.mot_x + cart.mot_z * cart.mot_z).sqrt();
+                cart.mot_x = d9 * ((j1 - i) as f64);
+                cart.mot_z = d9 * ((k1 - k) as f64);
+            }
+
+            if cart.cart_type == 2 {
+                let d20 =
+                    ((cart.push_x * cart.push_x + cart.push_z * cart.push_z).sqrt() as f32) as f64;
+                if d20 > 0.01 && cart.mot_x * cart.mot_x + cart.mot_z * cart.mot_z > 0.001 {
+                    cart.push_x /= d20;
+                    cart.push_z /= d20;
+                    if cart.push_x * cart.mot_x + cart.push_z * cart.mot_z < 0.0 {
+                        cart.push_x = 0.0;
+                        cart.push_z = 0.0;
+                    } else {
+                        cart.push_x = cart.mot_x;
+                        cart.push_z = cart.mot_z;
+                    }
+                }
+            }
+
+            if flag1 {
+                let d20 = (cart.mot_x * cart.mot_x + cart.mot_z * cart.mot_z).sqrt();
+                if d20 > 0.01 {
+                    let d21 = 0.06;
+                    cart.mot_x += cart.mot_x / d20 * d21;
+                    cart.mot_z += cart.mot_z / d20 * d21;
+                } else if i1 == 1 {
+                    if self.is_solid_normal_at(i - 1, j, k) {
+                        cart.mot_x = 0.02;
+                    } else if self.is_solid_normal_at(i + 1, j, k) {
+                        cart.mot_x = -0.02;
+                    }
+                } else if i1 == 0 {
+                    if self.is_solid_normal_at(i, j, k - 1) {
+                        cart.mot_z = 0.02;
+                    } else if self.is_solid_normal_at(i, j, k + 1) {
+                        cart.mot_z = -0.02;
+                    }
+                }
+            }
+        } else {
+            cart.mot_x = cart.mot_x.clamp(-d4, d4);
+            cart.mot_z = cart.mot_z.clamp(-d4, d4);
+            if cart.on_ground {
+                cart.mot_x *= cart.derailed_x;
+                cart.mot_y *= cart.derailed_y;
+                cart.mot_z *= cart.derailed_z;
+            }
+            passenger_fall_dmg = self.move_minecart_aabb(cart, cart.mot_x, cart.mot_y, cart.mot_z);
+            if !cart.on_ground {
+                cart.mot_x *= cart.flying_x;
+                cart.mot_y *= cart.flying_y;
+                cart.mot_z *= cart.flying_z;
+            }
+        }
+
+        cart.pitch = 0.0;
+        let d22 = cart.last_x - cart.x;
+        let d23 = cart.last_z - cart.z;
+        if d22 * d22 + d23 * d23 > 0.001 {
+            cart.yaw = (d23.atan2(d22) * 180.0 / std::f64::consts::PI) as f32;
+            if cart.yaw_flipped {
+                cart.yaw += 180.0;
+            }
+        }
+
+        let mut d24 = (cart.yaw - cart.last_yaw) as f64;
+        while d24 >= 180.0 {
+            d24 -= 360.0;
+        }
+        while d24 < -180.0 {
+            d24 += 360.0;
+        }
+        if !(-170.0..170.0).contains(&d24) {
+            cart.yaw += 180.0;
+            cart.yaw_flipped = !cart.yaw_flipped;
+        }
+        cart.yaw %= 360.0;
+        cart.pitch %= 360.0;
+        cart.last_yaw = cart.yaw;
+
+        if flag && cart.rng.next_i32_bound(4) == 0 {
+            cart.fuel -= 1;
+            if cart.fuel < 0 {
+                cart.push_x = 0.0;
+                cart.push_z = 0.0;
+            }
+        }
+
+        passenger_fall_dmg
+    }
+
+    // ---------------------------------------------------------------------
     // Fire (`BlockFire.java`: ID 51)
     // ---------------------------------------------------------------------
 
@@ -2646,5 +3181,127 @@ mod tests {
         assert!(world.reset_weather());
         assert!(!world.is_raining());
         assert!(!world.is_thundering());
+    }
+
+    #[test]
+    fn minecart_curve_slope_and_powered_rail_physics() {
+        use crate::entity::projectile::Minecart;
+
+        let mut world = make_flat_world();
+        // Build an L-shaped track:
+        // (1, 64, 4) = solid wall behind powered rail
+        // (2, 64, 3) = redstone torch powering the golden rail at (2, 64, 4)
+        // (2, 64, 4) = powered rail (lit, W-E, meta = 1 | 8 = 9)
+        // (3, 64, 4) = straight rail (W-E, meta = 1)
+        // (4, 64, 4) = curve rail connecting West (-X) and South (+Z) (meta = 7)
+        // (4, 64, 5) = straight rail (N-S, meta = 0)
+        // (4, 64, 6) = unpowered golden rail (braking, N-S, meta = 0)
+        world.java_set_type_id(1, 64, 4, blocks::STONE);
+        world.java_set_type_id_and_data(2, 64, 3, blocks::REDSTONE_TORCH_ON, 5);
+        world.java_set_type_id(2, 64, 4, blocks::POWERED_RAIL);
+        world.java_set_type_id(3, 64, 4, blocks::RAIL);
+        world.java_set_type_id(4, 64, 4, blocks::RAIL);
+        world.java_set_type_id(4, 64, 5, blocks::RAIL);
+        world.java_set_type_id(4, 64, 6, blocks::POWERED_RAIL);
+
+        // Spawn stationary minecart on the powered rail at (2, 64, 4)
+        let mut cart = Minecart::new(1, 0, 2.5, 64.5, 4.5);
+        assert!((cart.y - 64.85).abs() < 1e-6);
+
+        // Tick 1: wall kick-off should start moving the minecart in +X (`mot_x = 0.02`), and snap Y to `64.5`
+        world.tick_single_minecart(&mut cart);
+        assert!(
+            cart.mot_x > 0.0,
+            "Powered rail next to wall should kick cart in +X"
+        );
+        assert!((cart.y - 64.5).abs() < 1e-6);
+
+        // Tick until the cart rounds the corner at (4, 64, 4) and enters (4, 64, 5) moving in +Z
+        let mut turned_south = false;
+        for _ in 0..40 {
+            world.tick_single_minecart(&mut cart);
+            if cart.x.floor() as i32 == 4 && cart.z.floor() as i32 == 5 && cart.mot_z > 0.05 {
+                turned_south = true;
+                break;
+            }
+        }
+        assert!(
+            turned_south,
+            "Minecart should smoothly turn 90 degrees onto +Z rail at (4, 64, 5); pos=({}, {}), mot=({}, {})",
+            cart.x,
+            cart.z,
+            cart.mot_x,
+            cart.mot_z
+        );
+
+        // Continue ticking onto the unpowered golden rail at (4, 64, 6) -> should brake to a stop!
+        for _ in 0..30 {
+            world.tick_single_minecart(&mut cart);
+        }
+        assert_eq!(cart.mot_x, 0.0);
+        assert_eq!(cart.mot_z, 0.0);
+    }
+
+    #[test]
+    fn minecart_detector_rail_stays_powered_while_occupied() {
+        use crate::entity::projectile::Minecart;
+
+        let mut world = make_flat_world();
+        world.live_enable();
+        world.java_set_type_id_and_data(5, 64, 5, blocks::DETECTOR_RAIL, 0);
+
+        let mut cart = Minecart::new(1, 0, 5.5, 64.5, 5.5);
+
+        // Tick for 35 ticks while the cart stays stationary on the detector rail
+        for _ in 0..35 {
+            world.active_detector_rails.clear();
+            world.tick_single_minecart(&mut cart);
+            world.live_tick_ex(false);
+            assert_ne!(
+                world.get_data(5, 64, 5) & 8,
+                0,
+                "Detector rail must remain powered while minecart sits on it"
+            );
+        }
+
+        // Now move the minecart off the detector rail and advance 25 ticks -> detector rail must turn OFF
+        world.active_detector_rails.clear();
+        for _ in 0..25 {
+            world.live_tick_ex(false);
+        }
+        assert_eq!(
+            world.get_data(5, 64, 5) & 8,
+            0,
+            "Detector rail must turn off 20 ticks after minecart leaves"
+        );
+    }
+
+    #[test]
+    fn minecart_nbt_round_trip_and_furnace_traction() {
+        use crate::entity::projectile::Minecart;
+
+        let mut world = make_flat_world();
+        for x in 2..=8 {
+            world.java_set_type_id_and_data(x, 64, 5, blocks::RAIL, 1);
+        }
+
+        let mut powered = Minecart::new(10, 2, 3.5, 64.5, 5.5);
+        powered.fuel = 1200;
+        powered.push_x = 1.0;
+        powered.push_z = 0.0;
+
+        for _ in 0..10 {
+            world.tick_single_minecart(&mut powered);
+        }
+        assert!(
+            powered.x > 3.8 && powered.mot_x > 0.1,
+            "Furnace minecart with fuel and push_x should propel itself along the track"
+        );
+
+        let nbt = powered.to_nbt();
+        let restored = Minecart::from_nbt(10, &nbt).expect("valid Minecart NBT");
+        assert_eq!(restored.cart_type, 2);
+        assert_eq!(restored.fuel, powered.fuel);
+        assert!((restored.x - powered.x).abs() < 1e-6);
     }
 }

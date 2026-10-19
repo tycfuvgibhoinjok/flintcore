@@ -329,7 +329,7 @@ impl EntityTrackerEntry {
     }
 
     pub fn make_minecart_spawn_packets(&self, cart: &Minecart) -> Vec<Clientbound> {
-        let mut packets = Vec::with_capacity(2);
+        let mut packets = Vec::with_capacity(3);
         packets.push(Clientbound::VehicleSpawn(VehicleSpawn {
             entity_id: cart.entity_id,
             vehicle_type: cart.vehicle_type(),
@@ -338,6 +338,12 @@ impl EntityTrackerEntry {
             z: self.encoded_z,
             thrower_id: 0,
             velocity: None,
+        }));
+        packets.push(Clientbound::EntityVelocity(EntityVelocity {
+            entity_id: cart.entity_id,
+            mot_x: (cart.mot_x.clamp(-3.9, 3.9) * 8000.0) as i16,
+            mot_y: (cart.mot_y.clamp(-3.9, 3.9) * 8000.0) as i16,
+            mot_z: (cart.mot_z.clamp(-3.9, 3.9) * 8000.0) as i16,
         }));
         if let Some(pid) = cart.passenger_id {
             packets.push(Clientbound::AttachEntity(AttachEntity {
@@ -1423,13 +1429,72 @@ impl EntityTracker {
         mot_z: f64,
         outbound: &mut Vec<OutboundTrackingPacket>,
     ) {
+        entry.teleport_ticks += 1;
+        let new_x = (x * 32.0).floor() as i32;
+        let new_y = (y * 32.0).floor() as i32;
+        let new_z = (z * 32.0).floor() as i32;
+        let new_yaw = pack_angle(yaw);
+        let new_pitch = pack_angle(pitch);
+
+        let dx = new_x - entry.encoded_x;
+        let dy = new_y - entry.encoded_y;
+        let dz = new_z - entry.encoded_z;
+
+        // EntityTrackerEntry.java:82-85 — needsPositionUpdate is always true for EntityBoat & EntityMinecart
+        let needs_pos = true;
+        let needs_rot = new_yaw != entry.encoded_yaw || new_pitch != entry.encoded_pitch;
+
+        if needs_pos {
+            entry.encoded_x = new_x;
+            entry.encoded_y = new_y;
+            entry.encoded_z = new_z;
+        }
+        if needs_rot {
+            entry.encoded_yaw = new_yaw;
+            entry.encoded_pitch = new_pitch;
+        }
+
+        let move_packet = if (-128..128).contains(&dx)
+            && (-128..128).contains(&dy)
+            && (-128..128).contains(&dz)
+            && entry.teleport_ticks <= 400
+        {
+            if needs_pos && needs_rot {
+                Clientbound::RelEntityMoveLook(RelEntityMoveLook {
+                    entity_id,
+                    dx: dx as i8,
+                    dy: dy as i8,
+                    dz: dz as i8,
+                    yaw: new_yaw,
+                    pitch: new_pitch,
+                })
+            } else {
+                Clientbound::RelEntityMove(RelEntityMove {
+                    entity_id,
+                    dx: dx as i8,
+                    dy: dy as i8,
+                    dz: dz as i8,
+                })
+            }
+        } else {
+            entry.teleport_ticks = 0;
+            Clientbound::EntityTeleport(EntityTeleport {
+                entity_id,
+                x: new_x,
+                y: new_y,
+                z: new_z,
+                yaw: new_yaw,
+                pitch: new_pitch,
+            })
+        };
+
+        // EntityTrackerEntry.java:126-143 — send Packet28EntityVelocity before move packet
         let dvx = mot_x - entry.last_mot_x;
         let dvy = mot_y - entry.last_mot_y;
         let dvz = mot_z - entry.last_mot_z;
         let vel_delta_sq = dvx * dvx + dvy * dvy + dvz * dvz;
         if vel_delta_sq > 0.0004
             || (vel_delta_sq > 0.0 && mot_x == 0.0 && mot_y == 0.0 && mot_z == 0.0)
-            || entry.teleport_ticks >= 10
         {
             entry.last_mot_x = mot_x;
             entry.last_mot_y = mot_y;
@@ -1447,34 +1512,12 @@ impl EntityTracker {
                 });
             }
         }
-        if entry.teleport_ticks >= 10 {
-            entry.teleport_ticks = 0;
-            let new_x = (x * 32.0).floor() as i32;
-            let new_y = (y * 32.0).floor() as i32;
-            let new_z = (z * 32.0).floor() as i32;
-            let new_yaw = pack_angle(yaw);
-            let new_pitch = pack_angle(pitch);
-            entry.encoded_x = new_x;
-            entry.encoded_y = new_y;
-            entry.encoded_z = new_z;
-            entry.encoded_yaw = new_yaw;
-            entry.encoded_pitch = new_pitch;
-            let tp = Clientbound::EntityTeleport(EntityTeleport {
-                entity_id,
-                x: new_x,
-                y: new_y,
-                z: new_z,
-                yaw: new_yaw,
-                pitch: new_pitch,
+
+        for &viewer_id in &entry.tracked_players {
+            outbound.push(OutboundTrackingPacket {
+                recipient_id: viewer_id,
+                packet: move_packet.clone(),
             });
-            for &viewer_id in &entry.tracked_players {
-                outbound.push(OutboundTrackingPacket {
-                    recipient_id: viewer_id,
-                    packet: tp.clone(),
-                });
-            }
-        } else {
-            Self::emit_pos_rot_update(entry, entity_id, x, y, z, yaw, pitch, outbound);
         }
     }
 }

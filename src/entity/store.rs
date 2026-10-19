@@ -483,29 +483,15 @@ impl EntityStore {
 
     pub fn spawn_minecart(&mut self, cart_type: u8, x: f64, y: f64, z: f64) -> i32 {
         let entity_id = self.allocate_id();
-        let cart = Minecart {
-            entity_id,
-            cart_type,
-            x,
-            y,
-            z,
-            mot_x: 0.0,
-            mot_y: 0.0,
-            mot_z: 0.0,
-            yaw: 0.0,
-            pitch: 0.0,
-            damage: 0,
-            time_since_hit: 0,
-            fuel: 0,
-            push_x: 0.0,
-            push_z: 0.0,
-            passenger_id: None,
-            cargo: [None; 27],
-            on_ground: false,
-            dead: false,
-        };
+        let cart = Minecart::new(entity_id, cart_type, x, y, z);
         self.minecarts.insert(entity_id, cart);
         entity_id
+    }
+
+    pub fn insert_minecart(&mut self, cart: Minecart) -> i32 {
+        let id = cart.entity_id;
+        self.minecarts.insert(id, cart);
+        id
     }
 
     pub fn get_minecart(&self, entity_id: i32) -> Option<&Minecart> {

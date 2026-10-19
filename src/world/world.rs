@@ -249,6 +249,10 @@ pub struct World {
     pub(crate) random_tick_lcg: i32,
     /// Separate RNG for live random block ticks so `world_random` stays untouched for parity tests.
     pub(crate) tick_random: JavaRandom,
+    /// Detector rails currently occupied by at least one `EntityMinecart` (`BlockMinecartDetector.f`).
+    pub active_detector_rails: HashSet<(i32, i32, i32)>,
+    /// Pressure plates currently occupied by an entity (`BlockPressurePlate.g`).
+    pub active_pressure_plates: HashSet<(i32, i32, i32)>,
 }
 
 /// Active `EntityFallingSand` instance ticked by `World.cleanUp()`.
@@ -445,6 +449,8 @@ impl World {
                 .wrapping_mul(3)
                 .wrapping_add(1_013_904_223),
             tick_random: JavaRandom::new(world_seed ^ 0x5DEECE66D),
+            active_detector_rails: HashSet::new(),
+            active_pressure_plates: HashSet::new(),
         }
     }
 
@@ -1322,15 +1328,23 @@ impl World {
             blocks::STONE_BUTTON => self.tick_button(x, y, z),
             blocks::STONE_PLATE | blocks::WOOD_PLATE => {
                 if self.get_data(x, y, z) == 1 {
-                    self.set_pressure_plate_state(x, y, z, id, false);
+                    if self.active_pressure_plates.contains(&(x, y, z)) {
+                        self.java_schedule_tick(x, y, z, id, 20);
+                    } else {
+                        self.set_pressure_plate_state(x, y, z, id, false);
+                    }
                 }
             }
             blocks::DETECTOR_RAIL => {
                 let meta = self.get_data(x, y, z);
                 if (meta & 8) != 0 {
-                    self.java_set_data(x, y, z, meta & 7);
-                    self.java_apply_physics(x, y, z, id as i32);
-                    self.java_apply_physics(x, y - 1, z, id as i32);
+                    if self.active_detector_rails.contains(&(x, y, z)) {
+                        self.java_schedule_tick(x, y, z, id, 20);
+                    } else {
+                        self.java_set_data(x, y, z, meta & 7);
+                        self.java_apply_physics(x, y, z, id as i32);
+                        self.java_apply_physics(x, y - 1, z, id as i32);
+                    }
                 }
             }
             blocks::DISPENSER => {

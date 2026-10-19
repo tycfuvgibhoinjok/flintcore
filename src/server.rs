@@ -1333,19 +1333,32 @@ impl Server {
             None
         };
         if let Some(vid) = old_vehicle {
+            let mut dismount_pos = None;
             if let Some(boat) = self.entities.get_boat_mut(vid) {
                 if boat.passenger_id == Some(player_id) {
                     boat.passenger_id = None;
+                    dismount_pos = Some((boat.x, boat.y + 0.6, boat.z));
                 }
             }
             if let Some(mob) = self.entities.get_mob_mut(vid) {
                 if mob.passenger_id == Some(player_id) {
                     mob.passenger_id = None;
+                    dismount_pos = Some((mob.x, mob.y + mob.size().1 as f64, mob.z));
                 }
             }
             if let Some(cart) = self.entities.get_minecart_mut(vid) {
                 if cart.passenger_id == Some(player_id) {
                     cart.passenger_id = None;
+                    // Entity.java:1195 — `this.vehicle.boundingBox.b + this.vehicle.width` = `(cart.y - 0.35) + 0.70`
+                    dismount_pos = Some((cart.x, cart.y + 0.35, cart.z));
+                }
+            }
+            if let Some((dx, dy, dz)) = dismount_pos {
+                if let Some(player) = self.entities.get_player_mut(player_id) {
+                    player.x = dx;
+                    player.y = dy;
+                    player.stance = dy;
+                    player.z = dz;
                 }
             }
             self.broadcast(Clientbound::AttachEntity(AttachEntity {
@@ -5768,7 +5781,16 @@ impl Server {
         if ctype == 0 {
             if cur_rider == Some(player_id) {
                 self.dismount_player(player_id);
-            } else if cur_rider.is_none() {
+            } else if !cur_rider.is_some_and(|rid| self.entities.get_player(rid).is_some()) {
+                if let Some(mob_id) = cur_rider {
+                    if let Some(m) = self.entities.get_mob_mut(mob_id) {
+                        m.vehicle_id = None;
+                    }
+                    self.broadcast(Clientbound::AttachEntity(AttachEntity {
+                        entity_id: mob_id,
+                        vehicle_id: -1,
+                    }));
+                }
                 self.dismount_player(player_id);
                 if let Some(c) = self.entities.get_minecart_mut(cart_id) {
                     c.passenger_id = Some(player_id);
@@ -5818,10 +5840,14 @@ impl Server {
                 );
             }
         } else if ctype == 2 {
-            // Powered minecart (`EntityMinecart.java:869-875`): consume 1 COAL and add 1200 ticks of fuel
+            // Powered minecart (`EntityMinecart.java:866-879`):
+            // 1. If holding COAL (263), consume 1 and add 1200 fuel.
+            // 2. Always set push vector `f = locX - player.locX; g = locZ - player.locZ`.
             let mut slot_update = None;
-            let mut push_dir = None;
+            let mut consumed_coal = false;
+            let mut player_xz = None;
             if let Some(player) = self.entities.get_by_conn_mut(conn_id) {
+                player_xz = Some((player.x, player.z));
                 if let Some(mut stack) = player.inventory.item_in_hand() {
                     if stack.id == items::COAL {
                         stack.count = stack.count.saturating_sub(1);
@@ -5833,13 +5859,15 @@ impl Server {
                         let slot_idx = 36 + player.inventory.held_slot as i16;
                         let item = InventoryPlayer::to_slot_item(player.inventory.item_in_hand());
                         slot_update = Some((slot_idx, item));
-                        push_dir = Some((player.x, player.z));
+                        consumed_coal = true;
                     }
                 }
             }
-            if let Some((px, pz)) = push_dir {
+            if let Some((px, pz)) = player_xz {
                 if let Some(c) = self.entities.get_minecart_mut(cart_id) {
-                    c.fuel = (c.fuel + 1200).min(32000);
+                    if consumed_coal {
+                        c.fuel += 1200;
+                    }
                     c.push_x = c.x - px;
                     c.push_z = c.z - pz;
                 }
@@ -5860,6 +5888,11 @@ impl Server {
     fn damage_minecart(&mut self, cart_id: i32, raw_damage: i32) {
         let mut destroyed = None;
         if let Some(cart) = self.entities.get_minecart_mut(cart_id) {
+            if cart.dead {
+                return;
+            }
+            cart.rock_direction = -cart.rock_direction;
+            cart.time_since_hit = 10;
             cart.damage += raw_damage * 10;
             if cart.damage > 40 {
                 cart.dead = true;
@@ -5875,7 +5908,15 @@ impl Server {
         }
         if let Some((ctype, cx, cy, cz, passenger, cargo)) = destroyed {
             if let Some(pid) = passenger {
-                self.dismount_player(pid);
+                if self.entities.get_player(pid).is_some() {
+                    self.dismount_player(pid);
+                } else if let Some(m) = self.entities.get_mob_mut(pid) {
+                    m.vehicle_id = None;
+                    self.broadcast(Clientbound::AttachEntity(AttachEntity {
+                        entity_id: pid,
+                        vehicle_id: -1,
+                    }));
+                }
             }
             let _ = self.entities.remove_minecart(cart_id);
             for out in self.tracker.untrack_minecart(cart_id) {
@@ -5885,8 +5926,20 @@ impl Server {
             }
             self.spawn_dropped_item_random(cx, cy, cz, ItemStack::new(items::MINECART, 1, 0), 10);
             if ctype == 1 {
-                for item in cargo.into_iter().flatten() {
-                    self.spawn_dropped_item_random(cx, cy, cz, item, 10);
+                // EntityMinecart.java:134-160 — split each stack into random sub-stacks of 10..=30
+                for mut item in cargo.into_iter().flatten() {
+                    while item.count > 0 {
+                        let split = (self.world.tick_random.next_i32_bound(21) + 10)
+                            .min(item.count as i32) as u8;
+                        item.count -= split;
+                        self.spawn_dropped_item_random(
+                            cx,
+                            cy,
+                            cz,
+                            ItemStack::new(item.id, split, item.damage),
+                            10,
+                        );
+                    }
                 }
                 self.spawn_dropped_item_random(
                     cx,
@@ -5907,7 +5960,9 @@ impl Server {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn tick_minecarts(&mut self) {
+        self.world.active_detector_rails.clear();
         let cart_ids: Vec<i32> = self
             .entities
             .iter_minecarts()
@@ -5917,162 +5972,40 @@ impl Server {
             return;
         }
 
-        for cid in cart_ids {
-            let passenger_vel = self
+        let mut void_carts = Vec::new();
+        let mut passenger_fall_damages = Vec::new();
+
+        for &cid in &cart_ids {
+            // EntityMinecart.java:576-579 — clear dead passenger before/after tick
+            let dead_passenger = self
                 .entities
                 .get_minecart(cid)
                 .and_then(|c| c.passenger_id)
-                .and_then(|pid| self.entities.get_player(pid))
-                .map(|p| (p.mot_x, p.mot_z));
+                .is_some_and(|pid| {
+                    let p_alive = self.entities.get_player(pid).is_some_and(|p| !p.dead);
+                    let m_alive = self.entities.get_mob(pid).is_some_and(|m| !m.dead);
+                    !p_alive && !m_alive
+                });
 
-            let mut detector_pos = None;
             let mut rider_sync = None;
             if let Some(cart) = self.entities.get_minecart_mut(cid) {
-                if cart.damage > 0 {
-                    cart.damage -= 1;
+                if dead_passenger {
+                    cart.passenger_id = None;
                 }
-                let bx = cart.x.floor() as i32;
-                let by = cart.y.floor() as i32;
-                let bz = cart.z.floor() as i32;
-                let block_id = self.world.get_block(bx, by, bz);
-
-                if matches!(
-                    block_id,
-                    blocks::RAIL | blocks::POWERED_RAIL | blocks::DETECTOR_RAIL
-                ) {
-                    let meta = self.world.get_data(bx, by, bz);
-                    let shape =
-                        if block_id == blocks::POWERED_RAIL || block_id == blocks::DETECTOR_RAIL {
-                            meta & 7
-                        } else {
-                            meta
-                        };
-                    cart.y = by as f64 + 0.1 + if (2..=5).contains(&shape) { 0.5 } else { 0.0 };
-                    if let Some((pmx, pmz)) = passenger_vel {
-                        cart.mot_x += pmx * 0.1;
-                        cart.mot_z += pmz * 0.1;
-                    }
-                    if cart.fuel > 0 {
-                        cart.fuel -= 1;
-                        let d = (cart.push_x * cart.push_x + cart.push_z * cart.push_z).sqrt();
-                        if d > 0.01 {
-                            cart.mot_x += (cart.push_x / d) * 0.04;
-                            cart.mot_z += (cart.push_z / d) * 0.04;
-                        }
-                    }
-                    // Slope gravity (`EntityMinecart.java:244-260`)
-                    match shape {
-                        2 => cart.mot_x -= 0.0078125,
-                        3 => cart.mot_x += 0.0078125,
-                        4 => cart.mot_z += 0.0078125,
-                        5 => cart.mot_z -= 0.0078125,
-                        _ => {}
-                    }
-                    // Curved track redirection (`6..=9`)
-                    match shape {
-                        6 => {
-                            if cart.mot_x < 0.0 {
-                                cart.mot_z = -cart.mot_x;
-                                cart.mot_x = 0.0;
-                            } else if cart.mot_z < 0.0 {
-                                cart.mot_x = -cart.mot_z;
-                                cart.mot_z = 0.0;
-                            }
-                        }
-                        7 => {
-                            if cart.mot_x > 0.0 {
-                                cart.mot_z = cart.mot_x;
-                                cart.mot_x = 0.0;
-                            } else if cart.mot_z < 0.0 {
-                                cart.mot_x = cart.mot_z;
-                                cart.mot_z = 0.0;
-                            }
-                        }
-                        8 => {
-                            if cart.mot_x > 0.0 {
-                                cart.mot_z = -cart.mot_x;
-                                cart.mot_x = 0.0;
-                            } else if cart.mot_z > 0.0 {
-                                cart.mot_x = -cart.mot_z;
-                                cart.mot_z = 0.0;
-                            }
-                        }
-                        9 => {
-                            if cart.mot_x < 0.0 {
-                                cart.mot_z = cart.mot_x;
-                                cart.mot_x = 0.0;
-                            } else if cart.mot_z > 0.0 {
-                                cart.mot_x = cart.mot_z;
-                                cart.mot_z = 0.0;
-                            }
-                        }
-                        0 | 4 | 5 => cart.mot_x = 0.0,
-                        1..=3 => cart.mot_z = 0.0,
-                        _ => {}
-                    }
-                    if block_id == blocks::POWERED_RAIL {
-                        if (meta & 8) != 0 {
-                            let spd = (cart.mot_x * cart.mot_x + cart.mot_z * cart.mot_z).sqrt();
-                            if spd > 0.01 {
-                                cart.mot_x += (cart.mot_x / spd) * 0.06;
-                                cart.mot_z += (cart.mot_z / spd) * 0.06;
-                            } else if shape == 1 {
-                                if self.world.is_solid_normal_at(bx - 1, by, bz) {
-                                    cart.mot_x = 0.02;
-                                } else if self.world.is_solid_normal_at(bx + 1, by, bz) {
-                                    cart.mot_x = -0.02;
-                                }
-                            } else if shape == 0 {
-                                if self.world.is_solid_normal_at(bx, by, bz - 1) {
-                                    cart.mot_z = 0.02;
-                                } else if self.world.is_solid_normal_at(bx, by, bz + 1) {
-                                    cart.mot_z = -0.02;
-                                }
-                            }
-                        } else {
-                            cart.mot_x *= 0.5;
-                            cart.mot_z *= 0.5;
-                        }
-                    } else if block_id == blocks::DETECTOR_RAIL && (meta & 8) == 0 {
-                        detector_pos = Some((bx, by, bz, meta));
-                    }
-                    cart.mot_x = cart.mot_x.clamp(-0.4, 0.4) * 0.99;
-                    cart.mot_z = cart.mot_z.clamp(-0.4, 0.4) * 0.99;
-                    cart.x += cart.mot_x;
-                    cart.z += cart.mot_z;
-                    // Step up/down onto connected slope rail
-                    let nbx = cart.x.floor() as i32;
-                    let nbz = cart.z.floor() as i32;
-                    if (nbx != bx || nbz != bz) && self.world.is_rail_at(nbx, by + 1, nbz) {
-                        cart.y = (by + 1) as f64 + 0.1;
-                    } else if (nbx != bx || nbz != bz) && self.world.is_rail_at(nbx, by - 1, nbz) {
-                        cart.y = (by - 1) as f64 + 0.1;
-                    }
-                } else {
-                    cart.mot_y -= 0.04;
-                    cart.x += cart.mot_x;
-                    cart.y += cart.mot_y;
-                    cart.z += cart.mot_z;
-                    if blocks::is_solid(self.world.get_block(bx, (cart.y - 0.2).floor() as i32, bz))
-                    {
-                        cart.y = by as f64;
-                        cart.mot_y = 0.0;
-                        cart.mot_x *= 0.5;
-                        cart.mot_z *= 0.5;
-                    }
+                let fall_dmg = self.world.tick_single_minecart(cart);
+                if cart.dead {
+                    void_carts.push((cid, cart.passenger_id));
+                    continue;
                 }
                 if let Some(pid) = cart.passenger_id {
-                    rider_sync = Some((pid, cart.x, cart.y + 0.85, cart.z));
+                    if let Some(dmg) = fall_dmg {
+                        passenger_fall_damages.push((pid, dmg));
+                    }
+                    // Entity.f() + EntityMinecart.m() (`Entity.java:1154`, `EntityMinecart.java:90-92`)
+                    rider_sync = Some((pid, cart.x, cart.y + cart.mounted_y_offset(), cart.z));
                 }
             }
 
-            if let Some((dx, dy, dz, meta)) = detector_pos {
-                self.world.java_set_data(dx, dy, dz, meta | 8);
-                self.world
-                    .java_apply_physics(dx, dy - 1, dz, blocks::DETECTOR_RAIL as i32);
-                self.world
-                    .java_schedule_tick(dx, dy, dz, blocks::DETECTOR_RAIL, 20);
-            }
             if let Some((pid, rx, ry, rz)) = rider_sync {
                 let mut conn_to_update = None;
                 if let Some(p) = self.entities.get_player_mut(pid) {
@@ -6091,6 +6024,270 @@ impl Server {
                 }
                 if let Some(cid) = conn_to_update {
                     self.update_player_view_chunks(cid);
+                }
+            }
+        }
+
+        // EntityMinecart.collide (`EntityMinecart.java:564-575, 703-794`, `EntityLiving.java:710-720`)
+        let player_boxes: Vec<(i32, f64, f64, f64, Option<i32>)> = self
+            .entities
+            .iter_players()
+            .filter(|p| !p.dead)
+            .map(|p| (p.entity_id, p.x, p.y, p.z, p.vehicle_id))
+            .collect();
+
+        let mob_boxes: Vec<(i32, f64, f64, f64, f32, f32, Option<i32>, Option<i32>)> = self
+            .entities
+            .iter_mobs()
+            .filter(|m| !m.dead)
+            .map(|m| {
+                let (w, h) = m.size();
+                (
+                    m.entity_id,
+                    m.x,
+                    m.y,
+                    m.z,
+                    w,
+                    h,
+                    m.vehicle_id,
+                    m.passenger_id,
+                )
+            })
+            .collect();
+
+        let mut mob_mounts = Vec::new();
+        let mut mob_pushes = Vec::new();
+
+        for i in 0..cart_ids.len() {
+            let cid = cart_ids[i];
+            let Some((cx, cy, cz, c_mx, c_mz, c_type, c_pass, bb)) = self
+                .entities
+                .get_minecart(cid)
+                .filter(|c| !c.dead)
+                .map(|c| {
+                    (
+                        c.x,
+                        c.y,
+                        c.z,
+                        c.mot_x,
+                        c.mot_z,
+                        c.cart_type,
+                        c.passenger_id,
+                        c.bounding_box(),
+                    )
+                })
+            else {
+                continue;
+            };
+            let _ = cy;
+            let exp_a = bb.0 - 0.20000000298023224;
+            let exp_b = bb.1;
+            let exp_c = bb.2 - 0.20000000298023224;
+            let exp_d = bb.3 + 0.20000000298023224;
+            let exp_e = bb.4;
+            let exp_f = bb.5 + 0.20000000298023224;
+
+            // 1. Collide with players (`EntityLiving.java:717` -> `EntityMinecart.collide`)
+            for &(pid, px, py, pz, p_veh) in &player_boxes {
+                if Some(pid) == c_pass || p_veh == Some(cid) {
+                    continue;
+                }
+                let overlaps = px + 0.3 > exp_a
+                    && px - 0.3 < exp_d
+                    && py + 1.8 > exp_b
+                    && py < exp_e
+                    && pz + 0.3 > exp_c
+                    && pz - 0.3 < exp_f;
+                if overlaps {
+                    let mut d0 = px - cx;
+                    let mut d1 = pz - cz;
+                    let mut d2 = d0 * d0 + d1 * d1;
+                    if d2 >= 9.999999747378752e-5 {
+                        d2 = (d2.sqrt() as f32) as f64;
+                        d0 /= d2;
+                        d1 /= d2;
+                        let d3 = (1.0 / d2).min(1.0);
+                        d0 = d0 * d3 * 0.10000000149011612 * 0.5;
+                        d1 = d1 * d3 * 0.10000000149011612 * 0.5;
+                        if let Some(c) = self.entities.get_minecart_mut(cid) {
+                            c.mot_x -= d0;
+                            c.mot_z -= d1;
+                        }
+                    }
+                }
+            }
+
+            // 2. Collide with mobs (`EntityMinecart.java:717-790`)
+            let mut cur_pass = c_pass;
+            for &(mid, mx, my, mz, mw, mh, m_veh, m_pass) in &mob_boxes {
+                if Some(mid) == cur_pass || m_veh.is_some() || m_pass.is_some() {
+                    continue;
+                }
+                let hw = (mw / 2.0) as f64;
+                let overlaps = mx + hw > exp_a
+                    && mx - hw < exp_d
+                    && my + (mh as f64) > exp_b
+                    && my < exp_e
+                    && mz + hw > exp_c
+                    && mz - hw < exp_f;
+                if overlaps {
+                    if c_type == 0 && c_mx * c_mx + c_mz * c_mz > 0.01 && cur_pass.is_none() {
+                        cur_pass = Some(mid);
+                        mob_mounts.push((cid, mid));
+                    }
+                    let mut d0 = mx - cx;
+                    let mut d1 = mz - cz;
+                    let mut d2 = d0 * d0 + d1 * d1;
+                    if d2 >= 9.999999747378752e-5 {
+                        d2 = (d2.sqrt() as f32) as f64;
+                        d0 /= d2;
+                        d1 /= d2;
+                        let d3 = (1.0 / d2).min(1.0);
+                        d0 = d0 * d3 * 0.10000000149011612 * 0.5;
+                        d1 = d1 * d3 * 0.10000000149011612 * 0.5;
+                        if let Some(c) = self.entities.get_minecart_mut(cid) {
+                            c.mot_x -= d0;
+                            c.mot_z -= d1;
+                        }
+                        mob_pushes.push((mid, d0 / 4.0, d1 / 4.0));
+                    }
+                }
+            }
+
+            // 3. Collide with other minecarts (`EntityMinecart.java:570-572, 752-786`)
+            for &other_id in &cart_ids[(i + 1)..] {
+                let Some((ox, oz, o_last_x, o_mx, o_mz, o_type, obb)) = self
+                    .entities
+                    .get_minecart(other_id)
+                    .filter(|c| !c.dead)
+                    .map(|c| {
+                        (
+                            c.x,
+                            c.z,
+                            c.last_x,
+                            c.mot_x,
+                            c.mot_z,
+                            c.cart_type,
+                            c.bounding_box(),
+                        )
+                    })
+                else {
+                    continue;
+                };
+                let overlaps = obb.3 > exp_a
+                    && obb.0 < exp_d
+                    && obb.4 > exp_b
+                    && obb.1 < exp_e
+                    && obb.5 > exp_c
+                    && obb.2 < exp_f;
+                if !overlaps {
+                    continue;
+                }
+                let (cur_mx, cur_mz) = self
+                    .entities
+                    .get_minecart(cid)
+                    .map(|c| (c.mot_x, c.mot_z))
+                    .unwrap_or((c_mx, c_mz));
+                let mut d0 = ox - cx;
+                let mut d1 = oz - cz;
+                let mut d2 = d0 * d0 + d1 * d1;
+                if d2 < 9.999999747378752e-5 {
+                    continue;
+                }
+                d2 = (d2.sqrt() as f32) as f64;
+                d0 /= d2;
+                d1 /= d2;
+                let d3 = (1.0 / d2).min(1.0);
+                d0 = d0 * d3 * 0.10000000149011612 * 0.5;
+                d1 = d1 * d3 * 0.10000000149011612 * 0.5;
+
+                let d4 = ox - cx;
+                let d5 = oz - cz;
+                let d6 = d4 * o_mz + d5 * o_last_x;
+                if d6 * d6 > 5.0 {
+                    continue;
+                }
+                let mut d7 = o_mx + cur_mx;
+                let mut d8 = o_mz + cur_mz;
+
+                let (new_c_mx, new_c_mz, new_o_mx, new_o_mz) = if o_type == 2 && c_type != 2 {
+                    (
+                        cur_mx * 0.20000000298023224 + o_mx - d0,
+                        cur_mz * 0.20000000298023224 + o_mz - d1,
+                        o_mx * 0.699999988079071,
+                        o_mz * 0.699999988079071,
+                    )
+                } else if o_type != 2 && c_type == 2 {
+                    (
+                        cur_mx * 0.699999988079071,
+                        cur_mz * 0.699999988079071,
+                        o_mx * 0.20000000298023224 + cur_mx + d0,
+                        o_mz * 0.20000000298023224 + cur_mz + d1,
+                    )
+                } else {
+                    d7 /= 2.0;
+                    d8 /= 2.0;
+                    (
+                        cur_mx * 0.20000000298023224 + d7 - d0,
+                        cur_mz * 0.20000000298023224 + d8 - d1,
+                        o_mx * 0.20000000298023224 + d7 + d0,
+                        o_mz * 0.20000000298023224 + d8 + d1,
+                    )
+                };
+
+                if let Some(c) = self.entities.get_minecart_mut(cid) {
+                    c.mot_x = new_c_mx;
+                    c.mot_z = new_c_mz;
+                }
+                if let Some(o) = self.entities.get_minecart_mut(other_id) {
+                    o.mot_x = new_o_mx;
+                    o.mot_z = new_o_mz;
+                }
+            }
+        }
+
+        for (cid, mid) in mob_mounts {
+            if let Some(c) = self.entities.get_minecart_mut(cid) {
+                if c.passenger_id.is_none() {
+                    c.passenger_id = Some(mid);
+                }
+            }
+            if let Some(m) = self.entities.get_mob_mut(mid) {
+                m.vehicle_id = Some(cid);
+            }
+            self.broadcast(Clientbound::AttachEntity(AttachEntity {
+                entity_id: mid,
+                vehicle_id: cid,
+            }));
+        }
+
+        for (mid, vx, vz) in mob_pushes {
+            if let Some(m) = self.entities.get_mob_mut(mid) {
+                m.mot_x += vx;
+                m.mot_z += vz;
+            }
+        }
+
+        for (pid, dmg) in passenger_fall_damages {
+            if self.entities.get_player(pid).is_some() {
+                self.damage_player_direct(pid, dmg, "fell from a high place");
+            } else {
+                let _ = self.damage_mob(pid, dmg, None, false);
+            }
+        }
+
+        for (cid, passenger) in void_carts {
+            if let Some(pid) = passenger {
+                if self.entities.get_player(pid).is_some() {
+                    self.dismount_player(pid);
+                } else if let Some(m) = self.entities.get_mob_mut(pid) {
+                    m.vehicle_id = None;
+                }
+            }
+            let _ = self.entities.remove_minecart(cid);
+            for out in self.tracker.untrack_minecart(cid) {
+                if let Some(t) = self.entities.get_player(out.recipient_id) {
+                    self.send(t.conn_id, out.packet);
                 }
             }
         }
@@ -6242,14 +6439,19 @@ impl Server {
                 continue;
             }
             let bx = ct.x.floor() as i32;
-            let by = ct.y.floor() as i32;
+            let by = (ct.y - 0.35).floor() as i32;
             let bz = ct.z.floor() as i32;
-            if self.world.get_block(bx, by, bz) == blocks::WOOD_PLATE {
-                plate_positions.push((bx, by, bz, blocks::WOOD_PLATE));
+            let bid = self.world.get_block(bx, by, bz);
+            if bid == blocks::WOOD_PLATE
+                || (bid == blocks::STONE_PLATE && ct.passenger_id.is_some())
+            {
+                plate_positions.push((bx, by, bz, bid));
             }
         }
 
+        self.world.active_pressure_plates.clear();
         for (px, py, pz, pid) in plate_positions {
+            self.world.active_pressure_plates.insert((px, py, pz));
             self.world.set_pressure_plate_state(px, py, pz, pid, true);
         }
 
