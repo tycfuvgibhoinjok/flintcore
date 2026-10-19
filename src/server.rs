@@ -5933,8 +5933,9 @@ impl Server {
             out.push(other.aabb());
         }
         for player in self.entities.iter_players() {
+            let (length, width) = player.box_size;
             out.push(Aabb::for_entity(
-                player.x, player.y, player.z, 0.6, 1.8, 0.0, 0.0,
+                player.x, player.y, player.z, length, width, 0.0, 0.0,
             ));
         }
     }
@@ -10865,9 +10866,14 @@ mod tests {
         scenario_sky_light(&mut server.world, floor_y, radius);
 
         if let Some((px, py, pz)) = player {
-            server
+            let entity_id = server
                 .entities
                 .insert_player(1, "Player".to_string(), px, py, pz);
+            // The player of the reference harness is created without the
+            // constructor, so its box is empty: the mob walks through it.
+            if let Some(player) = server.entities.get_player_mut(entity_id) {
+                player.box_size = (0.0, 0.0);
+            }
         }
         let mob_id = server.spawn_mob_at(mob_type, 0.5, 64.0, 0.5);
         if scenario == "squid" {
@@ -10884,6 +10890,74 @@ mod tests {
             }
         }
         (server, mob_id)
+    }
+
+    /// Java `String.format("%.Nf", value)`.
+    ///
+    /// Java rounds half up, Rust rounds half to even, so the same value can
+    /// be printed with different digits. The trace of the reference is
+    /// compared as text, so the port has to round the way of Java.
+    fn java_fixed(value: f64, decimals: usize) -> String {
+        // The exact expansion of the value, with enough digits to see whether
+        // the remainder after the last kept digit is zero.
+        let exact = format!("{:.*}", decimals + 40, value);
+        let (sign, digits) = match exact.strip_prefix('-') {
+            Some(rest) => ("-", rest),
+            None => ("", exact.as_str()),
+        };
+        let (integer, fraction) = match digits.split_once('.') {
+            Some((integer, fraction)) => (integer, fraction),
+            None => (digits, ""),
+        };
+        let mut kept: Vec<u8> = fraction.bytes().take(decimals).collect();
+        // The rounding of Java is half up: the last digit is rounded up when
+        // the remainder is a half or more.
+        let round_up = fraction
+            .as_bytes()
+            .get(decimals)
+            .is_some_and(|first| *first >= b'5');
+        let mut integer = integer.to_string();
+        if round_up {
+            let mut index = kept.len();
+            let mut carry = true;
+            while carry && index > 0 {
+                index -= 1;
+                if kept[index] == b'9' {
+                    kept[index] = b'0';
+                } else {
+                    kept[index] += 1;
+                    carry = false;
+                }
+            }
+            if carry {
+                // The carry went through all the digits of the fraction.
+                kept.insert(0, b'1');
+                kept.truncate(decimals);
+                integer = increment_decimal(&integer);
+            }
+        }
+        let fraction: String = kept.iter().map(|digit| *digit as char).collect();
+        format!("{sign}{integer}.{fraction}")
+    }
+
+    /// The decimal string plus one.
+    fn increment_decimal(text: &str) -> String {
+        let mut digits: Vec<u8> = text.bytes().collect();
+        let mut index = digits.len();
+        loop {
+            if index == 0 {
+                digits.insert(0, b'1');
+                break;
+            }
+            index -= 1;
+            if digits[index] == b'9' {
+                digits[index] = b'0';
+            } else {
+                digits[index] += 1;
+                break;
+            }
+        }
+        String::from_utf8(digits).unwrap_or_else(|_| text.to_string())
     }
 
     /// The path of a mob, hashed the same way as the reference harness.
@@ -10921,18 +10995,18 @@ mod tests {
                 None => -1,
             };
             lines.push(format!(
-                "{} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9} {:.7} {:.7} {} {:.7} {} {} {:016x}",
+                "{} {} {} {} {} {} {} {} {} {} {} {} {} {:016x}",
                 tick,
-                mob.x,
-                mob.y,
-                mob.z,
-                mob.mot_x,
-                mob.mot_y,
-                mob.mot_z,
-                mob.yaw,
-                mob.pitch,
+                java_fixed(mob.x, 9),
+                java_fixed(mob.y, 9),
+                java_fixed(mob.z, 9),
+                java_fixed(mob.mot_x, 9),
+                java_fixed(mob.mot_y, 9),
+                java_fixed(mob.mot_z, 9),
+                java_fixed(mob.yaw as f64, 7),
+                java_fixed(mob.pitch as f64, 7),
                 if mob.on_ground { 1 } else { 0 },
-                mob.fall_distance,
+                java_fixed(mob.fall_distance as f64, 7),
                 target,
                 mob.path.len(),
                 scenario_path_hash(mob),

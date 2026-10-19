@@ -30,6 +30,13 @@ pub struct Player {
     pub x: f64,
     pub y: f64,
     pub z: f64,
+    /// The size of the box of the player (`Entity.length` and
+    /// `Entity.width`).
+    ///
+    /// The player of the reference harness is created without the
+    /// constructor, so it has no box at all (the size is zero). The scenarios
+    /// that are compared with the reference use it.
+    pub box_size: (f32, f32),
     pub prev_x: f64,
     pub prev_y: f64,
     pub prev_z: f64,
@@ -94,6 +101,7 @@ impl Player {
             x,
             y,
             z,
+            box_size: (0.6, 1.8),
             prev_x: x,
             prev_y: y,
             prev_z: z,

@@ -209,11 +209,11 @@ Mob movement parity harness:
   | `slime`  | **300 ticks (all)**   | - |
   | `flat`   | **300 ticks (all)**   | - |
   | `ghast`  | **300 ticks (all)**   | - |
-  | `chase`  | 94 ticks              | the position of the mob on the step |
+  | `chase`  | **300 ticks (all)**   | - |
   | `wall`   | 89 ticks              | the path of the spider |
   | `squid`  | 52 ticks              | the velocity of the squid |
-  | `lava`   | 18 ticks              | the position of the zombie (one unit in the last place) |
-  | `water`  | 24 ticks              | the position of the zombie (one unit in the last place) |
+  | `water`  | 24 ticks              | the position of the zombie in the water |
+  | `lava`   | 18 ticks              | the position of the zombie in the lava |
 
   - The random stream of the entities is identical to the reference: the
     numbers are drawn in the same order and with the same values (the
@@ -254,11 +254,17 @@ Mob movement parity harness:
     the sky light of the floor to 15): the world of the reference is
     generated with the normal generator, so the light of the hills around
     the floor would be an artefact of the terrain.
+  - The trace is compared as text, so the port prints the numbers the way
+    of Java: Java rounds half up, Rust rounds half to even and the same
+    value can be printed with different digits.
+  - The player of the reference harness is created without the constructor,
+    so it has no box at all: the mob walks through it. The scenario of the
+    port uses a player without a box too (`Player::box_size`).
   - The differences that are left are the parts of the reference that are
     not ported yet: the path of the mobs in some situations (the tie
-    breaking of the heap of the path finder), the last unit in the last
-    place of the position of a mob in the water and in the lava and the
-    branch of the swim of the squid.
+    breaking of the heap of the path finder), the position of a mob in the
+    water and in the lava (a difference of one unit in the ninth decimal)
+    and the branch of the swim of the squid.
 
 ## 7. Performance discipline
 
