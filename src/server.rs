@@ -11015,6 +11015,43 @@ mod tests {
         lines
     }
 
+    /// The scenarios that match the reference for the whole trace.
+    ///
+    /// The other scenarios still differ (see DEVELOPMENT.md), the test keeps
+    /// the ones that match from diverging.
+    #[test]
+    fn the_mob_scenarios_of_the_reference_match() {
+        let golden = golden_mob_traces();
+        let mut failures = Vec::new();
+        for name in ["flat", "chase", "slime", "ghast"] {
+            let Some(expected) = golden.iter().find(|(scenario, _)| *scenario == name) else {
+                failures.push(format!("{name}: the golden trace is missing"));
+                continue;
+            };
+            let trace = mob_scenario_trace(name, expected.1.len());
+            for (tick, (actual, expected)) in trace.iter().zip(expected.1.iter()).enumerate() {
+                if actual != expected {
+                    failures.push(format!(
+                        "{name}: diverges at tick {tick}: {actual} != {expected}"
+                    ));
+                    break;
+                }
+            }
+            if trace.len() != expected.1.len() {
+                failures.push(format!(
+                    "{name}: the trace has {} ticks, the reference has {}",
+                    trace.len(),
+                    expected.1.len()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the traces of the port differ from the reference:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[test]
     #[ignore = "temp debug"]
     fn debug_find_path() {
