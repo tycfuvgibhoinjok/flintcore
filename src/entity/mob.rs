@@ -4,6 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use crate::config::{MobSpawnSettings, SpawningConfig};
 use crate::gameplay::blocks;
 use crate::gameplay::items::{self, ItemStack};
 use crate::util::bytes::Writer;
@@ -117,6 +118,58 @@ impl MobType {
         matches!(self, Self::Squid)
     }
 
+    /// The spawn category of the mob (`EnumCreatureType`).
+    pub fn category(self) -> MobCategory {
+        if self.is_monster() {
+            MobCategory::Monster
+        } else if self.is_animal() {
+            MobCategory::Creature
+        } else {
+            MobCategory::WaterCreature
+        }
+    }
+
+    /// The name of the mob in the configuration file (`[spawning.mobs.<name>]`).
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Self::Creeper => "creeper",
+            Self::Skeleton => "skeleton",
+            Self::Spider => "spider",
+            Self::Giant => "giant",
+            Self::Zombie => "zombie",
+            Self::Slime => "slime",
+            Self::Ghast => "ghast",
+            Self::PigZombie => "pig_zombie",
+            Self::Pig => "pig",
+            Self::Sheep => "sheep",
+            Self::Cow => "cow",
+            Self::Chicken => "chicken",
+            Self::Squid => "squid",
+            Self::Wolf => "wolf",
+        }
+    }
+
+    /// Parses the name of the mob in the configuration file.
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "creeper" => Self::Creeper,
+            "skeleton" => Self::Skeleton,
+            "spider" => Self::Spider,
+            "giant" => Self::Giant,
+            "zombie" => Self::Zombie,
+            "slime" => Self::Slime,
+            "ghast" => Self::Ghast,
+            "pig_zombie" => Self::PigZombie,
+            "pig" => Self::Pig,
+            "sheep" => Self::Sheep,
+            "cow" => Self::Cow,
+            "chicken" => Self::Chicken,
+            "squid" => Self::Squid,
+            "wolf" => Self::Wolf,
+            _ => return None,
+        })
+    }
+
     pub fn dimensions(self, slime_size: i32) -> (f32, f32) {
         match self {
             Self::Creeper | Self::Skeleton | Self::Zombie | Self::PigZombie => (0.6, 1.8),
@@ -174,6 +227,16 @@ impl MobType {
             _ => 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobCategory {
+    /// `EnumCreatureType.MONSTER`
+    Monster,
+    /// `EnumCreatureType.CREATURE`
+    Creature,
+    /// `EnumCreatureType.WATER_CREATURE`
+    WaterCreature,
 }
 
 #[derive(Debug, Clone)]
@@ -863,43 +926,76 @@ fn resolve_step_y(world: &World, x: i32, y: i32, z: i32) -> Option<i32> {
 // SpawnerCreature (`SpawnerCreature.java` + `BiomeBase.java`)
 // -------------------------------------------------------------------------
 
-fn biome_monsters(_biome: Biome) -> &'static [(MobType, i32)] {
-    &[
-        (MobType::Spider, 10),
-        (MobType::Zombie, 10),
-        (MobType::Skeleton, 10),
-        (MobType::Creeper, 10),
-        (MobType::Slime, 10),
-    ]
-}
+/// The order in which the mobs are listed in the biome spawn tables.
+///
+/// Java builds the tables in the `BiomeBase` constructor (spider, zombie,
+/// skeleton, creeper, slime, sheep, pig, chicken, cow, squid) and the
+/// biome subclasses append their own mobs (the wolf in the forest and the
+/// taiga, the ghast and the pig zombie in the hell). The weighted pick walks
+/// the list in order, so the order has to stay the same to keep the random
+/// sequence of the world identical.
+const SPAWN_TABLE_ORDER: [MobType; 14] = [
+    MobType::Spider,
+    MobType::Zombie,
+    MobType::Skeleton,
+    MobType::Creeper,
+    MobType::Slime,
+    MobType::Giant,
+    MobType::Ghast,
+    MobType::PigZombie,
+    MobType::Sheep,
+    MobType::Pig,
+    MobType::Chicken,
+    MobType::Cow,
+    MobType::Wolf,
+    MobType::Squid,
+];
 
-fn biome_creatures(biome: Biome) -> &'static [(MobType, i32)] {
-    match biome {
-        Biome::Desert | Biome::IceDesert => &[],
-        Biome::Taiga => &[
-            (MobType::Sheep, 12),
-            (MobType::Pig, 10),
-            (MobType::Chicken, 10),
-            (MobType::Cow, 8),
-            (MobType::Wolf, 2),
-        ],
-        Biome::Forest => &[
-            (MobType::Sheep, 12),
-            (MobType::Pig, 10),
-            (MobType::Chicken, 10),
-            (MobType::Cow, 8),
-            (MobType::Wolf, 2),
-        ],
-        _ => &[
-            (MobType::Sheep, 12),
-            (MobType::Pig, 10),
-            (MobType::Chicken, 10),
-            (MobType::Cow, 8),
-        ],
+/// The mobs of a category that may spawn at all, in the order of the Java
+/// biome spawn tables.
+///
+/// The global switches of the `Uberbukkit` settings act as master switches on
+/// top of the per mob configuration.
+fn category_candidates(
+    spawning: &SpawningConfig,
+    category: MobCategory,
+) -> Vec<(MobType, &MobSpawnSettings)> {
+    let mut candidates = Vec::new();
+    for &mob_type in &SPAWN_TABLE_ORDER {
+        if mob_type.category() != category {
+            continue;
+        }
+        let master_enabled = match mob_type {
+            MobType::Slime => spawning.spawn_slimes,
+            MobType::Wolf => spawning.spawn_wolves,
+            MobType::Squid => spawning.spawn_squids,
+            _ => true,
+        };
+        if !master_enabled {
+            continue;
+        }
+        let Some(settings) = spawning.mobs.get(mob_type.config_name()) else {
+            continue;
+        };
+        if !settings.enabled || settings.weight <= 0 {
+            continue;
+        }
+        candidates.push((mob_type, settings));
     }
+    candidates
 }
 
+/// Picks a mob out of a weighted list (`BiomeMeta`).
+///
+/// A list with a single entry does not roll the dice, which keeps the random
+/// sequence of the world identical to the one of the hard coded tables.
 fn pick_weighted(entries: &[(MobType, i32)], rng: &mut JavaRandom) -> Option<MobType> {
+    if entries.is_empty() {
+        return None;
+    }
+    if entries.len() == 1 {
+        return Some(entries[0].0);
+    }
     let total: i32 = entries.iter().map(|(_, w)| *w).sum();
     if total <= 0 {
         return None;
@@ -949,16 +1045,18 @@ pub fn evaluate_natural_spawns(
     current_animals: usize,
     current_water: usize,
 ) -> Vec<SpawnedMobSpec> {
+    let spawning = &world.spawning;
     if player_positions.is_empty() || (!allow_monsters && !allow_animals) {
         return Vec::new();
     }
 
     let mut candidate_chunks = HashSet::new();
+    let radius = spawning.spawn_radius_chunks.clamp(0, 32);
     for &(px, _, pz) in player_positions {
         let pcx = (px.floor() as i32) >> 4;
         let pcz = (pz.floor() as i32) >> 4;
-        for dx in -8..=8 {
-            for dz in -8..=8 {
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
                 let cpos = ChunkPos::new(pcx + dx, pcz + dz);
                 if world.is_chunk_loaded(cpos) {
                     candidate_chunks.insert(cpos);
@@ -972,31 +1070,34 @@ pub fn evaluate_natural_spawns(
 
     let (spawn_x, spawn_y, spawn_z) = world.spawn_point();
     let sky_sub = world_sky_subtracted(world.world_time());
+    let min_player_distance = spawning.min_player_distance;
+    let min_spawn_distance = spawning.min_spawn_distance;
+    let sample_divisor = spawning.chunk_sample_divisor.max(1);
     let mut spawned = Vec::new();
 
-    // Categories: (0 = Monster, 1 = Creature, 2 = WaterCreature)
+    // The categories of `EnumCreatureType`.
     let categories = [
         (
-            0u8,
-            allow_monsters && world.spawning.spawn_monsters,
+            MobCategory::Monster,
+            allow_monsters && spawning.spawn_monsters,
             current_monsters,
-            world.spawning.monster_cap,
+            spawning.monster_cap,
         ),
         (
-            1u8,
-            allow_animals && world.spawning.spawn_animals,
+            MobCategory::Creature,
+            allow_animals && spawning.spawn_animals,
             current_animals,
-            world.spawning.animal_cap,
+            spawning.animal_cap,
         ),
         (
-            2u8,
-            allow_animals && world.spawning.spawn_water_mobs && world.spawning.spawn_squids,
+            MobCategory::WaterCreature,
+            allow_animals && spawning.spawn_water_mobs,
             current_water,
-            world.spawning.water_mob_cap,
+            spawning.water_mob_cap,
         ),
     ];
 
-    for (cat, enabled, cur_count, max_base) in categories {
+    for (category, enabled, cur_count, max_base) in categories {
         if !enabled {
             continue;
         }
@@ -1004,44 +1105,53 @@ pub fn evaluate_natural_spawns(
         if cur_count > cap {
             continue;
         }
+        let candidates = category_candidates(spawning, category);
+        if candidates.is_empty() {
+            continue;
+        }
 
         for &cpos in &candidate_chunks {
             // Only sample a subset of chunks per tick so TPS stays 20.0
-            if rng.next_i32_bound(16) != 0 {
+            if rng.next_i32_bound(sample_divisor) != 0 {
                 continue;
             }
             let Some(chunk) = world.get_chunk(cpos) else {
                 continue;
             };
-            let biome = Biome::from_id(chunk.biomes[0]);
-            let chosen_mob = if world.is_hell {
-                match cat {
-                    0 => pick_weighted(&[(MobType::Ghast, 10), (MobType::PigZombie, 10)], rng),
-                    _ => None,
-                }
+            let biome = if world.is_hell {
+                Biome::Hell
             } else {
-                match cat {
-                    0 => pick_weighted(biome_monsters(biome), rng),
-                    1 => pick_weighted(biome_creatures(biome), rng),
-                    _ => Some(MobType::Squid),
-                }
+                Biome::from_id(chunk.biomes[0])
             };
-            let Some(mob_type) = chosen_mob else {
-                continue;
-            };
-            if (mob_type == MobType::Slime && !world.spawning.spawn_slimes)
-                || (mob_type == MobType::Wolf && !world.spawning.spawn_wolves)
-                || (mob_type == MobType::Squid && !world.spawning.spawn_squids)
-            {
+            // The spawn table of the biome (`BiomeBase.a(type)`).
+            let biome_candidates: Vec<(MobType, &MobSpawnSettings)> = candidates
+                .iter()
+                .filter(|(_, settings)| settings.spawns_in(biome))
+                .copied()
+                .collect();
+            if biome_candidates.is_empty() {
                 continue;
             }
+            let table: Vec<(MobType, i32)> = biome_candidates
+                .iter()
+                .map(|(mob_type, settings)| (*mob_type, settings.weight))
+                .collect();
+            let Some(mob_type) = pick_weighted(&table, rng) else {
+                continue;
+            };
+            let Some((_, settings)) = biome_candidates
+                .iter()
+                .find(|(candidate, _)| *candidate == mob_type)
+            else {
+                continue;
+            };
 
             let base_x = cpos.x * 16 + rng.next_i32_bound(16);
             let base_y = rng.next_i32_bound(128);
             let base_z = cpos.z * 16 + rng.next_i32_bound(16);
 
             let base_id = world.get_block(base_x, base_y, base_z);
-            if cat == 2 {
+            if settings.require_water {
                 if !blocks::is_water(base_id) {
                     continue;
                 }
@@ -1057,13 +1167,13 @@ pub fn evaluate_natural_spawns(
                 for _ in 0..4 {
                     x += rng.next_i32_bound(6) - rng.next_i32_bound(6);
                     z += rng.next_i32_bound(6) - rng.next_i32_bound(6);
-                    if !(1..126).contains(&y) {
+                    if y < settings.min_y || y > settings.max_y {
                         continue;
                     }
 
-                    let can_stand = if cat == 2 {
+                    let can_stand = if settings.require_water {
                         blocks::is_water(world.get_block(x, y, z))
-                            && !blocks::is_solid_normal_block(world.get_block(x, y + 1, z))
+                            && !world.is_solid_normal_at(x, y + 1, z)
                     } else {
                         world.is_solid_normal_at(x, y - 1, z)
                             && !world.is_solid_normal_at(x, y, z)
@@ -1083,7 +1193,7 @@ pub fn evaluate_natural_spawns(
                         let dx = px - fx;
                         let dy = py - fy;
                         let dz = pz - fz;
-                        dx * dx + dy * dy + dz * dz < 576.0
+                        dx * dx + dy * dy + dz * dz < min_player_distance * min_player_distance
                     });
                     if near_player {
                         continue;
@@ -1091,43 +1201,42 @@ pub fn evaluate_natural_spawns(
                     let dsx = fx - spawn_x as f64;
                     let dsy = fy - spawn_y as f64;
                     let dsz = fz - spawn_z as f64;
-                    if dsx * dsx + dsy * dsy + dsz * dsz < 576.0 {
+                    if dsx * dsx + dsy * dsy + dsz * dsz < min_spawn_distance * min_spawn_distance {
                         continue;
                     }
 
-                    // Specific `mob.d()` spawn conditions
-                    if cat == 1 {
-                        // Animals require GRASS below and light > 8
-                        if world.get_block(x, y - 1, z) != blocks::GRASS {
+                    // The spawn conditions of the mob (`Entity.d()`).
+                    if settings.sky_light_roll > 0 {
+                        let sky_l = chunk_sky_light_at(world, x, y, z);
+                        if sky_l > rng.next_i32_bound(settings.sky_light_roll) {
                             continue;
                         }
+                    }
+                    if settings.light_roll > 0 {
                         let light = chunk_light_at(world, x, y, z, sky_sub);
-                        if light <= 8 {
+                        if light > rng.next_i32_bound(settings.light_roll) {
                             continue;
                         }
-                    } else if cat == 0 {
-                        if mob_type == MobType::Slime {
-                            if y >= 16
-                                || rng.next_i32_bound(10) != 0
-                                || !is_slime_chunk(world.seed(), x >> 4, z >> 4)
-                            {
-                                continue;
-                            }
-                        } else {
-                            let sky_l = chunk_sky_light_at(world, x, y, z);
-                            if sky_l > rng.next_i32_bound(32) {
-                                continue;
-                            }
-                            let light = chunk_light_at(world, x, y, z, sky_sub);
-                            if light > rng.next_i32_bound(8) {
-                                continue;
-                            }
+                    }
+                    if settings.min_light > 0 {
+                        let light = chunk_light_at(world, x, y, z, sky_sub);
+                        if light < settings.min_light {
+                            continue;
                         }
-                    } else if !(46..=62).contains(&y) {
+                    }
+                    if settings.require_grass_below && world.get_block(x, y - 1, z) != blocks::GRASS
+                    {
+                        continue;
+                    }
+                    if settings.spawn_chance > 1 && rng.next_i32_bound(settings.spawn_chance) != 0 {
+                        continue;
+                    }
+                    if settings.slime_chunk_only && !is_slime_chunk(world.seed(), x >> 4, z >> 4) {
                         continue;
                     }
 
-                    let spider_jockey = mob_type == MobType::Spider && rng.next_i32_bound(100) == 0;
+                    let spider_jockey = settings.jockey_chance > 0
+                        && rng.next_i32_bound(settings.jockey_chance) == 0;
                     spawned.push(SpawnedMobSpec {
                         mob_type,
                         x: fx,
@@ -1136,8 +1245,7 @@ pub fn evaluate_natural_spawns(
                         spider_jockey,
                     });
                     group_spawned += 1;
-                    let max_group = if mob_type == MobType::Wolf { 8 } else { 4 };
-                    if group_spawned >= max_group {
+                    if group_spawned >= settings.max_group {
                         break 'group;
                     }
                 }
@@ -1190,7 +1298,256 @@ pub fn chunk_sky_light_at(world: &World, x: i32, y: i32, z: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WorldConfig;
+    use crate::config::{WorldConfig, MOB_SPAWN_NAMES};
+    use crate::world::chunk::CHUNK_AREA;
+
+    /// A world with a flat grass surface in the chunk `(5, 5)`; the chunk of
+    /// the world spawn is empty.
+    fn spawn_world(spawning: SpawningConfig) -> World {
+        let mut world = World::new(WorldConfig {
+            seed: 100,
+            save_enabled: false,
+            ..Default::default()
+        });
+        world.spawning = spawning;
+        world.ensure_chunk_base(ChunkPos::new(0, 0));
+        world.ensure_chunk_base(ChunkPos::new(5, 5));
+        for x in 80..96 {
+            for z in 80..96 {
+                world.set_block(x, 63, z, blocks::GRASS);
+                world.set_block(x, 64, z, blocks::AIR);
+                world.set_block(x, 65, z, blocks::AIR);
+            }
+        }
+        if let Some(chunk) = world.get_chunk_mut(ChunkPos::new(5, 5)) {
+            chunk.biomes = [Biome::Plains.id(); CHUNK_AREA];
+            chunk.init_lighting();
+        }
+        while world.java_do_lighting() {}
+        world
+    }
+
+    /// The spawn table of a category in a biome (`BiomeBase.a(type)`).
+    fn table_for_biome(
+        spawning: &SpawningConfig,
+        category: MobCategory,
+        biome: Biome,
+    ) -> Vec<(&'static str, i32)> {
+        category_candidates(spawning, category)
+            .iter()
+            .filter(|(_, settings)| settings.spawns_in(biome))
+            .map(|(mob_type, settings)| (mob_type.config_name(), settings.weight))
+            .collect()
+    }
+
+    /// Runs the natural spawn evaluation a few hundred times; the position of
+    /// a spawn attempt is rolled randomly, so a single run is not enough.
+    fn collect_spawns(world: &World, seed: i64, rounds: i64) -> Vec<SpawnedMobSpec> {
+        let mut spawned = Vec::new();
+        for round in 0..rounds {
+            let mut rng = JavaRandom::new(seed + round);
+            let players = [(0.0, 64.0, 0.0)];
+            spawned.extend(evaluate_natural_spawns(
+                world, &mut rng, &players, true, true, 0, 0, 0,
+            ));
+        }
+        spawned
+    }
+
+    #[test]
+    fn the_spawn_tables_match_the_java_biome_lists() {
+        let spawning = SpawningConfig::default();
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::Monster, Biome::Plains),
+            vec![
+                ("spider", 10),
+                ("zombie", 10),
+                ("skeleton", 10),
+                ("creeper", 10),
+                ("slime", 10)
+            ]
+        );
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::Creature, Biome::Plains),
+            vec![("sheep", 12), ("pig", 10), ("chicken", 10), ("cow", 8)]
+        );
+        // The forest and the taiga have wolves, the other biomes have not.
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::Creature, Biome::Forest),
+            vec![
+                ("sheep", 12),
+                ("pig", 10),
+                ("chicken", 10),
+                ("cow", 8),
+                ("wolf", 2)
+            ]
+        );
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::WaterCreature, Biome::Plains),
+            vec![("squid", 10)]
+        );
+        // The hell only has ghosts and pig zombies.
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::Monster, Biome::Hell),
+            vec![("ghast", 10), ("pig_zombie", 10)]
+        );
+    }
+
+    #[test]
+    fn every_configured_mob_has_a_name() {
+        for name in MOB_SPAWN_NAMES {
+            let mob_type = MobType::from_config_name(name).unwrap();
+            assert_eq!(mob_type.config_name(), name);
+        }
+        assert_eq!(MobType::from_config_name("zombi"), None);
+    }
+
+    #[test]
+    fn disabled_mobs_leave_the_spawn_table() {
+        let mut spawning = SpawningConfig::default();
+        spawning.mobs.get_mut("zombie").unwrap().enabled = false;
+        spawning.mobs.get_mut("wolf").unwrap().weight = 0;
+        spawning.mobs.get_mut("giant").unwrap().enabled = false;
+
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::Monster, Biome::Plains),
+            vec![
+                ("spider", 10),
+                ("skeleton", 10),
+                ("creeper", 10),
+                ("slime", 10)
+            ]
+        );
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::Creature, Biome::Forest),
+            vec![("sheep", 12), ("pig", 10), ("chicken", 10), ("cow", 8)]
+        );
+    }
+
+    #[test]
+    fn the_master_switches_disable_the_mobs() {
+        let spawning = SpawningConfig {
+            spawn_slimes: false,
+            spawn_wolves: false,
+            spawn_squids: false,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::Monster, Biome::Plains),
+            vec![
+                ("spider", 10),
+                ("zombie", 10),
+                ("skeleton", 10),
+                ("creeper", 10)
+            ]
+        );
+        assert_eq!(
+            table_for_biome(&spawning, MobCategory::Creature, Biome::Forest),
+            vec![("sheep", 12), ("pig", 10), ("chicken", 10), ("cow", 8)]
+        );
+        assert!(table_for_biome(&spawning, MobCategory::WaterCreature, Biome::Plains).is_empty());
+    }
+
+    #[test]
+    fn the_biome_filter_limits_the_mobs() {
+        let spawning = SpawningConfig::default();
+        let wolf = &spawning.mobs["wolf"];
+        assert!(wolf.spawns_in(Biome::Forest));
+        assert!(wolf.spawns_in(Biome::Taiga));
+        assert!(!wolf.spawns_in(Biome::Plains));
+        assert!(!wolf.spawns_in(Biome::Desert));
+
+        let ghast = &spawning.mobs["ghast"];
+        assert!(ghast.spawns_in(Biome::Hell));
+        assert!(!ghast.spawns_in(Biome::Plains));
+
+        let zombie = &spawning.mobs["zombie"];
+        assert!(zombie.spawns_in(Biome::Desert));
+        assert!(zombie.spawns_in(Biome::Sky));
+        assert!(!zombie.spawns_in(Biome::Hell));
+    }
+
+    #[test]
+    fn a_single_candidate_does_not_roll_the_dice() {
+        let mut rng = JavaRandom::new(7);
+        let entries = [(MobType::Squid, 10)];
+        assert_eq!(pick_weighted(&entries, &mut rng), Some(MobType::Squid));
+        // The random state was not touched.
+        let mut other = JavaRandom::new(7);
+        assert_eq!(other.next_i32(), rng.next_i32());
+    }
+
+    #[test]
+    fn natural_spawns_follow_the_configured_mobs() {
+        let spawning = SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        let world = spawn_world(spawning.clone());
+
+        let spawned = collect_spawns(&world, 1234, 512);
+        assert!(!spawned.is_empty(), "the grass field must produce mobs");
+        // The plains biome has no wolves and the giant never spawns.
+        assert!(spawned
+            .iter()
+            .all(|spec| spec.mob_type != MobType::Wolf && spec.mob_type != MobType::Giant));
+        // The mobs keep the distance to the players and to the world spawn.
+        assert!(spawned.iter().all(|spec| {
+            let dx = spec.x;
+            let dy = spec.y - 64.0;
+            let dz = spec.z;
+            (dx * dx + dy * dy + dz * dz).sqrt() >= 24.0
+        }));
+        // The animals stand on the grass (`EntityAnimal.d()`).
+        assert!(spawned
+            .iter()
+            .filter(|spec| spec.mob_type.is_animal())
+            .all(
+                |spec| world.get_block(spec.x as i32, spec.y as i32 - 1, spec.z as i32)
+                    == blocks::GRASS
+            ));
+    }
+
+    #[test]
+    fn a_disabled_mob_never_spawns() {
+        let mut spawning = SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        spawning.mobs.get_mut("zombie").unwrap().enabled = false;
+        spawning.mobs.get_mut("pig").unwrap().enabled = false;
+        let world = spawn_world(spawning);
+
+        let spawned = collect_spawns(&world, 1234, 512);
+        assert!(!spawned.is_empty());
+        assert!(spawned
+            .iter()
+            .all(|spec| spec.mob_type != MobType::Zombie && spec.mob_type != MobType::Pig));
+    }
+
+    #[test]
+    fn the_spawn_group_size_is_respected() {
+        let mut spawning = SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        spawning.mobs.get_mut("zombie").unwrap().max_group = 1;
+        // Only the zombie may spawn, so every group holds a single mob.
+        for name in ["spider", "skeleton", "creeper", "slime"] {
+            spawning.mobs.get_mut(name).unwrap().enabled = false;
+        }
+        for name in ["sheep", "pig", "chicken", "cow", "wolf"] {
+            spawning.mobs.get_mut(name).unwrap().enabled = false;
+        }
+        spawning.mobs.get_mut("squid").unwrap().enabled = false;
+        let world = spawn_world(spawning);
+
+        let spawned = collect_spawns(&world, 4321, 512);
+        assert!(!spawned.is_empty());
+        // The group loop spawns at most three groups of one mob per chunk.
+        assert!(spawned.len() <= 6, "too many mobs: {}", spawned.len());
+    }
 
     #[test]
     fn all_14_mob_types_round_trip_nbt_and_metadata() {

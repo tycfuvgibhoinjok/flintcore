@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::util::{Error, Result};
+use crate::world::biome::Biome;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
@@ -42,6 +44,7 @@ impl Config {
         let mut config: Config =
             toml::from_str(&text).map_err(|error| Error::Config(error.to_string()))?;
         config.migrate()?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -70,6 +73,86 @@ impl Config {
             )));
         }
         self.schema_version = CURRENT_SCHEMA_VERSION;
+        Ok(())
+    }
+
+    /// Checks the values that the deserializer cannot verify on its own.
+    fn validate(&self) -> Result<()> {
+        let spawning = &self.spawning;
+        if spawning.spawn_interval_ticks == 0 {
+            return Err(Error::Config(
+                "spawning.spawn_interval_ticks must be at least 1".to_string(),
+            ));
+        }
+        if spawning.spawn_radius_chunks < 0 {
+            return Err(Error::Config(
+                "spawning.spawn_radius_chunks must not be negative".to_string(),
+            ));
+        }
+        if spawning.chunk_sample_divisor < 1 {
+            return Err(Error::Config(
+                "spawning.chunk_sample_divisor must be at least 1".to_string(),
+            ));
+        }
+        if spawning.min_player_distance < 0.0 || spawning.min_spawn_distance < 0.0 {
+            return Err(Error::Config(
+                "spawning.min_player_distance and spawning.min_spawn_distance must not be negative"
+                    .to_string(),
+            ));
+        }
+        for (name, mob) in &spawning.mobs {
+            if !MOB_SPAWN_NAMES.contains(&name.as_str()) {
+                return Err(Error::Config(format!(
+                    "unknown mob '{name}' in [spawning.mobs], known mobs: {}",
+                    MOB_SPAWN_NAMES.join(", ")
+                )));
+            }
+            if mob.weight < 0 {
+                return Err(Error::Config(format!(
+                    "spawning.mobs.{name}.weight must not be negative"
+                )));
+            }
+            if mob.max_group < 1 {
+                return Err(Error::Config(format!(
+                    "spawning.mobs.{name}.max_group must be at least 1"
+                )));
+            }
+            if mob.spawn_chance < 1 {
+                return Err(Error::Config(format!(
+                    "spawning.mobs.{name}.spawn_chance must be at least 1"
+                )));
+            }
+            if mob.light_roll < 0 || mob.sky_light_roll < 0 {
+                return Err(Error::Config(format!(
+                    "spawning.mobs.{name} light rolls must not be negative"
+                )));
+            }
+            if mob.min_light < 0 {
+                return Err(Error::Config(format!(
+                    "spawning.mobs.{name}.min_light must not be negative"
+                )));
+            }
+            if mob.min_y > mob.max_y {
+                return Err(Error::Config(format!(
+                    "spawning.mobs.{name}.min_y must not be greater than max_y"
+                )));
+            }
+            if mob.jockey_chance < 0 {
+                return Err(Error::Config(format!(
+                    "spawning.mobs.{name}.jockey_chance must not be negative"
+                )));
+            }
+            for biome in &mob.biomes {
+                if biome == "*" {
+                    continue;
+                }
+                if Biome::from_name(biome).is_none() {
+                    return Err(Error::Config(format!(
+                        "unknown biome '{biome}' in spawning.mobs.{name}.biomes"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -265,9 +348,13 @@ impl Default for WorldConfig {
     }
 }
 
-/// Natural mob spawning and dungeon mob spawner limits (`server.properties` + `Poseidon` + `Uberbukkit`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// Natural mob spawning and dungeon mob spawner limits
+/// (`server.properties` + `Poseidon` + `Uberbukkit` + `flintcore`).
+///
+/// The per mob settings live in `[spawning.mobs.<mob>]`; every mob has its
+/// own section with the values of the Java code as defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "SpawningConfigRaw")]
 pub struct SpawningConfig {
     pub spawn_monsters: bool,
     pub spawn_animals: bool,
@@ -283,6 +370,20 @@ pub struct SpawningConfig {
     pub mob_spawner_area_limit_enabled: bool,
     pub mob_spawner_area_limit: usize,
     pub mob_spawner_chunk_radius: i32,
+    /// Ticks between two natural spawn attempts.
+    pub spawn_interval_ticks: u64,
+    /// Radius in chunks around a player that is scanned for spawns
+    /// (`SpawnerCreature.spawnEntities` uses a radius of 8 chunks).
+    pub spawn_radius_chunks: i32,
+    /// Minimum distance to the closest player (`SpawnerCreature` uses 24).
+    pub min_player_distance: f64,
+    /// Minimum distance to the world spawn point (`SpawnerCreature` uses 24).
+    pub min_spawn_distance: f64,
+    /// Only every N-th candidate chunk is rolled per attempt. `1` matches the
+    /// Java behaviour, `16` is the flintcore default that keeps the tick cheap.
+    pub chunk_sample_divisor: i32,
+    /// Per mob settings, keyed by the mob name (`[spawning.mobs.zombie]`).
+    pub mobs: BTreeMap<String, MobSpawnSettings>,
 }
 
 impl Default for SpawningConfig {
@@ -302,6 +403,370 @@ impl Default for SpawningConfig {
             mob_spawner_area_limit_enabled: true,
             mob_spawner_area_limit: 150,
             mob_spawner_chunk_radius: 8,
+            spawn_interval_ticks: 20,
+            spawn_radius_chunks: 8,
+            min_player_distance: 24.0,
+            min_spawn_distance: 24.0,
+            chunk_sample_divisor: 16,
+            mobs: default_mob_settings(),
+        }
+    }
+}
+
+/// The names of the mobs that can be configured in `[spawning.mobs]`.
+pub const MOB_SPAWN_NAMES: [&str; 14] = [
+    "chicken",
+    "cow",
+    "creeper",
+    "giant",
+    "ghast",
+    "pig",
+    "pig_zombie",
+    "sheep",
+    "skeleton",
+    "slime",
+    "spider",
+    "squid",
+    "wolf",
+    "zombie",
+];
+
+/// The default spawn settings of a single mob.
+///
+/// The values are the ones of the Project-Poseidon code: the weights come
+/// from `BiomeBase` (`BiomeMeta.b`), the group size from `EntityLiving.l()`,
+/// the light and ground rules from `EntityAnimal.d()` and the special rules
+/// from `EntitySlime.d()` and `EntityGhast.d()`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MobSpawnSettings {
+    /// Whether the mob can spawn naturally at all.
+    pub enabled: bool,
+    /// Weight of the mob inside the biome spawn table (`BiomeMeta.b`).
+    pub weight: i32,
+    /// Maximum number of mobs spawned in one group (`EntityLiving.l()`).
+    pub max_group: i32,
+    /// Biomes the mob spawns in. `*` means every overworld biome, `hell` the
+    /// Nether. An empty list keeps the mob out of every biome.
+    pub biomes: Vec<String>,
+    /// The light level has to be at least this value (`EntityAnimal.d()`
+    /// requires a light level above 8).
+    pub min_light: i32,
+    /// The block light has to be at most `random(light_roll)`. `0` disables
+    /// the check.
+    pub light_roll: i32,
+    /// The sky light has to be at most `random(sky_light_roll)`. `0` disables
+    /// the check.
+    pub sky_light_roll: i32,
+    /// Lowest block height the mob can spawn at.
+    pub min_y: i32,
+    /// Highest block height the mob can spawn at.
+    pub max_y: i32,
+    /// The mob spawns with a probability of 1/N on a valid position
+    /// (`EntitySlime.d()` uses 10, `EntityGhast.d()` uses 20).
+    pub spawn_chance: i32,
+    /// The block below the mob has to be grass (`EntityAnimal.d()`).
+    pub require_grass_below: bool,
+    /// The mob only spawns in water (`EnumCreatureType.WATER_CREATURE`).
+    pub require_water: bool,
+    /// The mob only spawns in slime chunks (`EntitySlime.d()`).
+    pub slime_chunk_only: bool,
+    /// Chance of the spider jockey (`SpawnerCreature` uses 1/100).
+    pub jockey_chance: i32,
+}
+
+impl Default for MobSpawnSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            weight: 10,
+            max_group: 4,
+            biomes: vec!["*".to_string()],
+            min_light: 0,
+            light_roll: 8,
+            sky_light_roll: 32,
+            min_y: 0,
+            max_y: 127,
+            spawn_chance: 1,
+            require_grass_below: false,
+            require_water: false,
+            slime_chunk_only: false,
+            jockey_chance: 0,
+        }
+    }
+}
+
+/// The Java defaults of every configurable mob.
+pub fn default_mob_settings() -> BTreeMap<String, MobSpawnSettings> {
+    let base = MobSpawnSettings::default();
+    // The animals of `EntityAnimal` are checked against the light level of
+    // the block they stand on instead of the random light rolls.
+    let animal = MobSpawnSettings {
+        light_roll: 0,
+        sky_light_roll: 0,
+        min_light: 9,
+        require_grass_below: true,
+        ..base.clone()
+    };
+    let mut mobs = BTreeMap::new();
+    for (name, settings) in [
+        ("chicken", animal.clone()),
+        (
+            "cow",
+            MobSpawnSettings {
+                weight: 8,
+                ..animal.clone()
+            },
+        ),
+        ("creeper", base.clone()),
+        // `EntityGiant` is not part of the biome spawn tables.
+        (
+            "giant",
+            MobSpawnSettings {
+                enabled: false,
+                weight: 0,
+                ..base.clone()
+            },
+        ),
+        (
+            "ghast",
+            MobSpawnSettings {
+                max_group: 1,
+                biomes: vec!["hell".to_string()],
+                spawn_chance: 20,
+                ..base.clone()
+            },
+        ),
+        ("pig", animal.clone()),
+        (
+            "pig_zombie",
+            MobSpawnSettings {
+                biomes: vec!["hell".to_string()],
+                ..base.clone()
+            },
+        ),
+        (
+            "sheep",
+            MobSpawnSettings {
+                weight: 12,
+                ..animal.clone()
+            },
+        ),
+        ("skeleton", base.clone()),
+        // `EntitySlime.d()` checks the height, the slime chunk and a 1/10
+        // chance, but not the light level.
+        (
+            "slime",
+            MobSpawnSettings {
+                light_roll: 0,
+                sky_light_roll: 0,
+                max_y: 15,
+                spawn_chance: 10,
+                slime_chunk_only: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "spider",
+            MobSpawnSettings {
+                jockey_chance: 100,
+                ..base.clone()
+            },
+        ),
+        (
+            "squid",
+            MobSpawnSettings {
+                light_roll: 0,
+                sky_light_roll: 0,
+                require_water: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "wolf",
+            MobSpawnSettings {
+                weight: 2,
+                max_group: 8,
+                biomes: vec!["forest".to_string(), "taiga".to_string()],
+                ..animal.clone()
+            },
+        ),
+        ("zombie", base.clone()),
+    ] {
+        mobs.insert(name.to_string(), settings);
+    }
+    mobs
+}
+
+impl MobSpawnSettings {
+    /// Whether the mob may spawn in the given biome.
+    ///
+    /// `*` covers every overworld biome, the Nether has to be listed with the
+    /// name of its biome (`hell`).
+    pub fn spawns_in(&self, biome: Biome) -> bool {
+        self.biomes.iter().any(|name| {
+            if name == "*" {
+                biome != Biome::Hell
+            } else {
+                Biome::from_name(name) == Some(biome)
+            }
+        })
+    }
+}
+
+/// A partial per mob configuration; unset fields keep the Java default.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct MobSpawnOverride {
+    enabled: Option<bool>,
+    weight: Option<i32>,
+    max_group: Option<i32>,
+    biomes: Option<Vec<String>>,
+    min_light: Option<i32>,
+    light_roll: Option<i32>,
+    sky_light_roll: Option<i32>,
+    min_y: Option<i32>,
+    max_y: Option<i32>,
+    spawn_chance: Option<i32>,
+    require_grass_below: Option<bool>,
+    require_water: Option<bool>,
+    slime_chunk_only: Option<bool>,
+    jockey_chance: Option<i32>,
+}
+
+impl MobSpawnOverride {
+    fn apply(&self, settings: &mut MobSpawnSettings) {
+        if let Some(value) = self.enabled {
+            settings.enabled = value;
+        }
+        if let Some(value) = self.weight {
+            settings.weight = value;
+        }
+        if let Some(value) = self.max_group {
+            settings.max_group = value;
+        }
+        if let Some(value) = &self.biomes {
+            settings.biomes = value.clone();
+        }
+        if let Some(value) = self.min_light {
+            settings.min_light = value;
+        }
+        if let Some(value) = self.light_roll {
+            settings.light_roll = value;
+        }
+        if let Some(value) = self.sky_light_roll {
+            settings.sky_light_roll = value;
+        }
+        if let Some(value) = self.min_y {
+            settings.min_y = value;
+        }
+        if let Some(value) = self.max_y {
+            settings.max_y = value;
+        }
+        if let Some(value) = self.spawn_chance {
+            settings.spawn_chance = value;
+        }
+        if let Some(value) = self.require_grass_below {
+            settings.require_grass_below = value;
+        }
+        if let Some(value) = self.require_water {
+            settings.require_water = value;
+        }
+        if let Some(value) = self.slime_chunk_only {
+            settings.slime_chunk_only = value;
+        }
+        if let Some(value) = self.jockey_chance {
+            settings.jockey_chance = value;
+        }
+    }
+}
+
+/// The deserialised shape of [`SpawningConfig`]; the per mob overrides are
+/// merged onto the Java defaults while loading.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SpawningConfigRaw {
+    spawn_monsters: bool,
+    spawn_animals: bool,
+    spawn_water_mobs: bool,
+    spawn_squids: bool,
+    spawn_wolves: bool,
+    spawn_slimes: bool,
+    spawn_sheep_shades_of_black: bool,
+    spawn_brown_and_pink_sheep: bool,
+    monster_cap: usize,
+    animal_cap: usize,
+    water_mob_cap: usize,
+    mob_spawner_area_limit_enabled: bool,
+    mob_spawner_area_limit: usize,
+    mob_spawner_chunk_radius: i32,
+    spawn_interval_ticks: u64,
+    spawn_radius_chunks: i32,
+    min_player_distance: f64,
+    min_spawn_distance: f64,
+    chunk_sample_divisor: i32,
+    mobs: BTreeMap<String, MobSpawnOverride>,
+}
+
+impl Default for SpawningConfigRaw {
+    fn default() -> Self {
+        let defaults = SpawningConfig::default();
+        Self {
+            spawn_monsters: defaults.spawn_monsters,
+            spawn_animals: defaults.spawn_animals,
+            spawn_water_mobs: defaults.spawn_water_mobs,
+            spawn_squids: defaults.spawn_squids,
+            spawn_wolves: defaults.spawn_wolves,
+            spawn_slimes: defaults.spawn_slimes,
+            spawn_sheep_shades_of_black: defaults.spawn_sheep_shades_of_black,
+            spawn_brown_and_pink_sheep: defaults.spawn_brown_and_pink_sheep,
+            monster_cap: defaults.monster_cap,
+            animal_cap: defaults.animal_cap,
+            water_mob_cap: defaults.water_mob_cap,
+            mob_spawner_area_limit_enabled: defaults.mob_spawner_area_limit_enabled,
+            mob_spawner_area_limit: defaults.mob_spawner_area_limit,
+            mob_spawner_chunk_radius: defaults.mob_spawner_chunk_radius,
+            spawn_interval_ticks: defaults.spawn_interval_ticks,
+            spawn_radius_chunks: defaults.spawn_radius_chunks,
+            min_player_distance: defaults.min_player_distance,
+            min_spawn_distance: defaults.min_spawn_distance,
+            chunk_sample_divisor: defaults.chunk_sample_divisor,
+            mobs: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<SpawningConfigRaw> for SpawningConfig {
+    fn from(raw: SpawningConfigRaw) -> Self {
+        // The mobs that are not mentioned in the file keep their Java
+        // defaults.
+        let mut mobs = SpawningConfig::default().mobs;
+        for (name, over) in raw.mobs {
+            let mut settings = mobs.get(&name).cloned().unwrap_or_default();
+            over.apply(&mut settings);
+            mobs.insert(name, settings);
+        }
+        SpawningConfig {
+            spawn_monsters: raw.spawn_monsters,
+            spawn_animals: raw.spawn_animals,
+            spawn_water_mobs: raw.spawn_water_mobs,
+            spawn_squids: raw.spawn_squids,
+            spawn_wolves: raw.spawn_wolves,
+            spawn_slimes: raw.spawn_slimes,
+            spawn_sheep_shades_of_black: raw.spawn_sheep_shades_of_black,
+            spawn_brown_and_pink_sheep: raw.spawn_brown_and_pink_sheep,
+            monster_cap: raw.monster_cap,
+            animal_cap: raw.animal_cap,
+            water_mob_cap: raw.water_mob_cap,
+            mob_spawner_area_limit_enabled: raw.mob_spawner_area_limit_enabled,
+            mob_spawner_area_limit: raw.mob_spawner_area_limit,
+            mob_spawner_chunk_radius: raw.mob_spawner_chunk_radius,
+            spawn_interval_ticks: raw.spawn_interval_ticks,
+            spawn_radius_chunks: raw.spawn_radius_chunks,
+            min_player_distance: raw.min_player_distance,
+            min_spawn_distance: raw.min_spawn_distance,
+            chunk_sample_divisor: raw.chunk_sample_divisor,
+            mobs,
         }
     }
 }
@@ -531,5 +996,96 @@ mod tests {
             ..Config::default()
         };
         assert!(config.migrate().is_err());
+    }
+
+    #[test]
+    fn mob_spawn_defaults_match_the_java_values() {
+        let config = Config::default();
+        let mobs = &config.spawning.mobs;
+        assert_eq!(mobs.len(), MOB_SPAWN_NAMES.len());
+        for name in MOB_SPAWN_NAMES {
+            assert!(mobs.contains_key(name), "{name} is missing");
+        }
+
+        // `BiomeBase` (the weights of the biome spawn tables).
+        assert_eq!(mobs["zombie"].weight, 10);
+        assert_eq!(mobs["creeper"].weight, 10);
+        assert_eq!(mobs["sheep"].weight, 12);
+        assert_eq!(mobs["cow"].weight, 8);
+        assert_eq!(mobs["wolf"].weight, 2);
+        assert_eq!(mobs["squid"].weight, 10);
+        // `EntityLiving.l()` (the size of a spawn group).
+        assert_eq!(mobs["zombie"].max_group, 4);
+        assert_eq!(mobs["wolf"].max_group, 8);
+        assert_eq!(mobs["ghast"].max_group, 1);
+        // `BiomeForest`, `BiomeTaiga` and `BiomeHell`.
+        assert_eq!(mobs["wolf"].biomes, vec!["forest", "taiga"]);
+        assert_eq!(mobs["ghast"].biomes, vec!["hell"]);
+        assert_eq!(mobs["pig_zombie"].biomes, vec!["hell"]);
+        assert_eq!(mobs["zombie"].biomes, vec!["*"]);
+        // `EntityAnimal.d()` (grass below and a light level above 8).
+        assert_eq!(mobs["pig"].min_light, 9);
+        assert!(mobs["pig"].require_grass_below);
+        assert_eq!(mobs["pig"].light_roll, 0);
+        // `EntitySlime.d()` and `EntityGhast.d()`.
+        assert_eq!(mobs["slime"].spawn_chance, 10);
+        assert!(mobs["slime"].slime_chunk_only);
+        assert_eq!(mobs["slime"].max_y, 15);
+        assert_eq!(mobs["ghast"].spawn_chance, 20);
+        // `SpawnerCreature` (the spider jockey).
+        assert_eq!(mobs["spider"].jockey_chance, 100);
+        // `EntityGiant` is not part of the spawn tables.
+        assert!(!mobs["giant"].enabled);
+        // `EnumCreatureType` (the caps of the categories).
+        assert_eq!(config.spawning.monster_cap, 70);
+        assert_eq!(config.spawning.animal_cap, 15);
+        assert_eq!(config.spawning.water_mob_cap, 5);
+    }
+
+    #[test]
+    fn partial_mob_override_keeps_the_java_defaults() {
+        let text = r#"
+[spawning.mobs.zombie]
+weight = 25
+
+[spawning.mobs.sheep]
+enabled = false
+"#;
+        let config: Config = toml::from_str(text).unwrap();
+        let mobs = &config.spawning.mobs;
+        assert_eq!(mobs["zombie"].weight, 25);
+        assert_eq!(mobs["zombie"].max_group, 4);
+        assert_eq!(mobs["zombie"].biomes, vec!["*"]);
+        assert!(!mobs["sheep"].enabled);
+        assert_eq!(mobs["sheep"].weight, 12);
+        // The mobs that are not mentioned keep their defaults.
+        assert_eq!(mobs["cow"].weight, 8);
+        assert_eq!(mobs["wolf"].max_group, 8);
+    }
+
+    #[test]
+    fn unknown_mob_and_biome_are_rejected() {
+        let text = "[spawning.mobs.zombi]\nweight = 5\n";
+        let config: Config = toml::from_str(text).unwrap();
+        assert!(config.validate().is_err());
+
+        let text = "[spawning.mobs.zombie]\nbiomes = [\"swamp\"]\n";
+        let config: Config = toml::from_str(text).unwrap();
+        assert!(config.validate().is_err());
+
+        let text = "[spawning.mobs.zombie]\nweight = \"ten\"\n";
+        assert!(toml::from_str::<Config>(text).is_err());
+    }
+
+    #[test]
+    fn the_saved_config_contains_every_mob() {
+        let config = Config::default();
+        let text = toml::to_string_pretty(&config).unwrap();
+        for name in MOB_SPAWN_NAMES {
+            assert!(
+                text.contains(&format!("[spawning.mobs.{name}]")),
+                "{name} is missing in the saved config"
+            );
+        }
     }
 }

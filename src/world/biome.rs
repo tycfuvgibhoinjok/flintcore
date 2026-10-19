@@ -66,6 +66,45 @@ impl Biome {
         }
     }
 
+    /// The lower case name used in the configuration file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Biome::Rainforest => "rainforest",
+            Biome::Swampland => "swampland",
+            Biome::SeasonalForest => "seasonal_forest",
+            Biome::Forest => "forest",
+            Biome::Savanna => "savanna",
+            Biome::Shrubland => "shrubland",
+            Biome::Taiga => "taiga",
+            Biome::Desert => "desert",
+            Biome::Plains => "plains",
+            Biome::IceDesert => "ice_desert",
+            Biome::Tundra => "tundra",
+            Biome::Hell => "hell",
+            Biome::Sky => "sky",
+        }
+    }
+
+    /// Parses the lower case name used in the configuration file.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "rainforest" => Biome::Rainforest,
+            "swampland" => Biome::Swampland,
+            "seasonal_forest" => Biome::SeasonalForest,
+            "forest" => Biome::Forest,
+            "savanna" => Biome::Savanna,
+            "shrubland" => Biome::Shrubland,
+            "taiga" => Biome::Taiga,
+            "desert" => Biome::Desert,
+            "plains" => Biome::Plains,
+            "ice_desert" => Biome::IceDesert,
+            "tundra" => Biome::Tundra,
+            "hell" => Biome::Hell,
+            "sky" => Biome::Sky,
+            _ => return None,
+        })
+    }
+
     pub fn top_block(self) -> u8 {
         match self {
             Biome::Desert | Biome::IceDesert => blocks::SAND,

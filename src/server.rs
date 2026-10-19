@@ -441,7 +441,8 @@ impl Server {
         }
 
         // Natural mob spawning every 20 ticks (`SpawnerCreature.spawnEntities`)
-        if ticks % 20 == 0 {
+        let spawn_interval = self.config.spawning.spawn_interval_ticks.max(1);
+        if ticks % spawn_interval == 0 {
             if self.world.live_is_active() {
                 self.tick_mob_spawner();
             }
