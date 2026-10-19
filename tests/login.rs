@@ -1628,6 +1628,34 @@ async fn duplicate_username_login_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kicked_player_can_reconnect_with_the_same_name() {
+    let harness = Harness::start().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client, "Kicked").await;
+
+        // A too long chat message gets the player kicked.
+        let mut writer = Writer::new();
+        writer.write_u8(3);
+        writer
+            .write_string(&"a".repeat(101), MAX_CHAT_LENGTH)
+            .unwrap();
+        client.write_all(writer.as_slice()).await.unwrap();
+
+        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 255);
+        let reason = read_string(&mut client).await;
+        assert_eq!(reason, "Chat message too long");
+
+        // The name is free right away: the same name may log in again.
+        let mut client2 = TcpStream::connect(harness.address).await.unwrap();
+        login_and_consume_spawn(&mut client2, "Kicked").await;
+    };
+
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn respawn_re_spawns_players_for_each_other() {
     let harness = Harness::start().await;
     let exchange = async {

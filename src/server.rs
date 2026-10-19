@@ -714,64 +714,105 @@ impl Server {
         let _ = connection.sender.send(Outbound::Close);
     }
 
-    fn remove_and_handle_disconnect(&mut self, id: ConnId) {
-        if let Some(conn) = self.connections.remove(&id) {
-            let dimension = self
-                .entities
-                .get_by_conn(id)
-                .map(|p| p.dimension)
-                .unwrap_or(0);
+    /// Removes the player of a connection: the open container, the vehicle,
+    /// the entity, the world anchor, the player data and the tracker entry.
+    ///
+    /// The leave message is broadcast as well, so the caller must not send it
+    /// a second time.
+    fn cleanup_player(&mut self, id: ConnId) {
+        let dimension = self
+            .entities
+            .get_by_conn(id)
+            .map(|p| p.dimension)
+            .unwrap_or(0);
+        self.with_dimension(dimension, |s| {
+            s.close_player_container_and_drop_transient(id, false);
+            if let Some(p) = s.entities.get_by_conn(id) {
+                let eid = p.entity_id;
+                s.dismount_player(eid);
+            }
+        });
+        let Some(player) = self.entities.remove_by_conn(id) else {
+            return;
+        };
+        if self.nether.is_some() {
             self.with_dimension(dimension, |s| {
-                s.close_player_container_and_drop_transient(id, false);
-                if let Some(p) = s.entities.get_by_conn(id) {
-                    let eid = p.entity_id;
-                    s.dismount_player(eid);
+                if s.world.live_is_active() {
+                    s.world.live_player_quit(id);
                 }
             });
-            if let Some(player) = self.entities.remove_by_conn(id) {
-                if self.nether.is_some() {
-                    self.with_dimension(dimension, |s| {
-                        if s.world.live_is_active() {
-                            s.world.live_player_quit(id);
-                        }
-                    });
-                } else if self.world.live_is_active() {
-                    self.world.live_player_quit(id);
-                }
-                if self.config.world.save_enabled && self.config.server.save_playerdata {
-                    let _ = self.player_store.save_player(&player);
-                }
+        } else if self.world.live_is_active() {
+            self.world.live_player_quit(id);
+        }
+        if self.config.world.save_enabled && self.config.server.save_playerdata {
+            let _ = self.player_store.save_player(&player);
+        }
 
-                let untrack_packets = self.tracker.untrack_player(player.entity_id);
-                for outbound in untrack_packets {
-                    if let Some(target) = self.entities.get_player(outbound.recipient_id) {
-                        if target.dimension == dimension {
-                            self.send(target.conn_id, outbound.packet);
-                        }
-                    }
+        let untrack_packets = self.tracker.untrack_player(player.entity_id);
+        for outbound in untrack_packets {
+            if let Some(target) = self.entities.get_player(outbound.recipient_id) {
+                if target.dimension == dimension {
+                    self.send(target.conn_id, outbound.packet);
                 }
-
-                if !self.config.messages.remove_join_leave_debug {
-                    log::info(&format!(
-                        "{} lost connection: disconnect.quitting",
-                        player.username
-                    ));
-                }
-                let default_leave = crate::config::ServerConfig::default().leave_message;
-                let leave_tpl = if self.config.server.leave_message != default_leave {
-                    &self.config.server.leave_message
-                } else {
-                    &self.config.messages.leave
-                };
-                let msg = leave_tpl.replacen("%player%", &player.username, 1);
-                self.broadcast_chat(&msg);
             }
+        }
+
+        if !self.config.messages.remove_join_leave_debug {
+            log::info(&format!(
+                "{} lost connection: disconnect.quitting",
+                player.username
+            ));
+        }
+        let msg = self
+            .config
+            .messages
+            .leave
+            .replacen("%player%", &player.username, 1);
+        self.broadcast_chat(&msg);
+    }
+
+    fn remove_and_handle_disconnect(&mut self, id: ConnId) {
+        if let Some(conn) = self.connections.remove(&id) {
+            self.cleanup_player(id);
             if !self.config.messages.remove_join_leave_debug {
                 log::info(&format!(
                     "connection {id} ({}) disconnected",
                     conn.username.as_deref().unwrap_or("unknown")
                 ));
             }
+        }
+    }
+
+    /// Whether the session of a player is still alive.
+    ///
+    /// A kicked player keeps its connection until the socket is closed and
+    /// the disconnect event is processed, and a client that vanishes leaves a
+    /// connection whose writer is already gone. Such a player is gone: it
+    /// must not block the name for the next login.
+    fn player_session_is_alive(&self, conn_id: ConnId, entity_id: i32) -> bool {
+        match self.connections.get(&conn_id) {
+            Some(conn) => !conn.sender.is_closed() && conn.entity_id == entity_id,
+            None => false,
+        }
+    }
+
+    /// Removes the players whose session is gone.
+    ///
+    /// The disconnect event is processed asynchronously, so a kicked player can
+    /// still be in the list for a moment. Such a ghost would block the name
+    /// for the next login and count towards the player limit.
+    fn purge_dead_players(&mut self) {
+        let dead: Vec<ConnId> = self
+            .entities
+            .iter_players()
+            .filter(|player| !self.player_session_is_alive(player.conn_id, player.entity_id))
+            .map(|player| player.conn_id)
+            .collect();
+        for conn_id in dead {
+            log::info(&format!(
+                "removing the player of the dead connection {conn_id}"
+            ));
+            self.cleanup_player(conn_id);
         }
     }
 
@@ -9132,6 +9173,9 @@ impl Server {
             self.kick(id, &msg);
             return;
         }
+        // A player whose session is already gone must neither block the name
+        // nor count towards the player limit.
+        self.purge_dead_players();
         if self.entities.player_count() >= self.config.server.max_players as usize {
             let msg = self.config.messages.kick_full.clone();
             self.kick(id, &msg);
@@ -9306,13 +9350,7 @@ impl Server {
         self.send(id, Clientbound::UpdateHealth(UpdateHealth { health }));
 
         // Poseidon: PlayerJoinEvent -> broadcast join message to other players
-        let default_join = crate::config::ServerConfig::default().join_message;
-        let join_tpl = if self.config.server.join_message != default_join {
-            &self.config.server.join_message
-        } else {
-            &self.config.messages.join
-        };
-        let join_msg = join_tpl.replacen("%player%", name, 1);
+        let join_msg = self.config.messages.join.replacen("%player%", name, 1);
         self.broadcast_chat_except(id, &join_msg);
     }
 
@@ -10215,7 +10253,7 @@ impl Server {
         }
     }
 
-    fn kick(&self, id: ConnId, reason: &str) {
+    fn kick(&mut self, id: ConnId, reason: &str) {
         if let Some(connection) = self.connections.get(&id) {
             let _ = connection
                 .sender
@@ -10226,6 +10264,9 @@ impl Server {
                 )));
             let _ = connection.sender.send(Outbound::Close);
         }
+        // The session ends now: the player must neither block the name nor
+        // count towards the player limit until the disconnect event arrives.
+        self.cleanup_player(id);
     }
 }
 
@@ -10380,6 +10421,163 @@ mod tests {
             let player = server.entities.get_player(eid).unwrap();
             assert_eq!(player.dimension, -1, "travel must happen when F >= 1.0");
         }
+    }
+
+    #[test]
+    fn live_server_spawns_mobs_around_a_player() {
+        let dir = std::env::temp_dir().join("flintcore_live_spawn_check");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.world.save_enabled = true;
+        config.world.level_name = dir.to_string_lossy().to_string();
+        config.world.view_distance = 4;
+        config.world.keep_spawn_in_memory = false;
+        config.server.allow_nether = false;
+        let (_tx, rx) = mpsc::channel(8);
+        let mut server = Server::new(config, rx, Arc::new(AtomicBool::new(true)));
+        server
+            .entities
+            .insert_player(1, "Tester".to_string(), 0.5, 64.0, 0.5);
+        for _ in 0..1200 {
+            server.tick(0);
+        }
+        let mobs: Vec<_> = server.entities.iter_mobs().map(|m| m.mob_type).collect();
+        println!("LIVE: {} mobs: {:?}", mobs.len(), mobs);
+        let animals = mobs.iter().filter(|m| m.is_animal()).count();
+        let monsters = mobs.iter().filter(|m| m.is_monster()).count();
+        println!("LIVE: animals={animals} monsters={monsters}");
+        assert!(!mobs.is_empty(), "no mobs spawned in the live world");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server with a flat grass field and a player that stands at the
+    /// world spawn.
+    ///
+    /// The whole area is flattened, so that the mobs always spawn on the
+    /// surface at `y = 64` and the test does not depend on the terrain.
+    fn spawn_test_server(spawning: crate::config::SpawningConfig) -> Server {
+        let mut config = Config::default();
+        config.world.save_enabled = false;
+        config.world.view_distance = 2;
+        config.server.allow_nether = false;
+        config.spawning = spawning;
+        let (_tx, rx) = mpsc::channel(8);
+        let mut server = Server::new(config, rx, Arc::new(AtomicBool::new(true)));
+        for cx in 0..=6 {
+            for cz in 0..=6 {
+                server.world.ensure_chunk_base(ChunkPos::new(cx, cz));
+            }
+        }
+        for x in 0..112 {
+            for z in 0..112 {
+                server.world.set_block(x, 63, z, blocks::GRASS);
+                server.world.set_block(x, 64, z, blocks::AIR);
+                server.world.set_block(x, 65, z, blocks::AIR);
+            }
+        }
+        // The sky light of the base chunks, so that the animals can spawn.
+        for cx in 0..=6 {
+            for cz in 0..=6 {
+                if let Some(chunk) = server.world.get_chunk_mut(ChunkPos::new(cx, cz)) {
+                    chunk.init_lighting();
+                }
+            }
+        }
+        while server.world.java_do_lighting() {}
+        server
+            .entities
+            .insert_player(1, "Tester".to_string(), 0.0, 64.0, 0.0);
+        server
+    }
+
+    #[test]
+    fn the_spider_jockey_spawns_a_skeleton_rider() {
+        let mut spawning = crate::config::SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        spawning.mobs.get_mut("spider").unwrap().jockey_chance = 1;
+        for name in [
+            "zombie", "skeleton", "creeper", "slime", "sheep", "pig", "chicken", "cow", "wolf",
+            "squid",
+        ] {
+            spawning.mobs.get_mut(name).unwrap().enabled = false;
+        }
+        let mut server = spawn_test_server(spawning);
+        for _ in 0..50 {
+            server.tick_mob_spawner();
+        }
+
+        // A spider carries a skeleton, like the Java `applyPostSpawnExtras`
+        // does (`entityskeleton.mount(entityliving)`).
+        let mut jockeys = 0;
+        for mob in server.entities.iter_mobs() {
+            if mob.mob_type != MobType::Spider {
+                continue;
+            }
+            let Some(rider_id) = mob.passenger_id else {
+                continue;
+            };
+            let rider = server.entities.get_mob(rider_id).unwrap();
+            assert_eq!(rider.mob_type, MobType::Skeleton);
+            assert_eq!(rider.vehicle_id, Some(mob.entity_id));
+            jockeys += 1;
+        }
+        assert!(jockeys > 0, "the spider jockey did not spawn");
+    }
+
+    #[test]
+    fn a_dead_session_does_not_block_the_name() {
+        let mut server = test_server();
+
+        // A player whose connection is gone: the writer was closed, so the
+        // socket is dead even though the disconnect event is still queued.
+        let (tx, rx) = mpsc::unbounded_channel::<Outbound>();
+        drop(rx);
+        let entity_id = server
+            .entities
+            .insert_player(1, "Ghost".to_string(), 0.0, 64.0, 0.0);
+        server.connections.insert(
+            1,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().unwrap(),
+                state: ConnectionState::Playing,
+                username: Some("Ghost".to_string()),
+                entity_id,
+            },
+        );
+        assert_eq!(server.entities.player_count(), 1);
+
+        // The ghost is removed, the name and the slot are free again.
+        server.purge_dead_players();
+        assert_eq!(server.entities.player_count(), 0);
+        assert!(server.entities.get_by_conn(1).is_none());
+    }
+
+    #[test]
+    fn a_live_session_is_kept() {
+        let mut server = test_server();
+
+        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let entity_id = server
+            .entities
+            .insert_player(1, "Alive".to_string(), 0.0, 64.0, 0.0);
+        server.connections.insert(
+            1,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().unwrap(),
+                state: ConnectionState::Playing,
+                username: Some("Alive".to_string()),
+                entity_id,
+            },
+        );
+
+        server.purge_dead_players();
+        assert_eq!(server.entities.player_count(), 1);
+        assert!(server.entities.get_by_conn(1).is_some());
     }
 
     /// A server with the standard input console attached and a sink that

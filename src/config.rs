@@ -117,9 +117,9 @@ impl Config {
                     "spawning.mobs.{name}.max_group must be at least 1"
                 )));
             }
-            if mob.spawn_chance < 1 {
+            if mob.spawn_chance < 0 || mob.spawn_chance > 100 {
                 return Err(Error::Config(format!(
-                    "spawning.mobs.{name}.spawn_chance must be at least 1"
+                    "spawning.mobs.{name}.spawn_chance must be between 0 and 100"
                 )));
             }
             if mob.light_roll < 0 || mob.sky_light_roll < 0 {
@@ -157,6 +157,13 @@ impl Config {
     }
 }
 
+/// Server settings.
+///
+/// Sources: `server.properties` (the vanilla server), `Poseidon`
+/// (`settings.check-username-validity.*`, `settings.cracked-username-prefix`,
+/// `command.tps`), `Uberbukkit` (`settings.exempt-staff-from-flight-kick`) and
+/// the flintcore extensions (the console, the join/leave messages live in
+/// `[messages]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -179,8 +186,6 @@ pub struct ServerConfig {
     pub autosave_interval_ticks: u64,
     pub time_speed_multiplier: i64,
     pub enable_tps_command: bool,
-    pub join_message: String,
-    pub leave_message: String,
     /// Read server commands from the process' standard input (the vanilla
     /// server console). Only the `flintcore` binary starts the reader.
     pub console_enabled: bool,
@@ -211,8 +216,6 @@ impl Default for ServerConfig {
             autosave_interval_ticks: 6000,
             time_speed_multiplier: 1,
             enable_tps_command: true,
-            join_message: "\u{00A7}e%player% joined the game.".to_string(),
-            leave_message: "\u{00A7}e%player% left the game.".to_string(),
             console_enabled: true,
             console_name: "CONSOLE".to_string(),
         }
@@ -250,9 +253,18 @@ impl Default for MessagesConfig {
     }
 }
 
+/// Network settings.
+///
+/// Sources: `Poseidon` (`settings.enable-tpc-nodelay`, `settings.faster-packets`,
+/// `settings.packet-spam-detection.*`, `settings.release2beta.*`,
+/// `settings.bungeecord.*`), `Uberbukkit` (`client.allowed_protocols`) and the
+/// flintcore buffer limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// `Poseidon: settings.enable-tpc-nodelay` — the Poseidon default is
+    /// `false`, flintcore enables it because Nagle delays the small packets
+    /// of the protocol.
     pub tcp_nodelay: bool,
     pub faster_packets: bool,
     pub inbound_capacity: usize,
@@ -289,6 +301,13 @@ impl Default for NetworkConfig {
     }
 }
 
+/// World and world generation settings.
+///
+/// Sources: `server.properties` (the vanilla server), `Poseidon`
+/// (`world-settings.randomize-spawn`,
+/// `world-settings.teleport-to-highest-safe-block`,
+/// `emergency.debug.regenerate-corrupt-chunks`) and the flintcore
+/// extensions (the spawn coordinates, the worker pools).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorldConfig {
@@ -403,11 +422,13 @@ impl Default for SpawningConfig {
             mob_spawner_area_limit_enabled: true,
             mob_spawner_area_limit: 150,
             mob_spawner_chunk_radius: 8,
-            spawn_interval_ticks: 20,
+            // The Java code spawns every tick and rolls every candidate chunk
+            // (`World.doTick` -> `SpawnerCreature.spawnEntities`).
+            spawn_interval_ticks: 1,
             spawn_radius_chunks: 8,
             min_player_distance: 24.0,
             min_spawn_distance: 24.0,
-            chunk_sample_divisor: 16,
+            chunk_sample_divisor: 1,
             mobs: default_mob_settings(),
         }
     }
@@ -462,8 +483,9 @@ pub struct MobSpawnSettings {
     pub min_y: i32,
     /// Highest block height the mob can spawn at.
     pub max_y: i32,
-    /// The mob spawns with a probability of 1/N on a valid position
-    /// (`EntitySlime.d()` uses 10, `EntityGhast.d()` uses 20).
+    /// The mob spawns with a probability of `spawn_chance` percent. `100`
+    /// means that the mob always spawns (`EntitySlime.d()` uses 10, which is
+    /// the `random.nextInt(10) == 0` of the Java code, `EntityGhast.d()` 5).
     pub spawn_chance: i32,
     /// The block below the mob has to be grass (`EntityAnimal.d()`).
     pub require_grass_below: bool,
@@ -487,7 +509,7 @@ impl Default for MobSpawnSettings {
             sky_light_roll: 32,
             min_y: 0,
             max_y: 127,
-            spawn_chance: 1,
+            spawn_chance: 100,
             require_grass_below: false,
             require_water: false,
             slime_chunk_only: false,
@@ -533,7 +555,7 @@ pub fn default_mob_settings() -> BTreeMap<String, MobSpawnSettings> {
             MobSpawnSettings {
                 max_group: 1,
                 biomes: vec!["hell".to_string()],
-                spawn_chance: 20,
+                spawn_chance: 5,
                 ..base.clone()
             },
         ),
@@ -811,6 +833,9 @@ impl Default for WorldgenConfig {
 }
 
 /// Gameplay mechanics and historical version switches (`Poseidon` + `Uberbukkit` + `flintcore` extras).
+///
+/// The `Uberbukkit` options are named `mechanics.*` in `settings.yml`, the
+/// `Poseidon` ones live in `poseidon.yml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MechanicsConfig {
@@ -932,6 +957,10 @@ impl Default for MechanicsConfig {
 }
 
 /// Anti-exploit, dupe patches, and movement validation (`Poseidon` + `Uberbukkit`).
+///
+/// Sources: `Poseidon` (`world.settings.pistons.*`,
+/// `world.settings.speed-hack-check.*`), `Uberbukkit`
+/// (`patch.container-interaction.max-distance`) and the flintcore patches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FixesConfig {
@@ -1031,7 +1060,10 @@ mod tests {
         assert_eq!(mobs["slime"].spawn_chance, 10);
         assert!(mobs["slime"].slime_chunk_only);
         assert_eq!(mobs["slime"].max_y, 15);
-        assert_eq!(mobs["ghast"].spawn_chance, 20);
+        assert_eq!(mobs["ghast"].spawn_chance, 5);
+        // Every other mob always spawns.
+        assert_eq!(mobs["zombie"].spawn_chance, 100);
+        assert_eq!(mobs["sheep"].spawn_chance, 100);
         // `SpawnerCreature` (the spider jockey).
         assert_eq!(mobs["spider"].jockey_chance, 100);
         // `EntityGiant` is not part of the spawn tables.
@@ -1040,6 +1072,12 @@ mod tests {
         assert_eq!(config.spawning.monster_cap, 70);
         assert_eq!(config.spawning.animal_cap, 15);
         assert_eq!(config.spawning.water_mob_cap, 5);
+        // The Java code spawns every tick and rolls every candidate chunk.
+        assert_eq!(config.spawning.spawn_interval_ticks, 1);
+        assert_eq!(config.spawning.chunk_sample_divisor, 1);
+        assert_eq!(config.spawning.spawn_radius_chunks, 8);
+        assert_eq!(config.spawning.min_player_distance, 24.0);
+        assert_eq!(config.spawning.min_spawn_distance, 24.0);
     }
 
     #[test]

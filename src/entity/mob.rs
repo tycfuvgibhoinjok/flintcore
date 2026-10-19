@@ -1109,6 +1109,11 @@ pub fn evaluate_natural_spawns(
         if candidates.is_empty() {
             continue;
         }
+        // The buffers are reused for every chunk; the spawn pass runs every
+        // tick over every loaded chunk, so allocations would show up in the
+        // tick time.
+        let mut biome_candidates: Vec<(MobType, &MobSpawnSettings)> = Vec::with_capacity(16);
+        let mut table: Vec<(MobType, i32)> = Vec::with_capacity(16);
 
         for &cpos in &candidate_chunks {
             // Only sample a subset of chunks per tick so TPS stays 20.0
@@ -1124,24 +1129,24 @@ pub fn evaluate_natural_spawns(
                 Biome::from_id(chunk.biomes[0])
             };
             // The spawn table of the biome (`BiomeBase.a(type)`).
-            let biome_candidates: Vec<(MobType, &MobSpawnSettings)> = candidates
-                .iter()
-                .filter(|(_, settings)| settings.spawns_in(biome))
-                .copied()
-                .collect();
+            biome_candidates.clear();
+            table.clear();
+            for &(mob_type, settings) in &candidates {
+                if settings.spawns_in(biome) {
+                    biome_candidates.push((mob_type, settings));
+                    table.push((mob_type, settings.weight));
+                }
+            }
             if biome_candidates.is_empty() {
                 continue;
             }
-            let table: Vec<(MobType, i32)> = biome_candidates
-                .iter()
-                .map(|(mob_type, settings)| (*mob_type, settings.weight))
-                .collect();
             let Some(mob_type) = pick_weighted(&table, rng) else {
                 continue;
             };
-            let Some((_, settings)) = biome_candidates
+            let Some(settings) = biome_candidates
                 .iter()
                 .find(|(candidate, _)| *candidate == mob_type)
+                .map(|(_, settings)| *settings)
             else {
                 continue;
             };
@@ -1206,15 +1211,17 @@ pub fn evaluate_natural_spawns(
                     }
 
                     // The spawn conditions of the mob (`Entity.d()`).
-                    if settings.sky_light_roll > 0 {
-                        let sky_l = chunk_sky_light_at(world, x, y, z);
-                        if sky_l > rng.next_i32_bound(settings.sky_light_roll) {
-                            continue;
-                        }
-                    }
+                    // The block light is rolled before the sky light, like the
+                    // vanilla 1.7.3 `SpawnerCreature` does.
                     if settings.light_roll > 0 {
                         let light = chunk_light_at(world, x, y, z, sky_sub);
                         if light > rng.next_i32_bound(settings.light_roll) {
+                            continue;
+                        }
+                    }
+                    if settings.sky_light_roll > 0 {
+                        let sky_l = chunk_sky_light_at(world, x, y, z);
+                        if sky_l > rng.next_i32_bound(settings.sky_light_roll) {
                             continue;
                         }
                     }
@@ -1228,7 +1235,9 @@ pub fn evaluate_natural_spawns(
                     {
                         continue;
                     }
-                    if settings.spawn_chance > 1 && rng.next_i32_bound(settings.spawn_chance) != 0 {
+                    if settings.spawn_chance < 100
+                        && rng.next_i32_bound(100) >= settings.spawn_chance
+                    {
                         continue;
                     }
                     if settings.slime_chunk_only && !is_slime_chunk(world.seed(), x >> 4, z >> 4) {
@@ -1543,10 +1552,52 @@ mod tests {
         spawning.mobs.get_mut("squid").unwrap().enabled = false;
         let world = spawn_world(spawning);
 
-        let spawned = collect_spawns(&world, 4321, 512);
+        // The position of a spawn attempt is rolled randomly, so the first
+        // round that spawns a zombie is used to check the group size.
+        for round in 0..512 {
+            let mut rng = JavaRandom::new(4321 + round);
+            let players = [(0.0, 64.0, 0.0)];
+            let spawned = evaluate_natural_spawns(&world, &mut rng, &players, true, true, 0, 0, 0);
+            if spawned.is_empty() {
+                continue;
+            }
+            // Every chunk holds at most one group of one mob.
+            assert!(
+                spawned.len() <= 2,
+                "too many mobs in one round: {}",
+                spawned.len()
+            );
+            assert!(spawned.iter().all(|spec| spec.mob_type == MobType::Zombie));
+            return;
+        }
+        panic!("no zombie spawned");
+    }
+
+    #[test]
+    fn the_spawn_chance_is_a_percentage() {
+        // A chance of 0 percent means that the mob never spawns.
+        let mut spawning = SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        for name in [
+            "spider", "zombie", "skeleton", "creeper", "slime", "sheep", "pig", "chicken", "cow",
+            "wolf", "squid",
+        ] {
+            spawning.mobs.get_mut(name).unwrap().spawn_chance = 0;
+        }
+        let world = spawn_world(spawning);
+        let spawned = collect_spawns(&world, 1234, 512);
+        assert!(spawned.is_empty(), "no mob may spawn with a chance of 0");
+
+        // A chance of 100 percent means that the mob always spawns.
+        let spawning = SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        let world = spawn_world(spawning);
+        let spawned = collect_spawns(&world, 1234, 512);
         assert!(!spawned.is_empty());
-        // The group loop spawns at most three groups of one mob per chunk.
-        assert!(spawned.len() <= 6, "too many mobs: {}", spawned.len());
     }
 
     #[test]
