@@ -527,8 +527,9 @@ impl Mob {
 
         // The acceleration (`Entity.a(float, float, float)`).
         // The reference computes the acceleration with single precision.
-        let input =
-            (self.move_strafe * self.move_strafe + self.move_forward * self.move_forward).sqrt();
+        let input = crate::util::math::math_helper_a(
+            (self.move_strafe * self.move_strafe + self.move_forward * self.move_forward) as f64,
+        );
         // The squid has its own check for the water (`EntitySquid.ad()`).
         let in_water = if self.mob_type == MobType::Squid {
             crate::entity::physics::squid_in_water(world, &aabb)
@@ -1154,7 +1155,7 @@ impl<'a> Pathfinder<'a> {
         let dx = (to.0 - from.0) as f32;
         let dy = (to.1 - from.1) as f32;
         let dz = (to.2 - from.2) as f32;
-        (dx * dx + dy * dy + dz * dz).sqrt()
+        crate::util::math::math_helper_a((dx * dx + dy * dy + dz * dz) as f64)
     }
 
     /// Java `Pathfinder.a(int, int, int)`: the point of a position.

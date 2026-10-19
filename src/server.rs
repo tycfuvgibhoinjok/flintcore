@@ -5751,7 +5751,7 @@ impl Server {
                 {
                     let dx = mob.x - mob.last_x;
                     let dz = mob.z - mob.last_z;
-                    let moved = (dx * dx + dz * dz).sqrt() as f32;
+                    let moved = crate::util::math::math_helper_a(dx * dx + dz * dz);
                     let mut look = mob.look_yaw;
                     if moved > 0.05 {
                         // The reference uses its own `TrigMath.atan2` here.
@@ -10624,7 +10624,7 @@ fn look_at(
     let dz = target_z - mob.z;
     let dy = mob.y + mob.eye_height() - (target_y + target_eye_height);
     // `MathHelper.a(double)`: the square root is a single precision value.
-    let distance = ((dx * dx + dz * dz).sqrt() as f32) as f64;
+    let distance = crate::util::math::math_helper_a(dx * dx + dz * dz) as f64;
     let target_yaw = (crate::util::fdlibm::atan2(dz, dx) * 180.0
         / crate::entity::mob::JAVA_PI_DOUBLE) as f32
         - 90.0;

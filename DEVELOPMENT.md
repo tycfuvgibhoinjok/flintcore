@@ -231,8 +231,10 @@ Mob movement parity harness:
     and the movement.
   - The arithmetic of the reference is ported exactly: the constants of
     the single precision (`0.9800000190734863D`, `0.41999998688697815D`),
-    the sine and the cosine of the table of `MathHelper` and the arcus
-    tangens of `org.bukkit.craftbukkit.TrigMath` (`util::math::trig`).
+    the sine and the cosine of the table of `MathHelper`, the square root
+    of `MathHelper.a()` (the double precision, the single precision one
+    can differ in the last bit) and the arcus tangens of
+    `org.bukkit.craftbukkit.TrigMath` (`util::math::trig`).
   - The reference uses **two** arcus tangens: the one of
     `org.bukkit.craftbukkit.TrigMath` (the walk of the mobs) and the one of
     the JVM (`Math.atan2`, the look at the target, the flight of the ghast

@@ -39,6 +39,15 @@ pub fn sqrt_f32(value: f32) -> f32 {
     value.sqrt()
 }
 
+/// Java `MathHelper.a(double)`: the square root of a double, rounded to a
+/// single precision value.
+///
+/// The reference takes the square root in the double precision and rounds
+/// the result, the single precision square root can differ in the last bit.
+pub fn math_helper_a(value: f64) -> f32 {
+    value.sqrt() as f32
+}
+
 pub fn abs_f32(value: f32) -> f32 {
     value.abs()
 }
