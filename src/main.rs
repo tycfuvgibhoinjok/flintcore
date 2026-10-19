@@ -31,6 +31,7 @@ fn main() -> Result<()> {
         "flintcore starting with {}",
         config_path.display()
     ));
+    let console_enabled = config.server.console_enabled;
 
     let running = Arc::new(AtomicBool::new(true));
     let next_id = Arc::new(AtomicU64::new(1));
@@ -63,7 +64,15 @@ fn main() -> Result<()> {
         });
     }
 
-    let server = Server::new(config, inbound_rx, Arc::clone(&running));
+    let mut server = Server::new(config, inbound_rx, Arc::clone(&running));
+    if console_enabled {
+        // The console reader thread only exists in the binary: the library
+        // never touches the process' standard input.
+        let (console_tx, console_rx) = std::sync::mpsc::channel();
+        flintcore::console::spawn_reader(console_tx);
+        server.attach_console(console_rx);
+        log::info("console enabled, type a command to run it");
+    }
     let result = server.run();
     runtime.shutdown_timeout(Duration::from_secs(2));
     result

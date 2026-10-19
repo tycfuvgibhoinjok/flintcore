@@ -98,6 +98,12 @@ pub struct ServerConfig {
     pub enable_tps_command: bool,
     pub join_message: String,
     pub leave_message: String,
+    /// Read server commands from the process' standard input (the vanilla
+    /// server console). Only the `flintcore` binary starts the reader.
+    pub console_enabled: bool,
+    /// Name the console sender appears under in chat and in the log
+    /// (`MinecraftServer.getName()`).
+    pub console_name: String,
 }
 
 impl Default for ServerConfig {
@@ -124,6 +130,8 @@ impl Default for ServerConfig {
             enable_tps_command: true,
             join_message: "\u{00A7}e%player% joined the game.".to_string(),
             leave_message: "\u{00A7}e%player% left the game.".to_string(),
+            console_enabled: true,
+            console_name: "CONSOLE".to_string(),
         }
     }
 }

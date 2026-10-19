@@ -48,6 +48,27 @@ struct Connection {
     entity_id: i32,
 }
 
+/// Who issued a server command.
+///
+/// Java dispatches console commands with `MinecraftServer` as the
+/// `ICommandListener` and player commands with the player's
+/// `NetServerHandler`; both end up in the same command map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandSender {
+    Player(ConnId),
+    Console,
+}
+
+impl CommandSender {
+    /// The connection of a player sender; the console has none.
+    fn player_connection(self) -> Option<ConnId> {
+        match self {
+            CommandSender::Player(id) => Some(id),
+            CommandSender::Console => None,
+        }
+    }
+}
+
 pub struct Server {
     config: Config,
     inbound: mpsc::Receiver<NetEvent>,
@@ -74,6 +95,11 @@ pub struct Server {
     tps_records: VecDeque<f64>,
     last_tps_sample: Instant,
     ticks_since_sample: u32,
+    /// Commands typed into the server console, queued by the standard input
+    /// reader thread (`MinecraftServer.issueCommand`).
+    console_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Sink the console writes its own output to (`MinecraftServer.sendMessage`).
+    console_sink: Box<dyn Fn(&str) + Send>,
 }
 
 impl Server {
@@ -200,7 +226,28 @@ impl Server {
             tps_records: VecDeque::with_capacity(900),
             last_tps_sample: Instant::now(),
             ticks_since_sample: 0,
+            console_rx: None,
+            console_sink: Box::new(|message: &str| log::console(message)),
         }
+    }
+
+    /// Attaches the standard input console to the server.
+    ///
+    /// The receiver is drained once per tick (`MinecraftServer.b()`), so the
+    /// commands run on the simulation thread and cannot race with the world
+    /// simulation.
+    pub fn attach_console(&mut self, rx: std::sync::mpsc::Receiver<String>) {
+        self.console_rx = Some(rx);
+    }
+
+    /// Replaces the sink the console prints its answers to.
+    pub fn set_console_sink(&mut self, sink: Box<dyn Fn(&str) + Send>) {
+        self.console_sink = sink;
+    }
+
+    /// Whether the console terminal is attached.
+    pub fn console_attached(&self) -> bool {
+        self.console_rx.is_some()
     }
 
     fn load_list_file(filename: &str) -> HashSet<String> {
@@ -487,6 +534,10 @@ impl Server {
                 self.entities.player_count()
             ));
         }
+
+        // Console commands are executed at the end of the tick, like the
+        // vanilla `MinecraftServer.b()`.
+        self.process_console_commands();
     }
 
     fn run_tracker_tick(&mut self) {
@@ -9545,25 +9596,41 @@ impl Server {
     }
 
     fn handle_command(&mut self, id: ConnId, command: &str) {
-        let username = self
-            .connections
-            .get(&id)
-            .and_then(|connection| connection.username.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+        self.run_command(CommandSender::Player(id), command);
+    }
 
-        let cmd_body = &command[1..];
+    /// Runs a server command for `sender`.
+    ///
+    /// Java routes console commands and player commands through the same
+    /// command map (`MinecraftServer.b()` → `server.dispatchCommand`); only
+    /// the listener differs — the console answers on the terminal, a player
+    /// receives chat packets.
+    fn run_command(&mut self, sender: CommandSender, command: &str) {
+        let username = match sender {
+            CommandSender::Player(id) => self
+                .connections
+                .get(&id)
+                .and_then(|connection| connection.username.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            CommandSender::Console => {
+                let name = self.config.server.console_name.trim();
+                if name.is_empty() {
+                    "CONSOLE".to_string()
+                } else {
+                    name.to_string()
+                }
+            }
+        };
+
+        // The console accepts commands with and without the leading slash.
+        let cmd_body = command.strip_prefix('/').unwrap_or(command);
         if !self.config.server.enable_tps_command
             && cmd_body
                 .split_whitespace()
                 .next()
                 .is_some_and(|c| c.eq_ignore_ascii_case("tps"))
         {
-            self.send(
-                id,
-                Clientbound::Chat(Chat {
-                    message: "Unknown command. Type \"help\" for help.".to_string(),
-                }),
-            );
+            self.reply(sender, "Unknown command. Type \"help\" for help.");
             return;
         }
         let mut online_players: Vec<String> = self
@@ -9587,28 +9654,18 @@ impl Server {
             .dispatch_with_context(&username, cmd_body, &ctx);
 
         if !result.handled {
-            self.send(
-                id,
-                Clientbound::Chat(Chat {
-                    message: "Unknown command. Type \"help\" for help.".to_string(),
-                }),
-            );
+            self.reply(sender, "Unknown command. Type \"help\" for help.");
             return;
         }
 
-        log::info(&format!("{username} issued server command: {command}"));
+        log::info(&format!("{username} issued server command: /{cmd_body}"));
 
         for action in result.actions {
             self.execute_command_action(action);
         }
 
         for msg in &result.sender_messages {
-            self.send(
-                id,
-                Clientbound::Chat(Chat {
-                    message: msg.clone(),
-                }),
-            );
+            self.reply(sender, msg);
         }
 
         for (target_name, msg) in &result.target_messages {
@@ -9618,7 +9675,7 @@ impl Server {
                 .find(|p| p.username.eq_ignore_ascii_case(target_name))
                 .map(|p| p.conn_id)
             {
-                if target_conn != id {
+                if Some(target_conn) != sender.player_connection() {
                     self.send(
                         target_conn,
                         Clientbound::Chat(Chat {
@@ -9631,6 +9688,46 @@ impl Server {
 
         for msg in &result.broadcast_messages {
             self.broadcast_chat(msg);
+            // The console sees the broadcasts it triggers as well.
+            if sender == CommandSender::Console {
+                self.reply(sender, msg);
+            }
+        }
+    }
+
+    /// Sends a command answer to whoever issued the command.
+    fn reply(&self, sender: CommandSender, message: &str) {
+        match sender {
+            CommandSender::Player(id) => {
+                self.send(
+                    id,
+                    Clientbound::Chat(Chat {
+                        message: message.to_string(),
+                    }),
+                );
+            }
+            CommandSender::Console => {
+                let text = crate::console::strip_formatting(message);
+                (self.console_sink)(&text);
+            }
+        }
+    }
+
+    /// Drains the console command queue (`MinecraftServer.b()`).
+    fn process_console_commands(&mut self) {
+        let Some(rx) = &self.console_rx else {
+            return;
+        };
+        let mut queued = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            queued.push(line);
+        }
+        for line in queued {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            self.run_command(CommandSender::Console, line);
         }
     }
 
@@ -10282,5 +10379,133 @@ mod tests {
             let player = server.entities.get_player(eid).unwrap();
             assert_eq!(player.dimension, -1, "travel must happen when F >= 1.0");
         }
+    }
+
+    /// A server with the standard input console attached and a sink that
+    /// records everything the console prints.
+    fn console_server() -> (
+        Server,
+        std::sync::mpsc::Sender<String>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let mut server = test_server();
+        let (tx, rx) = std::sync::mpsc::channel();
+        server.attach_console(rx);
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_output = Arc::clone(&output);
+        server.set_console_sink(Box::new(move |message: &str| {
+            sink_output.lock().unwrap().push(message.to_string());
+        }));
+        (server, tx, output)
+    }
+
+    #[test]
+    fn console_runs_commands_without_a_connected_player() {
+        let (mut server, tx, output) = console_server();
+        assert!(server.console_attached());
+
+        tx.send("list".to_string()).unwrap();
+        server.process_console_commands();
+
+        let output = output.lock().unwrap();
+        assert!(
+            output
+                .iter()
+                .any(|line| line.contains("Connected players:")),
+            "console output was {output:?}"
+        );
+    }
+
+    #[test]
+    fn console_reports_unknown_commands() {
+        let (mut server, tx, output) = console_server();
+
+        tx.send("definitely-not-a-command".to_string()).unwrap();
+        server.process_console_commands();
+
+        let output = output.lock().unwrap();
+        assert!(
+            output
+                .iter()
+                .any(|line| line.contains("Unknown command. Type \"help\" for help.")),
+            "console output was {output:?}"
+        );
+    }
+
+    #[test]
+    fn console_accepts_commands_with_and_without_a_leading_slash() {
+        let (mut server, tx, _output) = console_server();
+
+        tx.send("time set 1000".to_string()).unwrap();
+        server.process_console_commands();
+        assert_eq!(server.world.world_time(), 1000);
+
+        tx.send("/time set 2000".to_string()).unwrap();
+        server.process_console_commands();
+        assert_eq!(server.world.world_time(), 2000);
+    }
+
+    #[test]
+    fn console_stop_shuts_the_server_down() {
+        let (mut server, tx, _output) = console_server();
+
+        tx.send("stop".to_string()).unwrap();
+        server.process_console_commands();
+
+        assert!(!server.running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn console_broadcasts_reach_the_players() {
+        let (mut server, tx, output) = console_server();
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        server.connections.insert(
+            1,
+            Connection {
+                sender: out_tx,
+                address: "127.0.0.1:25565".parse().unwrap(),
+                state: ConnectionState::Playing,
+                username: Some("Tester".to_string()),
+                entity_id: 0,
+            },
+        );
+        server
+            .entities
+            .insert_player(1, "Tester".to_string(), 0.0, 64.0, 0.0);
+
+        tx.send("say hello".to_string()).unwrap();
+        server.process_console_commands();
+
+        let mut player_saw_broadcast = false;
+        while let Ok(outbound) = out_rx.try_recv() {
+            if let Outbound::Packet(Clientbound::Chat(chat)) = outbound {
+                if chat.message.contains("[Server] hello") {
+                    player_saw_broadcast = true;
+                }
+            }
+        }
+        assert!(player_saw_broadcast, "the broadcast must reach the players");
+
+        // The console prints the broadcast without the colour codes.
+        let output = output.lock().unwrap();
+        assert!(
+            output.iter().any(|line| line.contains("[Server] hello")),
+            "console output was {output:?}"
+        );
+        assert!(
+            !output.iter().any(|line| line.contains('\u{00A7}')),
+            "console output must not contain colour codes"
+        );
+    }
+
+    #[test]
+    fn console_commands_run_during_the_tick() {
+        let (mut server, tx, _output) = console_server();
+
+        tx.send("time set 4321".to_string()).unwrap();
+        server.tick(0);
+
+        assert_eq!(server.world.world_time(), 4321);
     }
 }
