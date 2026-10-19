@@ -339,13 +339,11 @@ impl ItemStack {
             283 | 284 | 285 | 286 | 294 => 32,
             // Flint and steel
             259 => 64,
-            // Bow
-            261 => 384,
             // Fishing rod
             346 => 64,
             // Shears
             359 => 238,
-            // Armor durability
+            // Armor durability (`ItemArmor.java:6, 18`: `{11, 16, 15, 13} * 3 << j`)
             298 => 33,  // Leather helmet
             299 => 48,  // Leather chestplate
             300 => 45,  // Leather leggings
@@ -354,15 +352,15 @@ impl ItemStack {
             303 => 96,  // Chain chestplate
             304 => 90,  // Chain leggings
             305 => 78,  // Chain boots
-            306 => 135, // Iron helmet
+            306 => 132, // Iron helmet
             307 => 192, // Iron chestplate
             308 => 180, // Iron leggings
             309 => 156, // Iron boots
-            310 => 272, // Diamond helmet
+            310 => 264, // Diamond helmet
             311 => 384, // Diamond chestplate
             312 => 360, // Diamond leggings
             313 => 312, // Diamond boots
-            314 => 68,  // Gold helmet
+            314 => 66,  // Gold helmet
             315 => 96,  // Gold chestplate
             316 => 90,  // Gold leggings
             317 => 78,  // Gold boots
@@ -400,44 +398,22 @@ impl ItemStack {
         }
     }
 
+    /// Java `ItemArmor.bl` (`ItemArmor.java:5, 17`): `{ 3, 8, 6, 3 }` across all materials in Beta 1.7.3.
     pub fn armor_defense(&self) -> i32 {
         match self.id {
-            298 => 1,
-            299 => 3,
-            300 => 2,
-            301 => 1,
-            302 => 2,
-            303 => 5,
-            304 => 4,
-            305 => 1,
-            306 => 2,
-            307 => 6,
-            308 => 5,
-            309 => 2,
-            310 => 3,
-            311 => 8,
-            312 => 6,
-            313 => 3,
-            314 => 2,
-            315 => 5,
-            316 => 3,
-            317 => 1,
+            298 | 302 | 306 | 310 | 314 => 3,
+            299 | 303 | 307 | 311 | 315 => 8,
+            300 | 304 | 308 | 312 | 316 => 6,
+            301 | 305 | 309 | 313 | 317 => 3,
             _ => 0,
         }
     }
 
+    /// Java `ItemTool` subclasses (Pickaxe, Spade, Axe — take 2 durability when hitting an entity).
     pub fn is_tool(&self) -> bool {
         matches!(
             self.id,
-            256..=259
-                | 261
-                | 268..=271
-                | 272..=275
-                | 276..=279
-                | 283..=286
-                | 290..=294
-                | 346
-                | 359
+            256..=258 | 269..=271 | 273..=275 | 277..=279 | 284..=286
         )
     }
 

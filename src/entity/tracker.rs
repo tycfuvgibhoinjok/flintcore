@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::entity::mob::Mob;
 use crate::entity::player::Player;
-use crate::entity::projectile::{Minecart, Painting, PrimedTnt, Projectile};
+use crate::entity::projectile::{Minecart, Painting, PrimedTnt, Projectile, ProjectileKind};
 use crate::entity::store::{Boat, DroppedItem};
 use crate::net::packets::{
     AttachEntity, Clientbound, DestroyEntity, EntityEquipment, EntityLook, EntityMetadata,
     EntityPainting, EntityTeleport, EntityVelocity, MobSpawn, NamedEntitySpawn, PickupSpawn,
-    RelEntityMove, RelEntityMoveLook, VehicleSpawn,
+    RelEntityMove, RelEntityMoveLook, Sleep, VehicleSpawn,
 };
 
 #[inline]
@@ -107,7 +107,7 @@ impl EntityTrackerEntry {
             last_meta_bytes: mob.encode_metadata(),
             teleport_ticks: 0,
             tracked_players: HashSet::new(),
-            tracking_range: 80.0,
+            tracking_range: 160.0,
         }
     }
 
@@ -131,7 +131,7 @@ impl EntityTrackerEntry {
     }
 
     pub fn make_spawn_packets(&self, player: &Player) -> Vec<Clientbound> {
-        let mut packets = Vec::with_capacity(8);
+        let mut packets = Vec::with_capacity(9);
         let held_item = player.inventory.item_in_hand().map(|i| i.id).unwrap_or(0);
 
         packets.push(Clientbound::NamedEntitySpawn(NamedEntitySpawn {
@@ -144,6 +144,18 @@ impl EntityTrackerEntry {
             pitch: self.encoded_pitch,
             current_item: held_item,
         }));
+
+        if player.sleeping {
+            if let Some((bx, by, bz)) = player.bed_pos {
+                packets.push(Clientbound::Sleep(Sleep {
+                    entity_id: player.entity_id,
+                    in_bed_code: 0,
+                    bed_x: bx,
+                    bed_y: by as u8,
+                    bed_z: bz,
+                }));
+            }
+        }
 
         let flags = player.metadata_flags();
         packets.push(Clientbound::EntityMetadata(EntityMetadata {
@@ -267,10 +279,21 @@ impl EntityTrackerEntry {
     }
 
     pub fn make_projectile_spawn_packets(&self, proj: &Projectile) -> Vec<Clientbound> {
-        let vx = (proj.mot_x.clamp(-3.9, 3.9) * 8000.0) as i16;
-        let vy = (proj.mot_y.clamp(-3.9, 3.9) * 8000.0) as i16;
-        let vz = (proj.mot_z.clamp(-3.9, 3.9) * 8000.0) as i16;
-        let thrower_id = proj.shooter_id.unwrap_or(proj.entity_id);
+        let (vx, vy, vz, thrower_id) = if proj.kind == ProjectileKind::Fireball {
+            (
+                (proj.accel_x.clamp(-3.9, 3.9) * 8000.0) as i16,
+                (proj.accel_y.clamp(-3.9, 3.9) * 8000.0) as i16,
+                (proj.accel_z.clamp(-3.9, 3.9) * 8000.0) as i16,
+                proj.shooter_id.unwrap_or(1),
+            )
+        } else {
+            (
+                (proj.mot_x.clamp(-3.9, 3.9) * 8000.0) as i16,
+                (proj.mot_y.clamp(-3.9, 3.9) * 8000.0) as i16,
+                (proj.mot_z.clamp(-3.9, 3.9) * 8000.0) as i16,
+                proj.shooter_id.unwrap_or(proj.entity_id),
+            )
+        };
         vec![Clientbound::VehicleSpawn(VehicleSpawn {
             entity_id: proj.entity_id,
             vehicle_type: proj.kind.vehicle_type(),
@@ -464,7 +487,7 @@ impl EntityTracker {
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
         let mut entry = EntityTrackerEntry::new_mob(mob);
-        let range_sq = 80.0 * 80.0;
+        let range_sq = 160.0 * 160.0;
         let target_chunk = mob.chunk_pos();
 
         for p in players {
@@ -890,7 +913,7 @@ impl EntityTracker {
         for mob in mobs.iter() {
             let entity_id = mob.entity_id;
             let target_chunk = mob.chunk_pos();
-            let mob_range_sq = 80.0 * 80.0;
+            let mob_range_sq = 160.0 * 160.0;
             if let Some(entry) = self.mob_entries.get_mut(&entity_id) {
                 for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
                     let dx = ox - mob.x;

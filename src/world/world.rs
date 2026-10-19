@@ -1029,18 +1029,86 @@ impl World {
             | blocks::RED_ROSE
             | blocks::BROWN_MUSHROOM
             | blocks::RED_MUSHROOM => {
-                // BlockFlower.doPhysics -> destroy when the plant can't survive.
+                // BlockFlower.doPhysics -> destroy and drop when the plant can't survive.
                 if !self.plant_can_survive(id, x, y, z) {
+                    let meta = self.get_data(x, y, z);
+                    if !self.insta_tick && id != blocks::TALL_GRASS && id != blocks::DEAD_BUSH {
+                        let dmg = if id == blocks::SAPLING {
+                            (meta & 3) as i16
+                        } else {
+                            0
+                        };
+                        self.world_events
+                            .push(crate::world::redstone::WorldEvent::DropItem {
+                                x: x as f64,
+                                y: y as f64,
+                                z: z as f64,
+                                item: crate::gameplay::items::ItemStack::new(id as i16, 1, dmg),
+                            });
+                    }
                     self.java_set_type_id(x, y, z, 0);
                 }
             }
+            blocks::CROPS => {
+                if self.get_block(x, y - 1, z) != blocks::FARMLAND {
+                    let meta = self.get_data(x, y, z);
+                    if !self.insta_tick && meta == 7 {
+                        self.world_events
+                            .push(crate::world::redstone::WorldEvent::DropItem {
+                                x: x as f64,
+                                y: y as f64,
+                                z: z as f64,
+                                item: crate::gameplay::items::ItemStack::new(
+                                    crate::gameplay::items::WHEAT,
+                                    1,
+                                    0,
+                                ),
+                            });
+                    }
+                    self.java_set_type_id(x, y, z, 0);
+                }
+            }
+            blocks::FARMLAND => {
+                if y < 127 && blocks::material(self.get_block(x, y + 1, z)).is_buildable() {
+                    self.java_set_type_id(x, y, z, blocks::DIRT);
+                }
+            }
+            blocks::PORTAL => {
+                self.do_physics_portal(x, y, z);
+            }
             blocks::CACTUS => {
                 if !self.cactus_can_survive(x, y, z) {
+                    if !self.insta_tick {
+                        self.world_events
+                            .push(crate::world::redstone::WorldEvent::DropItem {
+                                x: x as f64,
+                                y: y as f64,
+                                z: z as f64,
+                                item: crate::gameplay::items::ItemStack::new(
+                                    blocks::CACTUS as i16,
+                                    1,
+                                    0,
+                                ),
+                            });
+                    }
                     self.java_set_type_id(x, y, z, 0);
                 }
             }
             blocks::REED => {
                 if !self.reed_can_survive(x, y, z) {
+                    if !self.insta_tick {
+                        self.world_events
+                            .push(crate::world::redstone::WorldEvent::DropItem {
+                                x: x as f64,
+                                y: y as f64,
+                                z: z as f64,
+                                item: crate::gameplay::items::ItemStack::new(
+                                    crate::gameplay::items::SUGAR_CANE,
+                                    1,
+                                    0,
+                                ),
+                            });
+                    }
                     self.java_set_type_id(x, y, z, 0);
                 }
             }
@@ -1265,7 +1333,13 @@ impl World {
                     self.java_apply_physics(x, y - 1, z, id as i32);
                 }
             }
-            blocks::DISPENSER => self.tick_dispenser(x, y, z),
+            blocks::DISPENSER => {
+                if self.is_block_indirectly_powered(x, y, z)
+                    || self.is_block_indirectly_powered(x, y + 1, z)
+                {
+                    self.tick_dispenser(x, y, z);
+                }
+            }
             blocks::FIRE => self.tick_fire(x, y, z),
             _ => {}
         }
@@ -1376,9 +1450,28 @@ impl World {
                             || cur == blocks::SNOW;
                         if can_build && !self.sand_can_fall_through(ent.x, j - 1, ent.z) {
                             self.java_set_type_id(ent.x, j, ent.z, ent.id);
+                        } else {
+                            self.world_events
+                                .push(crate::world::redstone::WorldEvent::DropItem {
+                                    x: ent.x as f64,
+                                    y: j as f64,
+                                    z: ent.z as f64,
+                                    item: crate::gameplay::items::ItemStack::new(
+                                        ent.id as i16,
+                                        1,
+                                        0,
+                                    ),
+                                });
                         }
                     } else if ent.ticks > 100 {
                         ent.dead = true;
+                        self.world_events
+                            .push(crate::world::redstone::WorldEvent::DropItem {
+                                x: ent.x as f64,
+                                y: ent.loc_y,
+                                z: ent.z as f64,
+                                item: crate::gameplay::items::ItemStack::new(ent.id as i16, 1, 0),
+                            });
                     }
                 }
             }
@@ -1930,6 +2023,21 @@ impl World {
                     self.java_apply_physics(x, y - 1, z, id as i32);
                 }
             }
+            blocks::PISTON | blocks::STICKY_PISTON if !self.piston_updating => {
+                if (old_data & 8) != 0 {
+                    let dir = (old_data & 7) as usize;
+                    if dir <= 5 {
+                        let hx = x + [0, 0, 0, 0, -1, 1][dir];
+                        let hy = y + [-1, 1, 0, 0, 0, 0][dir];
+                        let hz = z + [0, 0, -1, 1, 0, 0][dir];
+                        if self.get_block(hx, hy, hz) == blocks::PISTON_HEAD
+                            && (self.get_data(hx, hy, hz) & 7) as usize == dir
+                        {
+                            self.java_set_type_id(hx, hy, hz, 0);
+                        }
+                    }
+                }
+            }
             blocks::PISTON_HEAD if !self.piston_updating => {
                 let dir = (old_data & 7) as usize;
                 if dir <= 5 {
@@ -1948,6 +2056,22 @@ impl World {
                                 item: crate::gameplay::items::ItemStack::new(base as i16, 1, 0),
                             });
                         self.java_set_type_id(bx, by, bz, 0);
+                    }
+                }
+            }
+            blocks::SPONGE => {
+                for dx in -2..=2 {
+                    for dy in -2..=2 {
+                        let ny = y + dy;
+                        if !(0..128).contains(&ny) {
+                            continue;
+                        }
+                        for dz in -2..=2 {
+                            let t = self.get_block(x + dx, ny, z + dz);
+                            if t == blocks::WATER || t == blocks::STATIONARY_WATER {
+                                self.java_apply_physics(x + dx, ny, z + dz, t as i32);
+                            }
+                        }
                     }
                 }
             }
@@ -1986,7 +2110,7 @@ impl World {
     }
 
     /// Java `World.a(i, j, k, l, i1, j1)`: are all chunks in the box loaded?
-    fn chunks_area_loaded(&self, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32) -> bool {
+    pub fn chunks_area_loaded(&self, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32) -> bool {
         if y1 < 0 || y0 >= CHUNK_HEIGHT as i32 {
             return false;
         }
@@ -2047,6 +2171,12 @@ impl World {
                 }
             }
             blocks::FIRE => {
+                if y > 0
+                    && self.get_block(x, y - 1, z) == blocks::OBSIDIAN
+                    && self.try_create_portal(x, y, z)
+                {
+                    return;
+                }
                 if !self.is_solid_normal_at(x, y - 1, z) && !self.has_flammable_neighbor(x, y, z) {
                     self.java_set_type_id(x, y, z, 0);
                 } else {

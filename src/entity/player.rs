@@ -41,8 +41,11 @@ pub struct Player {
     pub fire_ticks: i16,
     pub fall_distance: f32,
     pub no_damage_ticks: u8,
+    pub last_damage: i16,
+    pub damage_remainder: i32,
     pub sneaking: bool,
     pub sleeping: bool,
+    pub sleep_ticks: u8,
     pub vehicle_id: Option<i32>,
     pub bed_pos: Option<(i32, i32, i32)>,
     pub spawn_bed: Option<(i32, i32, i32)>,
@@ -97,8 +100,11 @@ impl Player {
             fire_ticks: 0,
             fall_distance: 0.0,
             no_damage_ticks: 0,
+            last_damage: 0,
+            damage_remainder: 0,
             sneaking: false,
             sleeping: false,
+            sleep_ticks: 0,
             vehicle_id: None,
             bed_pos: None,
             spawn_bed: None,
@@ -184,33 +190,57 @@ impl Player {
     }
 
     pub fn take_damage_direct(&mut self, amount: i16) -> (i16, bool) {
-        if self.dead || self.no_damage_ticks > 10 {
+        if self.dead {
             return (0, false);
         }
+        let eff_amount = if self.no_damage_ticks > 10 {
+            if amount <= self.last_damage {
+                return (0, false);
+            }
+            let diff = amount - self.last_damage;
+            self.last_damage = amount;
+            diff
+        } else {
+            self.last_damage = amount;
+            self.no_damage_ticks = 20;
+            amount
+        };
 
-        self.health = (self.health - amount).max(0);
-        self.no_damage_ticks = 20;
+        self.health = (self.health - eff_amount).max(0);
 
         let died = self.health == 0;
         if died {
             self.dead = true;
         }
-        (amount, died)
+        (eff_amount, died)
     }
 
     pub fn take_damage(&mut self, amount: i16) -> (i16, bool) {
-        if self.dead || self.no_damage_ticks > 10 {
+        if self.dead {
             return (0, false);
         }
+        let eff_amount = if self.no_damage_ticks > 10 {
+            if amount <= self.last_damage {
+                return (0, false);
+            }
+            let diff = amount - self.last_damage;
+            self.last_damage = amount;
+            diff
+        } else {
+            self.last_damage = amount;
+            self.no_damage_ticks = 20;
+            amount
+        };
 
-        // Armor defense reduction: factor = 25 - armor_points
+        // Armor defense reduction (`EntityHuman.c(int)` in `EntityHuman.java:498-506`)
         let armor_points = self.inventory.total_armor_points();
         let factor = (25 - armor_points).max(0);
-        let actual_damage = (((amount as i32 * factor) + 12) / 25).max(1) as i16;
+        let k = (eff_amount as i32) * factor + self.damage_remainder;
+        self.inventory.damage_armor(eff_amount);
+        let actual_damage = (k / 25) as i16;
+        self.damage_remainder = k % 25;
 
-        self.inventory.damage_armor(amount);
         self.health = (self.health - actual_damage).max(0);
-        self.no_damage_ticks = 20;
 
         let died = self.health == 0;
         if died {
@@ -241,12 +271,16 @@ impl Player {
         self.fall_distance = 0.0;
         self.fire_ticks = 0;
         self.air_ticks = 300;
+        self.no_damage_ticks = 0;
+        self.last_damage = 0;
+        self.damage_remainder = 0;
         self.mot_x = 0.0;
         self.mot_y = 0.0;
         self.mot_z = 0.0;
         self.velocity_changed = false;
         self.sneaking = false;
         self.sleeping = false;
+        self.sleep_ticks = 0;
         self.vehicle_id = None;
         self.bed_pos = None;
         self.open_container = None;

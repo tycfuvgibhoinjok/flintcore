@@ -190,7 +190,9 @@ pub struct Mob {
     pub pitch: f32,
     pub health: i16,
     pub max_health: i16,
+    pub air_ticks: i16,
     pub no_damage_ticks: u8,
+    pub last_damage: i16,
     pub attack_ticks: i32,
     pub fire_ticks: i32,
     pub fall_distance: f32,
@@ -276,7 +278,9 @@ impl Mob {
             pitch: 0.0,
             health,
             max_health: health,
+            air_ticks: 300,
             no_damage_ticks: 0,
+            last_damage: 0,
             attack_ticks: 0,
             fire_ticks: 0,
             fall_distance: 0.0,
@@ -352,7 +356,11 @@ impl Mob {
 
     pub fn mounted_y_offset(&self) -> f64 {
         let (_, h) = self.size();
-        (h * 0.75) as f64
+        if self.mob_type == MobType::Spider {
+            (h * 0.75) as f64 - 0.5
+        } else {
+            (h * 0.75) as f64
+        }
     }
 
     pub fn fire_proof(&self) -> bool {

@@ -35,6 +35,11 @@ pub enum OpenContainer {
         z: i32,
         slots: [Option<ItemStack>; 9],
     },
+    MinecartChest {
+        window_id: u8,
+        entity_id: i32,
+        slots: [Option<ItemStack>; 27],
+    },
 }
 
 impl OpenContainer {
@@ -43,7 +48,8 @@ impl OpenContainer {
             Self::Workbench { window_id, .. }
             | Self::Chest { window_id, .. }
             | Self::Furnace { window_id, .. }
-            | Self::Dispenser { window_id, .. } => *window_id,
+            | Self::Dispenser { window_id, .. }
+            | Self::MinecartChest { window_id, .. } => *window_id,
         }
     }
 }
@@ -388,6 +394,11 @@ impl InventoryPlayer {
                     window.push(Self::to_slot_item(s));
                 }
             }
+            OpenContainer::MinecartChest { slots, .. } => {
+                for &s in slots {
+                    window.push(Self::to_slot_item(s));
+                }
+            }
         }
         for i in 9..36 {
             window.push(Self::to_slot_item(self.items[i]));
@@ -616,7 +627,7 @@ impl InventoryPlayer {
                                 None
                             };
                         }
-                    } else if cur.count <= cap && button == 0 {
+                    } else if cur.count <= cap {
                         self.set_window_slot(slot, Some(cur));
                         self.cursor = Some(c);
                     }
@@ -760,11 +771,7 @@ impl InventoryPlayer {
                             Some(ItemStack::new(cur.id, cur.count + res.count, cur.damage));
                         Self::consume_craft_grid_3x3(craft_grid, craft_result);
                     } else {
-                        let take = if button == 0 {
-                            res.count
-                        } else {
-                            res.count.div_ceil(2)
-                        };
+                        let take = res.count;
                         if cur.count.saturating_add(take) <= cur.max_stack_size() {
                             self.cursor =
                                 Some(ItemStack::new(cur.id, cur.count + take, cur.damage));
@@ -840,7 +847,7 @@ impl InventoryPlayer {
                             None
                         };
                     }
-                } else if cur.count <= cap && button == 0 {
+                } else if cur.count <= cap {
                     self.set_open_container_slot(container, slot, Some(cur));
                     self.cursor = Some(c);
                 }
@@ -857,6 +864,7 @@ impl InventoryPlayer {
             OpenContainer::Chest { slots, .. } => slots.len() as i16,
             OpenContainer::Furnace { .. } => 3,
             OpenContainer::Dispenser { .. } => 9,
+            OpenContainer::MinecartChest { .. } => 27,
         }
     }
 
@@ -886,6 +894,7 @@ impl InventoryPlayer {
                 OpenContainer::Chest { slots, .. } => slots[slot as usize],
                 OpenContainer::Furnace { slots, .. } => slots[slot as usize],
                 OpenContainer::Dispenser { slots, .. } => slots[slot as usize],
+                OpenContainer::MinecartChest { slots, .. } => slots[slot as usize],
             }
         } else {
             let rel = slot - header;
@@ -927,6 +936,9 @@ impl InventoryPlayer {
                     slots[slot as usize] = item;
                 }
                 OpenContainer::Dispenser { slots, .. } => {
+                    slots[slot as usize] = item;
+                }
+                OpenContainer::MinecartChest { slots, .. } => {
                     slots[slot as usize] = item;
                 }
             }
@@ -1054,7 +1066,9 @@ impl InventoryPlayer {
                     self.merge_into_open_container_slots(container, &mut moving, 10, 46, false);
                 }
             }
-            OpenContainer::Chest { .. } | OpenContainer::Dispenser { .. } => {
+            OpenContainer::Chest { .. }
+            | OpenContainer::Dispenser { .. }
+            | OpenContainer::MinecartChest { .. } => {
                 if slot < header {
                     self.merge_into_open_container_slots(
                         container,

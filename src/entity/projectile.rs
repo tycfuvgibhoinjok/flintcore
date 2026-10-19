@@ -129,6 +129,106 @@ impl Painting {
     pub fn chunk_pos(&self) -> ChunkPos {
         ChunkPos::new(self.x >> 4, self.z >> 4)
     }
+
+    pub fn art_pixel_size(title: &str) -> (i32, i32) {
+        match title {
+            "Kebab" | "Aztec" | "Alban" | "Aztec2" | "Bomb" | "Plant" | "Wasteland" => (16, 16),
+            "Pool" | "Courbet" | "Sea" | "Sunset" | "Creebet" => (32, 16),
+            "Wanderer" | "Graham" => (16, 32),
+            "Match" | "Bust" | "Stage" | "Void" | "SkullAndRoses" => (32, 32),
+            "Fighters" => (64, 32),
+            "Pointer" | "Pigscene" | "BurningSkull" => (64, 64),
+            "Skeleton" | "DonkeyKong" => (64, 48),
+            _ => (16, 16),
+        }
+    }
+
+    fn center_offset(px: i32) -> f32 {
+        if px == 32 || px == 64 {
+            0.5
+        } else {
+            0.0
+        }
+    }
+
+    /// Compute `(min_x, min_y, min_z, max_x, max_y, max_z)` AABB and list of backing wall block coordinates
+    /// (`EntityPainting.b` and `EntityPainting.h` in `EntityPainting.java:57-196`).
+    #[allow(clippy::type_complexity)]
+    pub fn bounds_and_wall_blocks(
+        x: i32,
+        y: i32,
+        z: i32,
+        direction: i32,
+        title: &str,
+    ) -> ((f64, f64, f64, f64, f64, f64), Vec<(i32, i32, i32)>) {
+        let (b_px, c_px) = Self::art_pixel_size(title);
+        let mut f = b_px as f32;
+        let f1 = (c_px as f32) / 32.0;
+        let mut f2 = b_px as f32;
+        if direction != 0 && direction != 2 {
+            f = 0.5;
+        } else {
+            f2 = 0.5;
+        }
+        f /= 32.0;
+        f2 /= 32.0;
+
+        let mut f3 = x as f32 + 0.5;
+        let mut f4 = y as f32 + 0.5;
+        let mut f5 = z as f32 + 0.5;
+        let f6 = 0.5625f32;
+        match direction {
+            0 => {
+                f5 -= f6;
+                f3 -= Self::center_offset(b_px);
+            }
+            1 => {
+                f3 -= f6;
+                f5 += Self::center_offset(b_px);
+            }
+            2 => {
+                f5 += f6;
+                f3 += Self::center_offset(b_px);
+            }
+            _ => {
+                f3 += f6;
+                f5 -= Self::center_offset(b_px);
+            }
+        }
+        f4 += Self::center_offset(c_px);
+        let f7 = -0.00625f32;
+        let aabb = (
+            (f3 - f - f7) as f64,
+            (f4 - f1 - f7) as f64,
+            (f5 - f2 - f7) as f64,
+            (f3 + f + f7) as f64,
+            (f4 + f1 + f7) as f64,
+            (f5 + f2 + f7) as f64,
+        );
+
+        let w_blocks = b_px / 16;
+        let h_blocks = c_px / 16;
+        let mut k = x;
+        let mut i1 = z;
+        if direction == 0 || direction == 2 {
+            k = ((f3 as f64) - (b_px as f64 / 32.0)).floor() as i32;
+        } else {
+            i1 = ((f5 as f64) - (b_px as f64 / 32.0)).floor() as i32;
+        }
+        let l = ((f4 as f64) - (c_px as f64 / 32.0)).floor() as i32;
+
+        let mut wall = Vec::with_capacity((w_blocks * h_blocks) as usize);
+        for k1 in 0..w_blocks {
+            for j1 in 0..h_blocks {
+                if direction != 0 && direction != 2 {
+                    wall.push((x, l + j1, i1 + k1));
+                } else {
+                    wall.push((k + k1, l + j1, z));
+                }
+            }
+        }
+        (aabb, wall)
+    }
 }
 
 pub const PAINTING_TITLES: &[&str] = &[

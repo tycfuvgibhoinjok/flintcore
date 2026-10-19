@@ -10,7 +10,7 @@ use crate::entity::mob::{
     chunk_light_at, evaluate_natural_spawns, find_path, world_sky_subtracted, MobType,
 };
 use crate::entity::player::DiggingState;
-use crate::entity::projectile::{ProjectileKind, PAINTING_TITLES};
+use crate::entity::projectile::{Painting, ProjectileKind, PAINTING_TITLES};
 use crate::entity::store::EntityStore;
 use crate::entity::tracker::EntityTracker;
 use crate::gameplay::blocks;
@@ -21,11 +21,11 @@ use crate::gameplay::tile::{TileEntity, TileEntityKind};
 use crate::net::connection::ConnectionState;
 use crate::net::packets::chat::{is_allowed_char, wrap_text};
 use crate::net::packets::{
-    ArmAnimation, AttachEntity, Bed, BlockChange, Chat, Clientbound, Collect, CraftProgressBar,
-    EntityMetadata, EntityStatus, EntityVelocity, Explosion, Handshake, KeepAlive, KickDisconnect,
-    LevelSound, Login, MultiBlockChange, OpenWindow, PlayNoteBlock, PlayerLookMove, PreChunk,
-    Respawn, Serverbound, SetSlot, Sleep, SpawnPosition, Transaction, UpdateHealth, UpdateSign,
-    UpdateTime, WindowItems,
+    ArmAnimation, AttachEntity, Bed, BlockChange, Chat, Clientbound, CloseWindow, Collect,
+    CraftProgressBar, EntityMetadata, EntityStatus, EntityVelocity, Explosion, Handshake,
+    KeepAlive, KickDisconnect, LevelSound, Login, MapData, MultiBlockChange, OpenWindow,
+    PlayNoteBlock, PlayerLookMove, PreChunk, Respawn, Serverbound, SetSlot, Sleep, SpawnPosition,
+    Transaction, UpdateHealth, UpdateSign, UpdateTime, Weather, WindowItems,
 };
 use crate::net::protocol::PROTOCOL_VERSION;
 use crate::net::{ConnId, NetEvent, Outbound};
@@ -235,9 +235,19 @@ impl Server {
             }
         }
 
+        // Weather cycle (`World.i()` + `WorldServer.java:182-195` Packet70Bed rain toggle)
+        if self.world.live_is_active() {
+            if let Some(new_raining) = self.world.tick_weather() {
+                self.broadcast(Clientbound::Bed(Bed {
+                    reason: if new_raining { 1 } else { 2 },
+                }));
+            }
+        }
+
         // Tick furnaces and sync open furnace windows
         self.world.tick_furnaces();
         self.sync_open_containers();
+        self.tick_held_maps(ticks);
 
         // Random block ticks (grass, crops, saplings, reeds, leaves, ice/snow) when players online
         let player_xz: Vec<(f64, f64)> = self
@@ -264,12 +274,15 @@ impl Server {
         }
         self.tick_mob_spawners();
 
-        // Tick boats, mobs, projectiles, primed TNTs, minecarts, and dropped items
+        // Tick boats, mobs, projectiles, primed TNTs, minecarts, paintings, and dropped items
         self.tick_boats();
         self.tick_mobs();
         self.tick_projectiles();
         self.tick_primed_tnts();
         self.tick_minecarts();
+        if ticks % 100 == 0 {
+            self.tick_paintings();
+        }
         self.tick_dropped_items();
         self.process_world_events();
         self.world.flush_pending_piston_syncs();
@@ -618,6 +631,7 @@ impl Server {
         }
 
         let mut resync_teleport = None;
+        let mut stepped_block = None;
         let (fall_damage, entity_id, old_chunk, new_chunk) = {
             if let Some(player) = self.entities.get_by_conn_mut(id) {
                 if player.dead {
@@ -637,8 +651,22 @@ impl Server {
                 }
                 let (yaw, pitch) = rot.unwrap_or((player.yaw, player.pitch));
 
-                if x.is_nan() || y.is_nan() || z.is_nan() || stance.is_nan() {
+                if x.is_nan()
+                    || y.is_nan()
+                    || z.is_nan()
+                    || stance.is_nan()
+                    || x.is_infinite()
+                    || y.is_infinite()
+                    || z.is_infinite()
+                    || stance.is_infinite()
+                    || yaw.is_infinite()
+                    || pitch.is_infinite()
+                {
                     self.kick(id, "Nope!");
+                    return;
+                }
+                if x.abs() > 3.2e7 || z.abs() > 3.2e7 {
+                    self.kick(id, "Illegal position");
                     return;
                 }
 
@@ -654,6 +682,16 @@ impl Server {
                 }
 
                 if resync_teleport.is_none() {
+                    let bx = x.floor() as i32;
+                    let by = y.floor() as i32;
+                    let bz = z.floor() as i32;
+                    let at_block = self.world.get_block(bx, by, bz);
+                    if blocks::is_water(at_block)
+                        || at_block == blocks::WEB
+                        || at_block == blocks::LADDER
+                    {
+                        player.fall_distance = 0.0;
+                    }
                     if player.vehicle_id.is_none() {
                         if !on_ground {
                             if y < prev_y {
@@ -664,6 +702,15 @@ impl Server {
                                 fall_damage = ((player.fall_distance - 3.0).ceil() as i16).max(0);
                             }
                             player.fall_distance = 0.0;
+                        }
+                        if on_ground
+                            && !player.sneaking
+                            && pos.is_some()
+                            && ((x - player.x).abs() > 0.01
+                                || (z - player.z).abs() > 0.01
+                                || fall_damage > 0)
+                        {
+                            stepped_block = Some((bx, (y - 0.2).floor() as i32, bz));
                         }
                     } else {
                         player.fall_distance = 0.0;
@@ -693,6 +740,18 @@ impl Server {
                 }),
             );
             return;
+        }
+
+        if let Some((sbx, sby, sbz)) = stepped_block {
+            if (0..128).contains(&sby) {
+                let bid = self.world.get_block(sbx, sby, sbz);
+                if bid == blocks::FARMLAND {
+                    self.world.trample_farmland(sbx, sby, sbz);
+                } else if bid == blocks::REDSTONE_ORE {
+                    self.world
+                        .java_set_type_id(sbx, sby, sbz, blocks::LIT_REDSTONE_ORE);
+                }
+            }
         }
 
         self.entities
@@ -956,12 +1015,24 @@ impl Server {
             return;
         }
 
+        let crit_bonus = self
+            .entities
+            .get_by_conn(id)
+            .is_some_and(|p| p.mot_y < 0.0 || (!p.on_ground && p.fall_distance > 0.0));
+
         // Check if target is a Mob (`EntityLiving` / `EntityAnimal` / `EntityMonster`)
         if self.entities.get_mob(target_id).is_some() {
-            if !use_entity.attack {
+            if !use_entity.attack
+                || (held_item.is_some_and(|s| s.id == items::SADDLE)
+                    && self
+                        .entities
+                        .get_mob(target_id)
+                        .is_some_and(|m| m.mob_type == MobType::Pig && !m.pig_saddled))
+            {
                 self.handle_interact_mob(id, attacker_id, &attacker_name, target_id);
             } else {
-                let raw_damage = held_item.map(|s| s.attack_damage()).unwrap_or(1);
+                let raw_damage =
+                    held_item.map(|s| s.attack_damage()).unwrap_or(1) + i16::from(crit_bonus);
                 self.damage_mob_from_player(
                     id,
                     attacker_id,
@@ -1035,6 +1106,8 @@ impl Server {
         }
 
         if use_entity.attack {
+            let mut woke_target = false;
+            let armor_sync;
             let (target_conn_id, target_name, target_health, died, mot_x, mot_y, mot_z, drops) = {
                 if let Some(target) = self.entities.get_player_mut(target_id) {
                     if target.dead {
@@ -1046,11 +1119,27 @@ impl Server {
                         return;
                     }
 
-                    let raw_damage = held_item.map(|s| s.attack_damage()).unwrap_or(1);
+                    let raw_damage =
+                        held_item.map(|s| s.attack_damage()).unwrap_or(1) + i16::from(crit_bonus);
                     let (dealt, died) = target.take_damage(raw_damage);
-                    if dealt <= 0 {
+                    if dealt <= 0 && raw_damage > 0 {
                         return;
                     }
+                    if target.sleeping {
+                        target.sleeping = false;
+                        target.sleep_ticks = 0;
+                        target.bed_pos = None;
+                        woke_target = true;
+                    }
+                    armor_sync = Some((
+                        target.conn_id,
+                        [
+                            InventoryPlayer::to_slot_item(target.inventory.armor[3]),
+                            InventoryPlayer::to_slot_item(target.inventory.armor[2]),
+                            InventoryPlayer::to_slot_item(target.inventory.armor[1]),
+                            InventoryPlayer::to_slot_item(target.inventory.armor[0]),
+                        ],
+                    ));
 
                     target.apply_knockback(attacker_x, attacker_z);
                     let mot_x = (target.mot_x.clamp(-3.9, 3.9) * 8000.0) as i16;
@@ -1060,12 +1149,20 @@ impl Server {
                         let tx = target.x;
                         let ty = target.y;
                         let tz = target.z;
-                        target
+                        let mut list: Vec<(f64, f64, f64, ItemStack)> = target
                             .inventory
                             .drop_all_on_death()
                             .into_iter()
                             .map(|it| (tx, ty, tz, it))
-                            .collect()
+                            .collect();
+                        if let Some(OpenContainer::Workbench { craft_grid, .. }) =
+                            target.open_container.take()
+                        {
+                            for it in craft_grid.into_iter().flatten() {
+                                list.push((tx, ty, tz, it));
+                            }
+                        }
+                        list
                     } else {
                         Vec::new()
                     };
@@ -1084,6 +1181,35 @@ impl Server {
                     return;
                 }
             };
+
+            if woke_target {
+                self.broadcast(Clientbound::ArmAnimation(ArmAnimation {
+                    entity_id: target_id,
+                    animate: 3,
+                }));
+            }
+            if let Some((cid, slots)) = armor_sync {
+                for (i, item) in slots.into_iter().enumerate() {
+                    self.send(
+                        cid,
+                        Clientbound::SetSlot(SetSlot {
+                            window_id: 0,
+                            slot: 5 + i as i16,
+                            item,
+                        }),
+                    );
+                }
+            }
+            // Alert tamed wolves owned by target (`EntityHuman.java:455-495`)
+            for w in self.entities.iter_mobs_mut() {
+                if w.mob_type == MobType::Wolf
+                    && w.wolf_tamed
+                    && w.wolf_owner.eq_ignore_ascii_case(&target_name)
+                {
+                    w.wolf_sitting = false;
+                    w.target_id = Some(attacker_id);
+                }
+            }
 
             let vel = Clientbound::EntityVelocity(EntityVelocity {
                 entity_id: target_id,
@@ -2074,21 +2200,53 @@ impl Server {
                 true
             }
             blocks::BED => {
+                let meta = self.world.get_data(x, y, z);
+                let (hx, hz) = if (meta & 8) == 0 {
+                    let dir = (meta & 3) as usize;
+                    let (dx, dz) = [(0, 1), (-1, 0), (0, -1), (1, 0)][dir];
+                    if self.world.get_block(x + dx, y, z + dz) != blocks::BED {
+                        return true;
+                    }
+                    (x + dx, z + dz)
+                } else {
+                    (x, z)
+                };
+                let occupied = self
+                    .entities
+                    .iter_players()
+                    .any(|p| !p.dead && p.sleeping && p.bed_pos == Some((hx, y, hz)));
+                if occupied {
+                    self.send(
+                        id,
+                        Clientbound::Chat(Chat {
+                            message: "This bed is occupied".to_string(),
+                        }),
+                    );
+                    return true;
+                }
+
                 let mut sleep_pkt = None;
                 let mut only_at_night = false;
                 let time_of_day = self.world.world_time().rem_euclid(24000);
-                let is_night = (12541..=23458).contains(&time_of_day);
+                let is_night = (12541..=23458).contains(&time_of_day) || self.world.is_thundering();
                 if let Some(player) = self.entities.get_by_conn_mut(id) {
-                    player.spawn_bed = Some((x, y, z));
+                    if (player.x - hx as f64).abs() > 3.5
+                        || (player.y - y as f64).abs() > 2.5
+                        || (player.z - hz as f64).abs() > 3.5
+                    {
+                        return true;
+                    }
+                    player.spawn_bed = Some((hx, y, hz));
                     if is_night {
                         player.sleeping = true;
-                        player.bed_pos = Some((x, y, z));
+                        player.sleep_ticks = 0;
+                        player.bed_pos = Some((hx, y, hz));
                         sleep_pkt = Some(Sleep {
                             entity_id: player.entity_id,
                             in_bed_code: 0,
-                            bed_x: x,
+                            bed_x: hx,
                             bed_y: y as u8,
-                            bed_z: z,
+                            bed_z: hz,
                         });
                     } else {
                         only_at_night = true;
@@ -2327,11 +2485,27 @@ impl Server {
                     && self.world.can_place_block_at(door_id, tx, ty, tz, face)
                     && self.world.can_place_block_at(door_id, tx, ty + 1, tz, face)
                 {
-                    let dir = (((yaw + 180.0) * 4.0 / 360.0 - 0.5).floor() as i32 & 3) as u8;
+                    let dir = (((yaw + 180.0) * 4.0 / 360.0 - 0.5).floor() as i32 & 3) as usize;
+                    let (dx, dz) = [(0, -1), (1, 0), (0, 1), (-1, 0)][dir];
+                    let left_solid = i32::from(self.world.is_solid_normal_at(tx - dx, ty, tz - dz))
+                        + i32::from(self.world.is_solid_normal_at(tx - dx, ty + 1, tz - dz));
+                    let right_solid =
+                        i32::from(self.world.is_solid_normal_at(tx + dx, ty, tz + dz))
+                            + i32::from(self.world.is_solid_normal_at(tx + dx, ty + 1, tz + dz));
+                    let left_door = self.world.get_block(tx - dx, ty, tz - dz) == door_id
+                        || self.world.get_block(tx - dx, ty + 1, tz - dz) == door_id;
+                    let right_door = self.world.get_block(tx + dx, ty, tz + dz) == door_id
+                        || self.world.get_block(tx + dx, ty + 1, tz + dz) == door_id;
+                    let flip = (left_door && !right_door) || (right_solid > left_solid);
+                    let meta = if flip {
+                        (((dir as i32 - 1) & 3) + 4) as u8
+                    } else {
+                        dir as u8
+                    };
                     self.world
-                        .java_set_type_id_and_data(tx, ty, tz, door_id, dir);
+                        .java_set_type_id_and_data(tx, ty, tz, door_id, meta);
                     self.world
-                        .java_set_type_id_and_data(tx, ty + 1, tz, door_id, dir + 8);
+                        .java_set_type_id_and_data(tx, ty + 1, tz, door_id, meta + 8);
                     self.send_block_change_to_observers(tx, ty, tz);
                     self.send_block_change_to_observers(tx, ty + 1, tz);
                     consumed = true;
@@ -2402,16 +2576,24 @@ impl Server {
             items::PAINTING => {
                 if (2..=5).contains(&face) && blocks::material(clicked_block).is_buildable() {
                     let dir = match face {
+                        2 => 0,
                         4 => 1,
-                        2 => 2,
-                        5 => 3,
-                        _ => 0,
+                        3 => 2,
+                        _ => 3,
                     };
-                    let title_idx = (self.current_tick as usize + (cx.unsigned_abs() as usize))
-                        % PAINTING_TITLES.len();
-                    let title = PAINTING_TITLES[title_idx].to_string();
-                    self.spawn_painting_at(title, cx, cy, cz, dir);
-                    consumed = true;
+                    let mut valid_titles = Vec::new();
+                    for &title in PAINTING_TITLES {
+                        if self.painting_can_survive(cx, cy, cz, dir, title, None) {
+                            valid_titles.push(title);
+                        }
+                    }
+                    if !valid_titles.is_empty() {
+                        let idx = (self.current_tick as usize + (cx.unsigned_abs() as usize))
+                            % valid_titles.len();
+                        let title = valid_titles[idx].to_string();
+                        self.spawn_painting_at(title, cx, cy, cz, dir);
+                        consumed = true;
+                    }
                 }
             }
             // Empty bucket (325 -> collect stationary/source water or lava)
@@ -2590,6 +2772,18 @@ impl Server {
                     }),
                 );
             }
+        } else if stack.is_food()
+            || matches!(
+                stack.id,
+                items::BOW
+                    | items::SNOW_BALL
+                    | items::EGG
+                    | items::FISHING_ROD
+                    | items::MILK_BUCKET
+            )
+        {
+            // ItemInWorldManager.java:241-243 — if block.interact and placeItem both returned false, fall through to useItem
+            self.use_item_right_click_air(id, stack.id);
         }
     }
 
@@ -2747,7 +2941,7 @@ impl Server {
                 None
             });
         } else if stack.id == items::FISHING_ROD {
-            // ItemFishingRod.java: cast or reel in FishingHook
+            // ItemFishingRod.java & EntityFish.java:337-410 — cast or reel in FishingHook
             let shooter_id = self
                 .entities
                 .get_by_conn(id)
@@ -2759,8 +2953,18 @@ impl Server {
                 .find(|pr| {
                     pr.kind == ProjectileKind::FishingHook && pr.shooter_id == Some(shooter_id)
                 })
-                .map(|pr| (pr.entity_id, pr.x, pr.y, pr.z, pr.in_water_or_catching()));
-            if let Some((hook_id, hx, hy, hz, catching)) = existing_hook {
+                .map(|pr| {
+                    (
+                        pr.entity_id,
+                        pr.x,
+                        pr.y,
+                        pr.z,
+                        pr.in_water_or_catching(),
+                        pr.in_ground,
+                        pr.hooked_entity,
+                    )
+                });
+            if let Some((hook_id, hx, hy, hz, catching, in_ground, hooked_entity)) = existing_hook {
                 if self.entities.remove_projectile(hook_id).is_some() {
                     for out in self.tracker.untrack_projectile(hook_id) {
                         if let Some(t) = self.entities.get_player(out.recipient_id) {
@@ -2768,7 +2972,37 @@ impl Server {
                         }
                     }
                 }
-                if catching {
+                let mut rod_damage = 0i16;
+                if let Some(target_eid) = hooked_entity {
+                    let dx = px - hx;
+                    let dy = py - hy;
+                    let dz = pz - hz;
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.1);
+                    let vx = dx * 0.1;
+                    let vy = dy * 0.1 + dist.sqrt() * 0.08;
+                    let vz = dz * 0.1;
+                    if let Some(m) = self.entities.get_mob_mut(target_eid) {
+                        m.mot_x += vx;
+                        m.mot_y += vy;
+                        m.mot_z += vz;
+                        m.velocity_changed = true;
+                    } else if let Some(tp) = self.entities.get_player_mut(target_eid) {
+                        tp.mot_x += vx;
+                        tp.mot_y += vy;
+                        tp.mot_z += vz;
+                        tp.velocity_changed = true;
+                        let tconn = tp.conn_id;
+                        let vel = Clientbound::EntityVelocity(EntityVelocity {
+                            entity_id: target_eid,
+                            mot_x: (tp.mot_x.clamp(-3.9, 3.9) * 8000.0) as i16,
+                            mot_y: (tp.mot_y.clamp(-3.9, 3.9) * 8000.0) as i16,
+                            mot_z: (tp.mot_z.clamp(-3.9, 3.9) * 8000.0) as i16,
+                        });
+                        self.send(tconn, vel.clone());
+                        self.broadcast(vel);
+                    }
+                    rod_damage = 3;
+                } else if catching {
                     let dx = px - hx;
                     let dy = py - hy;
                     let dz = pz - hz;
@@ -2791,10 +3025,15 @@ impl Server {
                             }
                         }
                     }
+                    rod_damage = 1;
+                } else if in_ground {
+                    rod_damage = 2;
                 }
-                let mut damaged = stack;
-                let broken = damaged.damage_item(1);
-                new_stack = Some(if broken { None } else { Some(damaged) });
+                if rod_damage > 0 {
+                    let mut damaged = stack;
+                    let broken = damaged.damage_item(rod_damage);
+                    new_stack = Some(if broken { None } else { Some(damaged) });
+                }
             } else {
                 self.launch_player_projectile(
                     shooter_id,
@@ -3183,16 +3422,16 @@ impl Server {
         }
     }
 
-    /// Java `Entity.m_()` / `EntityLiving.m_()` — fire and lava contact + burn tick damage for players.
+    /// Java `Entity.m_()` / `EntityLiving.m_()` — environmental damage (void, suffocation, drowning, cactus, fire, lava) for players.
     fn tick_player_environmental_damage(&mut self) {
         let player_ids: Vec<i32> = self.entities.iter_players().map(|p| p.entity_id).collect();
         let mut damages: Vec<(i32, i16, &'static str)> = Vec::new();
 
         for pid in player_ids {
-            let Some((px, py, pz, dead, cur_fire)) = self
+            let Some((px, py, pz, dead, sleeping, cur_fire)) = self
                 .entities
                 .get_player(pid)
-                .map(|p| (p.x, p.y, p.z, p.dead, p.fire_ticks))
+                .map(|p| (p.x, p.y, p.z, p.dead, p.sleeping, p.fire_ticks))
             else {
                 continue;
             };
@@ -3200,33 +3439,87 @@ impl Server {
                 continue;
             }
 
-            let min_x = (px - 0.3).floor() as i32;
-            let max_x = (px + 0.3).floor() as i32;
+            // 1. Void damage (`Entity.java:292-294`, `EntityLiving.java:861-872`)
+            if py < -64.0 {
+                damages.push((pid, 4, "fell out of the world"));
+            }
+
+            // 2. Head-level checks: in-wall suffocation (`EntityLiving.java:121-130`) & drowning (`EntityLiving.java:138-166`)
+            let head_x = px.floor() as i32;
+            let head_y = (py + 1.62).floor() as i32;
+            let head_z = pz.floor() as i32;
+            if (0..128).contains(&head_y) {
+                let head_block = self.world.get_block(head_x, head_y, head_z);
+                if !sleeping && blocks::is_opaque_cube(head_block) {
+                    damages.push((pid, 1, "suffocated in a wall"));
+                }
+                if blocks::is_water(head_block) {
+                    let drowned = if let Some(p) = self.entities.get_player_mut(pid) {
+                        p.air_ticks -= 1;
+                        if p.air_ticks <= -20 {
+                            p.air_ticks = 0;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if drowned {
+                        damages.push((pid, 2, "drowned"));
+                    }
+                } else if let Some(p) = self.entities.get_player_mut(pid) {
+                    p.air_ticks = 300;
+                }
+            }
+
+            let min_x = (px - 0.36).floor() as i32;
+            let max_x = (px + 0.36).floor() as i32;
             let min_y = py.floor() as i32;
             let max_y = (py + 1.79).floor() as i32;
-            let min_z = (pz - 0.3).floor() as i32;
-            let max_z = (pz + 0.3).floor() as i32;
+            let min_z = (pz - 0.36).floor() as i32;
+            let max_z = (pz + 0.36).floor() as i32;
 
             let mut in_water = false;
             let mut in_lava = false;
             let mut in_fire = false;
+            let mut in_cactus = false;
 
             for bx in min_x..=max_x {
                 for by in min_y..=max_y {
                     for bz in min_z..=max_z {
                         let bid = self.world.get_block(bx, by, bz);
-                        if blocks::is_water(bid) {
-                            in_water = true;
-                        } else if blocks::is_lava(bid) {
-                            in_lava = true;
-                        } else if bid == blocks::FIRE {
-                            in_fire = true;
+                        if bid == blocks::CACTUS {
+                            in_cactus = true;
+                        }
+                        if (px - 0.3).floor() as i32 <= bx
+                            && bx <= (px + 0.3).floor() as i32
+                            && (pz - 0.3).floor() as i32 <= bz
+                            && bz <= (pz + 0.3).floor() as i32
+                        {
+                            if blocks::is_water(bid) {
+                                in_water = true;
+                            } else if blocks::is_lava(bid) {
+                                in_lava = true;
+                            } else if bid == blocks::FIRE {
+                                in_fire = true;
+                            }
                         }
                     }
                 }
             }
 
-            if in_water {
+            if in_cactus {
+                damages.push((pid, 1, "was pricked to death"));
+            }
+
+            let in_rain = self.world.is_being_rained_on(
+                px.floor() as i32,
+                py.floor() as i32,
+                pz.floor() as i32,
+            );
+
+            if in_water || in_rain {
                 if let Some(p) = self.entities.get_player_mut(pid) {
                     p.fire_ticks = 0;
                 }
@@ -3666,12 +3959,31 @@ impl Server {
         let mut wolf_pack_alert = None;
         let mut pigzombie_alert = None;
 
+        let attacker_is_player = attacker.is_some_and(|(aid, _, _)| {
+            self.entities.get_player(aid).is_some() || killed_by_skeleton_arrow
+        });
+
         if let Some(mob) = self.entities.get_mob_mut(mob_id) {
-            if mob.dead || mob.no_damage_ticks > 10 || damage <= 0 {
+            if mob.dead || damage < 0 || (damage == 0 && attacker.is_none()) {
                 return false;
             }
-            mob.health -= damage;
-            mob.no_damage_ticks = 20;
+            let mut adj_dmg = damage;
+            if mob.mob_type == MobType::Wolf && attacker.is_some() && !attacker_is_player {
+                adj_dmg = (adj_dmg + 1) / 2;
+            }
+            let eff_dmg = if mob.no_damage_ticks > 10 {
+                if adj_dmg <= mob.last_damage {
+                    return false;
+                }
+                let diff = adj_dmg - mob.last_damage;
+                mob.last_damage = adj_dmg;
+                diff
+            } else {
+                mob.last_damage = adj_dmg;
+                mob.no_damage_ticks = 20;
+                adj_dmg
+            };
+            mob.health -= eff_dmg;
 
             if let Some((att_id, ax, az)) = attacker {
                 let dx = ax - mob.x;
@@ -4124,8 +4436,20 @@ impl Server {
                 }
             }
 
+            let has_los = target_pos.is_some_and(|(_, _, tx, ty, tz)| {
+                self.world
+                    .ray_trace((mx, my + 1.0, mz), (tx, ty + 1.0, tz), false)
+                    .is_none()
+            });
+            let in_rain = self.world.is_being_rained_on(
+                mx.floor() as i32,
+                my.floor() as i32,
+                mz.floor() as i32,
+            );
+
             // Now update the mob state and physics
             let mut rider_sync = None;
+            let mut stepped_soil = None;
             if let Some(mob) = self.entities.get_mob_mut(mob_id) {
                 mob.target_id = target_pos.map(|(tid, ..)| tid);
                 if let Some((tx, ty, tz)) = teleport_to_owner {
@@ -4151,7 +4475,7 @@ impl Server {
                     mob.pigzombie_anger -= 1;
                 }
                 if mob.fire_ticks > 0 {
-                    if mob.fire_proof() || mob.in_water {
+                    if mob.fire_proof() || mob.in_water || in_rain {
                         mob.fire_ticks = 0;
                     } else {
                         if mob.fire_ticks % 20 == 0 {
@@ -4159,6 +4483,10 @@ impl Server {
                         }
                         mob.fire_ticks -= 1;
                     }
+                }
+
+                if mob.y < -64.0 {
+                    burned_mobs.push(mob_id);
                 }
 
                 let bx = mob.x.floor() as i32;
@@ -4174,6 +4502,27 @@ impl Server {
                         burned_mobs.push(mob_id);
                     }
                     mob.fire_ticks = mob.fire_ticks.max(160);
+                } else if cur_block == blocks::CACTUS {
+                    burned_mobs.push(mob_id);
+                }
+
+                let head_y = (mob.y + mob.eye_height()).floor() as i32;
+                if (0..128).contains(&head_y) {
+                    let head_block = self.world.get_block(bx, head_y, bz);
+                    if blocks::is_opaque_cube(head_block) {
+                        burned_mobs.push(mob_id);
+                    }
+                    if mob.mob_type != MobType::Squid {
+                        if blocks::is_water(head_block) {
+                            mob.air_ticks -= 1;
+                            if mob.air_ticks <= -20 {
+                                mob.air_ticks = 0;
+                                burned_mobs.push(mob_id);
+                            }
+                        } else {
+                            mob.air_ticks = 300;
+                        }
+                    }
                 }
 
                 // Chicken egg timer (`EntityChicken.v()`)
@@ -4187,7 +4536,7 @@ impl Server {
 
                 // Wolf water shaking (`EntityWolf.v()`, `m_()`)
                 if mob.mob_type == MobType::Wolf {
-                    if mob.in_water {
+                    if mob.in_water || in_rain {
                         mob.wolf_wet = true;
                         mob.wolf_shaking = false;
                         mob.wolf_shake_time = 0.0;
@@ -4303,7 +4652,7 @@ impl Server {
                             let tdx = tx - mob.x;
                             let tdy = (ty + 1.0) - (mob.y + 2.0);
                             let tdz = tz - mob.z;
-                            if tdx * tdx + tdy * tdy + tdz * tdz < 64.0 * 64.0 {
+                            if tdx * tdx + tdy * tdy + tdz * tdz < 64.0 * 64.0 && has_los {
                                 mob.yaw = (-tdx.atan2(tdz) * 180.0 / std::f64::consts::PI) as f32;
                                 mob.ghast_charge += 1;
                                 if mob.ghast_charge == 20 {
@@ -4373,7 +4722,9 @@ impl Server {
 
                             match mob.mob_type {
                                 MobType::Creeper => {
-                                    if (mob.creeper_state > 0 && dist < 7.0) || dist < 3.0 {
+                                    if has_los
+                                        && ((mob.creeper_state > 0 && dist < 7.0) || dist < 3.0)
+                                    {
                                         mob.creeper_state = 1;
                                         mob.creeper_fuse += 1;
                                         move_forward = false;
@@ -4392,7 +4743,7 @@ impl Server {
                                     }
                                 }
                                 MobType::Skeleton => {
-                                    if dist < 10.0 {
+                                    if dist < 10.0 && has_los {
                                         if mob.attack_ticks == 0 {
                                             arrows_to_shoot.push((
                                                 mob_id,
@@ -4486,6 +4837,14 @@ impl Server {
                     }
                 }
 
+                // Cobweb slowdown (`BlockWeb.java:11-13`, `Entity.java:436-441`)
+                if cur_block == blocks::WEB {
+                    mob.mot_x *= 0.25;
+                    mob.mot_y *= 0.05;
+                    mob.mot_z *= 0.25;
+                    mob.fall_distance = 0.0;
+                }
+
                 let next_x = mob.x + mob.mot_x;
                 let next_y = mob.y + mob.mot_y;
                 let next_z = mob.z + mob.mot_z;
@@ -4545,15 +4904,40 @@ impl Server {
                 }
 
                 let below_y = next_y.floor() as i32;
-                let below_id =
+                let below_id = if (0..128).contains(&below_y) {
                     self.world
-                        .get_block(mob.x.floor() as i32, below_y, mob.z.floor() as i32);
+                        .get_block(mob.x.floor() as i32, below_y, mob.z.floor() as i32)
+                } else {
+                    blocks::AIR
+                };
                 if mob.mot_y < 0.0 && blocks::is_solid(below_id) {
                     mob.y = (below_y + 1) as f64;
                     mob.mot_y = 0.0;
                     mob.on_ground = true;
+                    if !matches!(
+                        mob.mob_type,
+                        MobType::Chicken | MobType::Ghast | MobType::Squid
+                    ) && mob.fall_distance > 3.0
+                    {
+                        let fdmg = ((mob.fall_distance - 3.0).ceil() as i32).max(0);
+                        for _ in 0..fdmg {
+                            burned_mobs.push(mob_id);
+                        }
+                    }
+                    mob.fall_distance = 0.0;
+                    if below_id == blocks::FARMLAND {
+                        stepped_soil = Some((mob.x.floor() as i32, below_y, mob.z.floor() as i32));
+                    } else if below_id == blocks::SOUL_SAND {
+                        mob.mot_x *= 0.4;
+                        mob.mot_z *= 0.4;
+                    }
                 } else {
-                    mob.y = next_y.clamp(1.0, 126.0);
+                    if mob.in_water {
+                        mob.fall_distance = 0.0;
+                    } else if mob.mot_y < 0.0 {
+                        mob.fall_distance += (-mob.mot_y) as f32;
+                    }
+                    mob.y = next_y.min(126.0);
                     mob.on_ground = false;
                 }
 
@@ -4575,6 +4959,10 @@ impl Server {
                 if let Some(pid) = mob.passenger_id {
                     rider_sync = Some((pid, mob.x, mob.y + mob.mounted_y_offset(), mob.z));
                 }
+            }
+
+            if let Some((sx, sy, sz)) = stepped_soil {
+                self.world.trample_farmland(sx, sy, sz);
             }
 
             if let Some((pid, rx, ry, rz)) = rider_sync {
@@ -4691,24 +5079,61 @@ impl Server {
         attacker_z: f64,
     ) {
         let mut hit = None;
+        let mut woke_player = false;
+        let mut armor_sync = None;
         if let Some(p) = self.entities.get_player_mut(player_id) {
-            if p.dead {
+            if p.dead || damage < 0 {
                 return;
             }
-            let (dealt, died) = p.take_damage(damage);
-            if dealt <= 0 {
-                return;
+            let (dealt, died) = if damage == 0 {
+                if p.no_damage_ticks > 10 {
+                    return;
+                }
+                p.no_damage_ticks = 20;
+                p.last_damage = 0;
+                (0, false)
+            } else {
+                let (d, died_flag) = p.take_damage(damage);
+                if d <= 0 && p.no_damage_ticks > 10 && damage <= p.last_damage {
+                    return;
+                }
+                (d, died_flag)
+            };
+            let _ = dealt;
+            if p.sleeping {
+                p.sleeping = false;
+                p.sleep_ticks = 0;
+                p.bed_pos = None;
+                woke_player = true;
+            }
+            if damage > 0 {
+                armor_sync = Some((
+                    p.conn_id,
+                    [
+                        InventoryPlayer::to_slot_item(p.inventory.armor[3]),
+                        InventoryPlayer::to_slot_item(p.inventory.armor[2]),
+                        InventoryPlayer::to_slot_item(p.inventory.armor[1]),
+                        InventoryPlayer::to_slot_item(p.inventory.armor[0]),
+                    ],
+                ));
             }
             p.apply_knockback(attacker_x, attacker_z);
             let drops = if died {
                 let px = p.x;
                 let py = p.y;
                 let pz = p.z;
-                p.inventory
+                let mut list: Vec<(f64, f64, f64, ItemStack)> = p
+                    .inventory
                     .drop_all_on_death()
                     .into_iter()
                     .map(|it| (px, py, pz, it))
-                    .collect()
+                    .collect();
+                if let Some(OpenContainer::Workbench { craft_grid, .. }) = p.open_container.take() {
+                    for it in craft_grid.into_iter().flatten() {
+                        list.push((px, py, pz, it));
+                    }
+                }
+                list
             } else {
                 Vec::new()
             };
@@ -4724,7 +5149,48 @@ impl Server {
             ));
         }
 
+        if woke_player {
+            self.broadcast(Clientbound::ArmAnimation(ArmAnimation {
+                entity_id: player_id,
+                animate: 3,
+            }));
+        }
+        if let Some((cid, slots)) = armor_sync {
+            for (i, item) in slots.into_iter().enumerate() {
+                self.send(
+                    cid,
+                    Clientbound::SetSlot(SetSlot {
+                        window_id: 0,
+                        slot: 5 + i as i16,
+                        item,
+                    }),
+                );
+            }
+        }
+
         if let Some((conn_id, username, health, died, mx, my, mz, drops)) = hit {
+            // Alert tamed wolves owned by player (`EntityHuman.java:455-495`)
+            let nearest_attacker_mob = self
+                .entities
+                .iter_mobs()
+                .filter(|m| {
+                    !m.dead && (m.x - attacker_x).abs() < 2.0 && (m.z - attacker_z).abs() < 2.0
+                })
+                .map(|m| m.entity_id)
+                .next();
+            if let Some(att_mob_id) = nearest_attacker_mob {
+                for w in self.entities.iter_mobs_mut() {
+                    if w.mob_type == MobType::Wolf
+                        && w.wolf_tamed
+                        && w.entity_id != att_mob_id
+                        && w.wolf_owner.eq_ignore_ascii_case(&username)
+                    {
+                        w.wolf_sitting = false;
+                        w.target_id = Some(att_mob_id);
+                    }
+                }
+            }
+
             let vel = Clientbound::EntityVelocity(EntityVelocity {
                 entity_id: player_id,
                 mot_x: mx,
@@ -4852,32 +5318,90 @@ impl Server {
                 continue;
             }
 
-            if proj_snapshot.in_ground {
-                if proj_snapshot.kind == ProjectileKind::Arrow && proj_snapshot.from_player {
-                    // Check if a player walks over the stuck arrow to pick it up
-                    let collector = self.entities.iter_players().find_map(|p| {
-                        if !p.dead
-                            && (p.x - proj_snapshot.x).abs() <= 1.2
-                            && (p.y - proj_snapshot.y).abs() <= 1.8
-                            && (p.z - proj_snapshot.z).abs() <= 1.2
-                        {
-                            Some((p.entity_id, p.conn_id))
-                        } else {
-                            None
-                        }
+            if proj_snapshot.kind == ProjectileKind::FishingHook {
+                let valid_owner = proj_snapshot
+                    .shooter_id
+                    .and_then(|sid| self.entities.get_player(sid))
+                    .is_some_and(|p| {
+                        !p.dead
+                            && p.inventory
+                                .item_in_hand()
+                                .is_some_and(|s| s.id == items::FISHING_ROD)
+                            && ((p.x - proj_snapshot.x).powi(2)
+                                + (p.y - proj_snapshot.y).powi(2)
+                                + (p.z - proj_snapshot.z).powi(2))
+                                <= 1024.0
                     });
-                    if let Some((peid, pconn)) = collector {
-                        arrow_pickups.push((pid, peid, pconn));
+                if !valid_owner {
+                    to_remove.push(pid);
+                    continue;
+                }
+                if let Some(target_eid) = proj_snapshot.hooked_entity {
+                    let hooked_pos = self
+                        .entities
+                        .get_mob(target_eid)
+                        .filter(|m| !m.dead)
+                        .map(|m| (m.x, m.y + (m.size().1 as f64) * 0.8, m.z))
+                        .or_else(|| {
+                            self.entities
+                                .get_player(target_eid)
+                                .filter(|p| !p.dead)
+                                .map(|p| (p.x, p.y + 1.4, p.z))
+                        });
+                    if let Some((hx, hy, hz)) = hooked_pos {
+                        if let Some(p) = self.entities.get_projectile_mut(pid) {
+                            p.x = hx;
+                            p.y = hy;
+                            p.z = hz;
+                            p.mot_x = 0.0;
+                            p.mot_y = 0.0;
+                            p.mot_z = 0.0;
+                        }
                         continue;
+                    } else if let Some(p) = self.entities.get_projectile_mut(pid) {
+                        p.hooked_entity = None;
                     }
                 }
-                if let Some(p) = self.entities.get_projectile_mut(pid) {
-                    p.ticks_in_ground += 1;
-                    if p.ticks_in_ground >= 1200 {
-                        to_remove.push(pid);
+            }
+
+            if proj_snapshot.in_ground {
+                let gbx = proj_snapshot.x.floor() as i32;
+                let gby = proj_snapshot.y.floor() as i32;
+                let gbz = proj_snapshot.z.floor() as i32;
+                if (0..128).contains(&gby) && !blocks::is_solid(self.world.get_block(gbx, gby, gbz))
+                {
+                    if let Some(p) = self.entities.get_projectile_mut(pid) {
+                        p.in_ground = false;
+                        p.ticks_in_ground = 0;
+                        p.ticks_in_air = 0;
                     }
+                } else {
+                    if proj_snapshot.kind == ProjectileKind::Arrow && proj_snapshot.from_player {
+                        // Check if a player walks over the stuck arrow to pick it up
+                        let collector = self.entities.iter_players().find_map(|p| {
+                            if !p.dead
+                                && (p.x - proj_snapshot.x).abs() <= 1.2
+                                && (p.y - proj_snapshot.y).abs() <= 1.8
+                                && (p.z - proj_snapshot.z).abs() <= 1.2
+                            {
+                                Some((p.entity_id, p.conn_id))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((peid, pconn)) = collector {
+                            arrow_pickups.push((pid, peid, pconn));
+                            continue;
+                        }
+                    }
+                    if let Some(p) = self.entities.get_projectile_mut(pid) {
+                        p.ticks_in_ground += 1;
+                        if p.ticks_in_ground >= 1200 {
+                            to_remove.push(pid);
+                        }
+                    }
+                    continue;
                 }
-                continue;
             }
 
             let next_x = proj_snapshot.x + proj_snapshot.mot_x;
@@ -4921,7 +5445,11 @@ impl Server {
                 } else if proj_snapshot.kind == ProjectileKind::Fireball {
                     fireball_explosions.push((next_x, next_y, next_z));
                 }
-                if proj_snapshot.kind != ProjectileKind::FishingHook {
+                if proj_snapshot.kind == ProjectileKind::FishingHook {
+                    if let Some(p) = self.entities.get_projectile_mut(pid) {
+                        p.hooked_entity = Some(mob_id);
+                    }
+                } else {
                     to_remove.push(pid);
                     continue;
                 }
@@ -4951,15 +5479,17 @@ impl Server {
                     ProjectileKind::Fireball => 5,
                     _ => 0,
                 };
-                if dmg > 0 {
-                    player_hits.push((player_id, dmg, proj_snapshot.x, proj_snapshot.z));
-                }
+                player_hits.push((player_id, dmg, proj_snapshot.x, proj_snapshot.z));
                 if proj_snapshot.kind == ProjectileKind::Egg {
                     egg_hatches.push((next_x, next_y, next_z));
                 } else if proj_snapshot.kind == ProjectileKind::Fireball {
                     fireball_explosions.push((next_x, next_y, next_z));
                 }
-                if proj_snapshot.kind != ProjectileKind::FishingHook {
+                if proj_snapshot.kind == ProjectileKind::FishingHook {
+                    if let Some(p) = self.entities.get_projectile_mut(pid) {
+                        p.hooked_entity = Some(player_id);
+                    }
+                } else {
                     to_remove.push(pid);
                     continue;
                 }
@@ -5227,11 +5757,11 @@ impl Server {
     }
 
     fn handle_interact_minecart(&mut self, conn_id: ConnId, player_id: i32, cart_id: i32) {
-        let Some((ctype, cur_rider)) = self
+        let Some((ctype, cur_rider, cargo)) = self
             .entities
             .get_minecart(cart_id)
             .filter(|c| !c.dead)
-            .map(|c| (c.cart_type, c.passenger_id))
+            .map(|c| (c.cart_type, c.passenger_id, c.cargo))
         else {
             return;
         };
@@ -5251,27 +5781,78 @@ impl Server {
                     vehicle_id: cart_id,
                 }));
             }
+        } else if ctype == 1 {
+            // StorageMinecart (`EntityMinecart.java:862-865` + Poseidon dupe fix `NetServerHandler.java:1037-1039`)
+            let open_info = if let Some(player) = self.entities.get_by_conn_mut(conn_id) {
+                if player.vehicle_id.is_some() {
+                    return;
+                }
+                let win_id = player.next_window_id();
+                let container = OpenContainer::MinecartChest {
+                    window_id: win_id,
+                    entity_id: cart_id,
+                    slots: cargo,
+                };
+                let win_items = player.inventory.container_window_items(&container);
+                player.open_container = Some(container);
+                Some((win_id, win_items))
+            } else {
+                None
+            };
+            if let Some((win_id, win_items)) = open_info {
+                self.send(
+                    conn_id,
+                    Clientbound::OpenWindow(OpenWindow {
+                        window_id: win_id,
+                        inventory_type: 0,
+                        title: "Minecart".to_string(),
+                        slots_count: 27,
+                    }),
+                );
+                self.send(
+                    conn_id,
+                    Clientbound::WindowItems(WindowItems {
+                        window_id: win_id,
+                        items: win_items,
+                    }),
+                );
+            }
         } else if ctype == 2 {
-            // Powered minecart: right-click with COAL adds 3600 ticks of fuel and pushes in player look dir
-            let (px, pz, has_coal) = self
-                .entities
-                .get_by_conn(conn_id)
-                .map(|p| {
-                    (
-                        p.x,
-                        p.z,
-                        p.inventory
-                            .item_in_hand()
-                            .is_some_and(|s| s.id == items::COAL),
-                    )
-                })
-                .unwrap_or((0.0, 0.0, false));
-            if has_coal {
+            // Powered minecart (`EntityMinecart.java:869-875`): consume 1 COAL and add 1200 ticks of fuel
+            let mut slot_update = None;
+            let mut push_dir = None;
+            if let Some(player) = self.entities.get_by_conn_mut(conn_id) {
+                if let Some(mut stack) = player.inventory.item_in_hand() {
+                    if stack.id == items::COAL {
+                        stack.count = stack.count.saturating_sub(1);
+                        player.inventory.set_item_in_hand(if stack.count > 0 {
+                            Some(stack)
+                        } else {
+                            None
+                        });
+                        let slot_idx = 36 + player.inventory.held_slot as i16;
+                        let item = InventoryPlayer::to_slot_item(player.inventory.item_in_hand());
+                        slot_update = Some((slot_idx, item));
+                        push_dir = Some((player.x, player.z));
+                    }
+                }
+            }
+            if let Some((px, pz)) = push_dir {
                 if let Some(c) = self.entities.get_minecart_mut(cart_id) {
-                    c.fuel += 3600;
+                    c.fuel = (c.fuel + 1200).min(32000);
                     c.push_x = c.x - px;
                     c.push_z = c.z - pz;
                 }
+            }
+            if let Some((slot, item)) = slot_update {
+                self.send(
+                    conn_id,
+                    Clientbound::SetSlot(SetSlot {
+                        window_id: 0,
+                        slot,
+                        item,
+                    }),
+                );
             }
         }
     }
@@ -5282,10 +5863,17 @@ impl Server {
             cart.damage += raw_damage * 10;
             if cart.damage > 40 {
                 cart.dead = true;
-                destroyed = Some((cart.cart_type, cart.x, cart.y, cart.z, cart.passenger_id));
+                destroyed = Some((
+                    cart.cart_type,
+                    cart.x,
+                    cart.y,
+                    cart.z,
+                    cart.passenger_id,
+                    cart.cargo,
+                ));
             }
         }
-        if let Some((ctype, cx, cy, cz, passenger)) = destroyed {
+        if let Some((ctype, cx, cy, cz, passenger, cargo)) = destroyed {
             if let Some(pid) = passenger {
                 self.dismount_player(pid);
             }
@@ -5297,6 +5885,9 @@ impl Server {
             }
             self.spawn_dropped_item_random(cx, cy, cz, ItemStack::new(items::MINECART, 1, 0), 10);
             if ctype == 1 {
+                for item in cargo.into_iter().flatten() {
+                    self.spawn_dropped_item_random(cx, cy, cz, item, 10);
+                }
                 self.spawn_dropped_item_random(
                     cx,
                     cy,
@@ -5425,6 +6016,18 @@ impl Server {
                             if spd > 0.01 {
                                 cart.mot_x += (cart.mot_x / spd) * 0.06;
                                 cart.mot_z += (cart.mot_z / spd) * 0.06;
+                            } else if shape == 1 {
+                                if self.world.is_solid_normal_at(bx - 1, by, bz) {
+                                    cart.mot_x = 0.02;
+                                } else if self.world.is_solid_normal_at(bx + 1, by, bz) {
+                                    cart.mot_x = -0.02;
+                                }
+                            } else if shape == 0 {
+                                if self.world.is_solid_normal_at(bx, by, bz - 1) {
+                                    cart.mot_z = 0.02;
+                                } else if self.world.is_solid_normal_at(bx, by, bz + 1) {
+                                    cart.mot_z = -0.02;
+                                }
                             }
                         } else {
                             cart.mot_x *= 0.5;
@@ -5481,10 +6084,87 @@ impl Server {
                     let new_c = p.chunk_pos();
                     conn_to_update = Some(p.conn_id);
                     self.entities.update_player_chunk(pid, old_c, new_c);
+                } else if let Some(rmob) = self.entities.get_mob_mut(pid) {
+                    rmob.x = rx;
+                    rmob.y = ry;
+                    rmob.z = rz;
                 }
                 if let Some(cid) = conn_to_update {
                     self.update_player_view_chunks(cid);
                 }
+            }
+        }
+    }
+
+    fn painting_can_survive(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        direction: i32,
+        title: &str,
+        ignore_id: Option<i32>,
+    ) -> bool {
+        let (aabb, wall_blocks) = Painting::bounds_and_wall_blocks(x, y, z, direction, title);
+        for (wx, wy, wz) in wall_blocks {
+            if !(0..128).contains(&wy) {
+                return false;
+            }
+            if !blocks::material(self.world.get_block(wx, wy, wz)).is_buildable() {
+                return false;
+            }
+        }
+        for other in self.entities.iter_paintings() {
+            if other.dead || Some(other.entity_id) == ignore_id {
+                continue;
+            }
+            let (oa, _) = Painting::bounds_and_wall_blocks(
+                other.x,
+                other.y,
+                other.z,
+                other.direction,
+                &other.title,
+            );
+            let overlaps = aabb.0 < oa.3
+                && aabb.3 > oa.0
+                && aabb.1 < oa.4
+                && aabb.4 > oa.1
+                && aabb.2 < oa.5
+                && aabb.5 > oa.2;
+            if overlaps {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn tick_paintings(&mut self) {
+        let mut broken = Vec::new();
+        for p in self.entities.iter_paintings() {
+            if p.dead {
+                continue;
+            }
+            if !self.world.is_chunk_loaded(p.chunk_pos()) {
+                continue;
+            }
+            if !self.painting_can_survive(p.x, p.y, p.z, p.direction, &p.title, Some(p.entity_id)) {
+                broken.push((p.entity_id, p.x, p.y, p.z));
+            }
+        }
+        for (pid, x, y, z) in broken {
+            if self.entities.remove_painting(pid).is_some() {
+                for outbound in self.tracker.untrack_painting(pid) {
+                    if let Some(target) = self.entities.get_player(outbound.recipient_id) {
+                        self.send(target.conn_id, outbound.packet);
+                    }
+                }
+                self.spawn_dropped_item_random(
+                    x as f64 + 0.5,
+                    y as f64 + 0.5,
+                    z as f64 + 0.5,
+                    ItemStack::new(items::PAINTING, 1, 0),
+                    10,
+                );
             }
         }
     }
@@ -5538,23 +6218,88 @@ impl Server {
                 plate_positions.push((bx, by, bz, blocks::WOOD_PLATE));
             }
         }
+        for pr in self.entities.iter_projectiles() {
+            if pr.dead {
+                continue;
+            }
+            let bx = pr.x.floor() as i32;
+            let by = pr.y.floor() as i32;
+            let bz = pr.z.floor() as i32;
+            if self.world.get_block(bx, by, bz) == blocks::WOOD_PLATE {
+                plate_positions.push((bx, by, bz, blocks::WOOD_PLATE));
+            }
+        }
+        for bt in self.entities.iter_boats() {
+            let bx = bt.x.floor() as i32;
+            let by = bt.y.floor() as i32;
+            let bz = bt.z.floor() as i32;
+            if self.world.get_block(bx, by, bz) == blocks::WOOD_PLATE {
+                plate_positions.push((bx, by, bz, blocks::WOOD_PLATE));
+            }
+        }
+        for ct in self.entities.iter_minecarts() {
+            if ct.dead {
+                continue;
+            }
+            let bx = ct.x.floor() as i32;
+            let by = ct.y.floor() as i32;
+            let bz = ct.z.floor() as i32;
+            if self.world.get_block(bx, by, bz) == blocks::WOOD_PLATE {
+                plate_positions.push((bx, by, bz, blocks::WOOD_PLATE));
+            }
+        }
 
         for (px, py, pz, pid) in plate_positions {
             self.world.set_pressure_plate_state(px, py, pz, pid, true);
         }
 
+        // Wake players whose bed block was destroyed (`EntityHuman.java:88-93`)
+        let mut broken_bed_wakes = Vec::new();
+        for p in self.entities.iter_players() {
+            if !p.dead && p.sleeping {
+                if let Some((bx, by, bz)) = p.bed_pos {
+                    if self.world.get_block(bx, by, bz) != blocks::BED {
+                        broken_bed_wakes.push(p.entity_id);
+                    }
+                }
+            }
+        }
+        for eid in broken_bed_wakes {
+            if let Some(p) = self.entities.get_player_mut(eid) {
+                p.sleeping = false;
+                p.sleep_ticks = 0;
+                p.bed_pos = None;
+            }
+            self.broadcast(Clientbound::ArmAnimation(ArmAnimation {
+                entity_id: eid,
+                animate: 3,
+            }));
+        }
+
         // Bed sleep check (`World.everyoneDeeplySleeping()`)
+        for p in self.entities.iter_players_mut() {
+            if !p.dead && p.sleeping && p.sleep_ticks < 100 {
+                p.sleep_ticks += 1;
+            }
+        }
         let all_sleeping = self.entities.player_count() > 0
-            && self.entities.iter_players().all(|p| !p.dead && p.sleeping);
+            && self
+                .entities
+                .iter_players()
+                .all(|p| !p.dead && p.sleeping && p.sleep_ticks >= 1);
         if all_sleeping {
             let cur_time = self.world.world_time();
             let next_morning = (cur_time + 24000) - (cur_time + 24000).rem_euclid(24000);
             self.world.live_time = next_morning;
             self.world.level_data.borrow_mut().time = next_morning;
+            if self.world.reset_weather() {
+                self.broadcast(Clientbound::Bed(Bed { reason: 2 }));
+            }
 
             let mut woke_players = Vec::new();
             for p in self.entities.iter_players_mut() {
                 p.sleeping = false;
+                p.sleep_ticks = 0;
                 p.bed_pos = None;
                 woke_players.push(p.entity_id);
             }
@@ -5565,6 +6310,94 @@ impl Server {
                 }));
             }
             self.broadcast(Clientbound::UpdateTime(UpdateTime { time: next_morning }));
+        }
+    }
+
+    pub fn strike_lightning(&mut self, x: i32, y: i32, z: i32) {
+        self.world.strike_lightning_at(x, y, z);
+        self.process_world_events();
+    }
+
+    fn handle_lightning_strike(&mut self, x: i32, y: i32, z: i32) {
+        let bolt_id = self.entities.allocate_id();
+        self.broadcast(Clientbound::Weather(Weather {
+            entity_id: bolt_id,
+            weather_type: 1,
+            x: x * 32,
+            y: y * 32,
+            z: z * 32,
+        }));
+
+        // EntityWeatherStorm.java:111-120 — affect entities in ±3.0 box (`y - 3.0..=y + 9.0`)
+        let fx = x as f64;
+        let fy = y as f64;
+        let fz = z as f64;
+
+        let hit_players: Vec<i32> = self
+            .entities
+            .iter_players()
+            .filter(|p| {
+                !p.dead
+                    && (p.x - fx).abs() <= 3.0
+                    && p.y >= fy - 3.0
+                    && p.y <= fy + 9.0
+                    && (p.z - fz).abs() <= 3.0
+            })
+            .map(|p| p.entity_id)
+            .collect();
+        for pid in hit_players {
+            if let Some(p) = self.entities.get_player_mut(pid) {
+                p.fire_ticks = p.fire_ticks.max(160);
+            }
+            self.damage_player_direct(pid, 5, "was struck by lightning");
+        }
+
+        let hit_mobs: Vec<(i32, MobType, f64, f64, f64, f32, f32)> = self
+            .entities
+            .iter_mobs()
+            .filter(|m| {
+                !m.dead
+                    && (m.x - fx).abs() <= 3.0
+                    && m.y >= fy - 3.0
+                    && m.y <= fy + 9.0
+                    && (m.z - fz).abs() <= 3.0
+            })
+            .map(|m| (m.entity_id, m.mob_type, m.x, m.y, m.z, m.yaw, m.pitch))
+            .collect();
+
+        for (mid, mtype, mx, my, mz, myaw, mpitch) in hit_mobs {
+            match mtype {
+                MobType::Creeper => {
+                    // EntityCreeper.java:151-163 — power the creeper!
+                    if let Some(m) = self.entities.get_mob_mut(mid) {
+                        m.creeper_powered = true;
+                        m.fire_ticks = m.fire_ticks.max(160);
+                    }
+                    let _ = self.damage_mob(mid, 5, None, false);
+                }
+                MobType::Pig => {
+                    // EntityPig.java:67-85 — transform Pig into PigZombie!
+                    let _ = self.entities.remove_mob(mid);
+                    for out in self.tracker.untrack_mob(mid) {
+                        if let Some(target) = self.entities.get_player(out.recipient_id) {
+                            self.send(target.conn_id, out.packet);
+                        }
+                    }
+                    let pz_id = self.spawn_mob_at(MobType::PigZombie, mx, my, mz);
+                    if let Some(pz) = self.entities.get_mob_mut(pz_id) {
+                        pz.yaw = myaw;
+                        pz.pitch = mpitch;
+                    }
+                }
+                _ => {
+                    if let Some(m) = self.entities.get_mob_mut(mid) {
+                        if !m.fire_proof() {
+                            m.fire_ticks = m.fire_ticks.max(160);
+                        }
+                    }
+                    let _ = self.damage_mob(mid, 5, None, false);
+                }
+            }
         }
     }
 
@@ -5661,6 +6494,9 @@ impl Server {
                         data,
                     }));
                 }
+                WorldEvent::LightningStrike { x, y, z } => {
+                    self.handle_lightning_strike(x, y, z);
+                }
             }
         }
     }
@@ -5712,7 +6548,7 @@ impl Server {
             }
         }
 
-        // Entity damage within `radius * 2.0`
+        // Entity damage within `radius * 2.0` with block exposure raycasting (`Explosion.java:127-150`)
         let blast_size = (radius * 2.0) as f64;
         let player_ids: Vec<i32> = self.entities.iter_players().map(|p| p.entity_id).collect();
         for pid in player_ids {
@@ -5725,17 +6561,28 @@ impl Server {
                 let dz = p.z - ez;
                 let d = (dx * dx + dy * dy + dz * dz).sqrt();
                 if d <= blast_size {
-                    Some((d, dx, dy, dz))
+                    Some((d, p.x, p.y, p.z))
                 } else {
                     None
                 }
             });
-            if let Some((d, _dx, _dy, _dz)) = dist_info {
-                let d7 = d / blast_size;
-                let impact = 1.0 - d7;
-                let dmg =
-                    (((impact * impact + impact) / 2.0 * 8.0 * blast_size + 1.0) as i16).max(1);
-                self.damage_player_from_mob(pid, dmg, ex, ez);
+            if let Some((d, px, py, pz)) = dist_info {
+                let r1 = self
+                    .world
+                    .ray_trace((ex, ey, ez), (px, py + 0.2, pz), false)
+                    .is_none();
+                let r2 = self
+                    .world
+                    .ray_trace((ex, ey, ez), (px, py + 1.5, pz), false)
+                    .is_none();
+                let exposure = (i32::from(r1) + i32::from(r2)) as f64 / 2.0;
+                if exposure > 0.0 {
+                    let d7 = d / blast_size;
+                    let impact = (1.0 - d7) * exposure;
+                    let dmg =
+                        (((impact * impact + impact) / 2.0 * 8.0 * blast_size + 1.0) as i16).max(1);
+                    self.damage_player_from_mob(pid, dmg, ex, ez);
+                }
             }
         }
 
@@ -5750,16 +6597,27 @@ impl Server {
                 let dz = m.z - ez;
                 let d = (dx * dx + dy * dy + dz * dz).sqrt();
                 if d <= blast_size {
-                    Some(d)
+                    Some((d, m.x, m.y, m.z, m.eye_height()))
                 } else {
                     None
                 }
             });
-            if let Some(d) = dist_info {
-                let impact = 1.0 - (d / blast_size);
-                let dmg =
-                    (((impact * impact + impact) / 2.0 * 8.0 * blast_size + 1.0) as i16).max(1);
-                let _ = self.damage_mob(mid, dmg, Some((0, ex, ez)), false);
+            if let Some((d, mx, my, mz, eye_h)) = dist_info {
+                let r1 = self
+                    .world
+                    .ray_trace((ex, ey, ez), (mx, my + 0.2, mz), false)
+                    .is_none();
+                let r2 = self
+                    .world
+                    .ray_trace((ex, ey, ez), (mx, my + eye_h, mz), false)
+                    .is_none();
+                let exposure = (i32::from(r1) + i32::from(r2)) as f64 / 2.0;
+                if exposure > 0.0 {
+                    let impact = (1.0 - (d / blast_size)) * exposure;
+                    let dmg =
+                        (((impact * impact + impact) / 2.0 * 8.0 * blast_size + 1.0) as i16).max(1);
+                    let _ = self.damage_mob(mid, dmg, Some((0, ex, ez)), false);
+                }
             }
         }
 
@@ -6079,61 +6937,207 @@ impl Server {
                     **items = *slots;
                 }
             }
+            OpenContainer::MinecartChest {
+                entity_id, slots, ..
+            } => {
+                if let Some(cart) = self.entities.get_minecart_mut(*entity_id) {
+                    cart.cargo = *slots;
+                }
+            }
             OpenContainer::Workbench { .. } => {}
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn sync_open_containers(&mut self) {
         let mut updates = Vec::new();
+        let mut force_closes = Vec::new();
+        let cart_snapshots: HashMap<i32, (f64, f64, f64, [Option<ItemStack>; 27])> = self
+            .entities
+            .iter_minecarts()
+            .filter(|c| !c.dead && c.cart_type == 1)
+            .map(|c| (c.entity_id, (c.x, c.y, c.z, c.cargo)))
+            .collect();
+
         for player in self.entities.iter_players_mut() {
-            if let Some(OpenContainer::Furnace {
-                window_id,
-                x,
-                y,
-                z,
-                slots,
-                cook_time,
-                burn_time,
-                ticks_for_current_fuel,
-            }) = &mut player.open_container
-            {
-                if let Some(TileEntity {
-                    kind:
-                        TileEntityKind::Furnace {
-                            burn_time: te_burn,
-                            ticks_for_current_fuel: te_fuel,
-                            cook_time: te_cook,
-                            items: te_items,
-                        },
-                    ..
-                }) = self.world.get_tile_entity(*x, *y, *z)
-                {
-                    let mut bars = Vec::new();
-                    if *cook_time != *te_cook {
-                        *cook_time = *te_cook;
-                        bars.push((0i16, *te_cook));
-                    }
-                    if *burn_time != *te_burn {
-                        *burn_time = *te_burn;
-                        bars.push((1i16, *te_burn));
-                    }
-                    if *ticks_for_current_fuel != *te_fuel {
-                        *ticks_for_current_fuel = *te_fuel;
-                        bars.push((2i16, *te_fuel));
-                    }
-                    let mut slot_changes = Vec::new();
-                    for i in 0..3 {
-                        if slots[i] != te_items[i] {
-                            slots[i] = te_items[i];
-                            slot_changes
-                                .push((i as i16, InventoryPlayer::to_slot_item(te_items[i])));
-                        }
-                    }
-                    if !bars.is_empty() || !slot_changes.is_empty() {
-                        updates.push((player.conn_id, *window_id, bars, slot_changes));
+            let (px, py, pz) = (player.x, player.y, player.z);
+            match &mut player.open_container {
+                Some(OpenContainer::Workbench {
+                    window_id, x, y, z, ..
+                }) => {
+                    let valid = self.world.get_block(*x, *y, *z) == blocks::WORKBENCH
+                        && (px - (*x as f64 + 0.5)).powi(2)
+                            + (py - (*y as f64 + 0.5)).powi(2)
+                            + (pz - (*z as f64 + 0.5)).powi(2)
+                            <= 64.0;
+                    if !valid {
+                        force_closes.push((player.conn_id, *window_id));
                     }
                 }
+                Some(OpenContainer::Furnace {
+                    window_id,
+                    x,
+                    y,
+                    z,
+                    slots,
+                    cook_time,
+                    burn_time,
+                    ticks_for_current_fuel,
+                }) => {
+                    let dist_ok = (px - (*x as f64 + 0.5)).powi(2)
+                        + (py - (*y as f64 + 0.5)).powi(2)
+                        + (pz - (*z as f64 + 0.5)).powi(2)
+                        <= 64.0;
+                    if let Some(TileEntity {
+                        kind:
+                            TileEntityKind::Furnace {
+                                burn_time: te_burn,
+                                ticks_for_current_fuel: te_fuel,
+                                cook_time: te_cook,
+                                items: te_items,
+                            },
+                        ..
+                    }) = self.world.get_tile_entity(*x, *y, *z).filter(|_| dist_ok)
+                    {
+                        let mut bars = Vec::new();
+                        if *cook_time != *te_cook {
+                            *cook_time = *te_cook;
+                            bars.push((0i16, *te_cook));
+                        }
+                        if *burn_time != *te_burn {
+                            *burn_time = *te_burn;
+                            bars.push((1i16, *te_burn));
+                        }
+                        if *ticks_for_current_fuel != *te_fuel {
+                            *ticks_for_current_fuel = *te_fuel;
+                            bars.push((2i16, *te_fuel));
+                        }
+                        let mut slot_changes = Vec::new();
+                        for i in 0..3 {
+                            if slots[i] != te_items[i] {
+                                slots[i] = te_items[i];
+                                slot_changes
+                                    .push((i as i16, InventoryPlayer::to_slot_item(te_items[i])));
+                            }
+                        }
+                        if !bars.is_empty() || !slot_changes.is_empty() {
+                            updates.push((player.conn_id, *window_id, bars, slot_changes));
+                        }
+                    } else {
+                        force_closes.push((player.conn_id, *window_id));
+                    }
+                }
+                Some(OpenContainer::Chest {
+                    window_id,
+                    positions,
+                    slots,
+                }) => {
+                    let mut valid = !positions.is_empty();
+                    let mut slot_changes = Vec::new();
+                    for (idx, &(cx, cy, cz)) in positions.iter().enumerate() {
+                        let dist_ok = (px - (cx as f64 + 0.5)).powi(2)
+                            + (py - (cy as f64 + 0.5)).powi(2)
+                            + (pz - (cz as f64 + 0.5)).powi(2)
+                            <= 64.0;
+                        if let Some(TileEntity {
+                            kind: TileEntityKind::Chest { items: te_items },
+                            ..
+                        }) = self.world.get_tile_entity(cx, cy, cz).filter(|_| dist_ok)
+                        {
+                            let start = idx * 27;
+                            for s in 0..27 {
+                                if start + s < slots.len() && slots[start + s] != te_items[s] {
+                                    slots[start + s] = te_items[s];
+                                    slot_changes.push((
+                                        (start + s) as i16,
+                                        InventoryPlayer::to_slot_item(te_items[s]),
+                                    ));
+                                }
+                            }
+                        } else {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if !valid {
+                        force_closes.push((player.conn_id, *window_id));
+                    } else if !slot_changes.is_empty() {
+                        updates.push((player.conn_id, *window_id, Vec::new(), slot_changes));
+                    }
+                }
+                Some(OpenContainer::Dispenser {
+                    window_id,
+                    x,
+                    y,
+                    z,
+                    slots,
+                }) => {
+                    let dist_ok = (px - (*x as f64 + 0.5)).powi(2)
+                        + (py - (*y as f64 + 0.5)).powi(2)
+                        + (pz - (*z as f64 + 0.5)).powi(2)
+                        <= 64.0;
+                    if let Some(TileEntity {
+                        kind: TileEntityKind::Dispenser { items: te_items },
+                        ..
+                    }) = self.world.get_tile_entity(*x, *y, *z).filter(|_| dist_ok)
+                    {
+                        let mut slot_changes = Vec::new();
+                        for i in 0..9 {
+                            if slots[i] != te_items[i] {
+                                slots[i] = te_items[i];
+                                slot_changes
+                                    .push((i as i16, InventoryPlayer::to_slot_item(te_items[i])));
+                            }
+                        }
+                        if !slot_changes.is_empty() {
+                            updates.push((player.conn_id, *window_id, Vec::new(), slot_changes));
+                        }
+                    } else {
+                        force_closes.push((player.conn_id, *window_id));
+                    }
+                }
+                Some(OpenContainer::MinecartChest {
+                    window_id,
+                    entity_id,
+                    slots,
+                }) => {
+                    if let Some(&(cx, cy, cz, ref cargo)) = cart_snapshots.get(entity_id) {
+                        let dist_ok =
+                            (px - cx).powi(2) + (py - cy).powi(2) + (pz - cz).powi(2) <= 64.0;
+                        if dist_ok {
+                            let mut slot_changes = Vec::new();
+                            for i in 0..27 {
+                                if slots[i] != cargo[i] {
+                                    slots[i] = cargo[i];
+                                    slot_changes
+                                        .push((i as i16, InventoryPlayer::to_slot_item(cargo[i])));
+                                }
+                            }
+                            if !slot_changes.is_empty() {
+                                updates.push((
+                                    player.conn_id,
+                                    *window_id,
+                                    Vec::new(),
+                                    slot_changes,
+                                ));
+                            }
+                        } else {
+                            force_closes.push((player.conn_id, *window_id));
+                        }
+                    } else {
+                        force_closes.push((player.conn_id, *window_id));
+                    }
+                }
+                None => {}
             }
+        }
+
+        for (conn_id, win_id) in force_closes {
+            self.close_player_container_and_drop_transient(conn_id, true);
+            self.send(
+                conn_id,
+                Clientbound::CloseWindow(CloseWindow { window_id: win_id }),
+            );
         }
 
         for (conn_id, win_id, bars, slot_changes) in updates {
@@ -6154,6 +7158,91 @@ impl Server {
                         window_id: win_id as i8,
                         slot,
                         item,
+                    }),
+                );
+            }
+        }
+    }
+
+    /// Java `ItemWorldMap.a` + `WorldMapHumanTracker.a` (`ItemWorldMap.java:40-210`, `WorldMapHumanTracker.java:35-101`):
+    /// stream `Packet131` (`MapData`) scanlines and player cursor icons for players holding `Item.MAP`.
+    fn tick_held_maps(&mut self, ticks: u64) {
+        let holders: Vec<(ConnId, i16, f64, f64, f32)> = self
+            .entities
+            .iter_players()
+            .filter_map(|p| {
+                if p.dead {
+                    return None;
+                }
+                let stack = p.inventory.item_in_hand()?;
+                if stack.id == items::MAP {
+                    Some((p.conn_id, stack.damage, p.x, p.z, p.yaw))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if holders.is_empty() {
+            return;
+        }
+
+        let center_x = self.config.world.spawn_x;
+        let center_z = self.config.world.spawn_z;
+        let scale = 3i32; // 1 << 3 = 8 blocks per pixel
+        let step = 1i32 << scale;
+
+        for (conn_id, map_id, px, pz, yaw) in holders {
+            if ticks % 5 == 0 {
+                let rel_x = (((px - center_x as f64) / (step as f64)) * 2.0)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8 as u8;
+                let rel_z = (((pz - center_z as f64) / (step as f64)) * 2.0)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8 as u8;
+                let dir = (((yaw * 16.0 / 360.0).round() as i32) & 15) as u8;
+                let data = vec![1u8, dir << 4, rel_x, rel_z];
+                self.send(
+                    conn_id,
+                    Clientbound::MapData(MapData {
+                        item_type: items::MAP,
+                        item_id: map_id,
+                        data,
+                    }),
+                );
+            } else {
+                let col = ((ticks * 11) % 128) as i32;
+                let mut data = Vec::with_capacity(131);
+                data.push(0u8);
+                data.push(col as u8);
+                data.push(0u8);
+                let mut prev_h = 64i32;
+                for row in 0..128i32 {
+                    let wx = center_x + (col - 64) * step;
+                    let wz = center_z + (row - 64) * step;
+                    let wy = self.world.top_solid_or_liquid_block(wx, wz);
+                    let (color_idx, shade) = if wy > 1 {
+                        let bid = self.world.get_block(wx, wy - 1, wz);
+                        let c_idx = blocks::material(bid).map_color_index();
+                        let s = if wy > prev_h {
+                            2u8
+                        } else if wy < prev_h {
+                            0u8
+                        } else {
+                            1u8
+                        };
+                        prev_h = wy;
+                        (c_idx, s)
+                    } else {
+                        (0u8, 1u8)
+                    };
+                    data.push(color_idx * 4 + shade);
+                }
+                self.send(
+                    conn_id,
+                    Clientbound::MapData(MapData {
+                        item_type: items::MAP,
+                        item_id: map_id,
+                        data,
                     }),
                 );
             }
@@ -6209,6 +7298,16 @@ impl Server {
         let y = sign.y as i32;
         let z = sign.z;
         if !self.world.is_chunk_loaded(ChunkPos::new(x >> 4, z >> 4)) {
+            return;
+        }
+        // TileEntitySign.isEditableBy (`NetServerHandler.java:1151-1164`)
+        let can_edit = self.entities.get_by_conn(id).is_some_and(|p| {
+            p.editing_sign == Some((x, y, z))
+                || ((p.x - x as f64).powi(2) + (p.y - y as f64).powi(2) + (p.z - z as f64).powi(2)
+                    <= 64.0
+                    && p.editing_sign.is_none())
+        });
+        if !can_edit {
             return;
         }
 
@@ -6330,10 +7429,26 @@ impl Server {
                 let bx = item.x.floor() as i32;
                 let by = item.y.floor() as i32;
                 let bz = item.z.floor() as i32;
+                let cur_id = self.world.get_block(bx, by, bz);
 
-                if blocks::is_lava(self.world.get_block(bx, by, bz)) {
+                if blocks::is_lava(cur_id) {
                     item.mot_y = 0.2;
                     item.health -= 4;
+                } else if cur_id == blocks::FIRE || cur_id == blocks::CACTUS {
+                    item.health -= 1;
+                } else if blocks::is_opaque_cube(cur_id) {
+                    // Entity.g(x, y, z) (`Entity.java:1277-1353`): push item out of opaque block
+                    if !blocks::is_opaque_cube(self.world.get_block(bx, by + 1, bz)) {
+                        item.mot_y = 0.2;
+                    } else if !blocks::is_opaque_cube(self.world.get_block(bx - 1, by, bz)) {
+                        item.mot_x = -0.2;
+                    } else if !blocks::is_opaque_cube(self.world.get_block(bx + 1, by, bz)) {
+                        item.mot_x = 0.2;
+                    } else if !blocks::is_opaque_cube(self.world.get_block(bx, by, bz - 1)) {
+                        item.mot_z = -0.2;
+                    } else if !blocks::is_opaque_cube(self.world.get_block(bx, by, bz + 1)) {
+                        item.mot_z = 0.2;
+                    }
                 }
 
                 let next_x = item.x + item.mot_x;
@@ -6573,11 +7688,53 @@ impl Server {
         }
     }
 
+    fn find_safe_bed_respawn(&self, bx: i32, by: i32, bz: i32) -> Option<(i32, i32, i32)> {
+        if self.world.get_block(bx, by, bz) != blocks::BED {
+            return None;
+        }
+        let meta = self.world.get_data(bx, by, bz);
+        let dir = (meta & 3) as usize;
+        let (dx, dz) = [(0, 1), (-1, 0), (0, -1), (1, 0)][dir];
+        let (fx, fz) = if (meta & 8) != 0 {
+            (bx - dx, bz - dz)
+        } else {
+            (bx + dx, bz + dz)
+        };
+        let min_x = bx.min(fx) - 1;
+        let max_x = bx.max(fx) + 1;
+        let min_z = bz.min(fz) - 1;
+        let max_z = bz.max(fz) + 1;
+        for rx in min_x..=max_x {
+            for rz in min_z..=max_z {
+                if by > 0
+                    && by < 126
+                    && self.world.is_solid_normal_at(rx, by - 1, rz)
+                    && self.world.get_block(rx, by, rz) == blocks::AIR
+                    && self.world.get_block(rx, by + 1, rz) == blocks::AIR
+                {
+                    return Some((rx, by, rz));
+                }
+            }
+        }
+        None
+    }
+
     fn handle_respawn(&mut self, id: ConnId) {
         if self.world.live_is_active() {
             self.world.live_player_quit(id);
         }
-        let (spawn_x, spawn_y, spawn_z) = self.world.safe_spawn_point();
+        let saved_bed = self.entities.get_by_conn(id).and_then(|p| p.spawn_bed);
+        let mut invalid_bed = false;
+        let (spawn_x, spawn_y, spawn_z) = if let Some((bx, by, bz)) = saved_bed {
+            if let Some(pos) = self.find_safe_bed_respawn(bx, by, bz) {
+                pos
+            } else {
+                invalid_bed = true;
+                self.world.safe_spawn_point()
+            }
+        } else {
+            self.world.safe_spawn_point()
+        };
 
         // Untrack player in EntityTracker before respawn (`ServerConfigurationManager.moveToWorld`)
         // so both the respawned player and all observers clear stale tracked_players state
@@ -6596,6 +7753,9 @@ impl Server {
         // Poseidon double-respawn client hack: send opposite dimension first, then dimension 0
         self.send(id, Clientbound::Respawn(Respawn { dimension: -1 }));
         self.send(id, Clientbound::Respawn(Respawn { dimension: 0 }));
+        if invalid_bed {
+            self.send(id, Clientbound::Bed(Bed { reason: 0 }));
+        }
 
         let mut respawned_eid = None;
         if let Some(player) = self.entities.get_by_conn_mut(id) {
@@ -6800,6 +7960,10 @@ impl Server {
             .map(|p| p.health)
             .unwrap_or(20);
         self.send(id, Clientbound::UpdateHealth(UpdateHealth { health }));
+
+        if self.world.live_is_active() && self.world.is_raining() {
+            self.send(id, Clientbound::Bed(Bed { reason: 1 }));
+        }
 
         // Poseidon: PlayerJoinEvent -> broadcast join message to other players
         let join_msg = self

@@ -56,6 +56,11 @@ pub enum WorldEvent {
         z: i32,
         data: i32,
     },
+    LightningStrike {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
 }
 
 /// Java `RedstoneUpdateInfo`: tracks redstone torch toggle timestamps for burnout (>= 8 toggles in 100 ticks).
@@ -1618,7 +1623,7 @@ impl World {
         let ability = Self::fire_burn_ability(target_id);
         if rng.next_i32_bound(bound) < ability {
             let is_tnt = target_id == blocks::TNT;
-            if rng.next_i32_bound(age + 10) < 5 {
+            if rng.next_i32_bound(age + 10) < 5 && !self.is_being_rained_on(x, y, z) {
                 let new_age = (age + rng.next_i32_bound(5) / 4).min(15) as u8;
                 self.java_set_type_id_and_data(x, y, z, blocks::FIRE, new_age);
             } else {
@@ -1634,6 +1639,17 @@ impl World {
     pub fn tick_fire(&mut self, x: i32, y: i32, z: i32) {
         let on_netherrack = y > 0 && self.get_block(x, y - 1, z) == blocks::NETHERRACK;
         if !self.is_solid_normal_at(x, y - 1, z) && !self.has_flammable_neighbor(x, y, z) {
+            self.java_set_type_id(x, y, z, blocks::AIR);
+            return;
+        }
+        if !on_netherrack
+            && self.is_raining()
+            && (self.is_being_rained_on(x, y, z)
+                || self.is_being_rained_on(x - 1, y, z)
+                || self.is_being_rained_on(x + 1, y, z)
+                || self.is_being_rained_on(x, y, z - 1)
+                || self.is_being_rained_on(x, y, z + 1))
+        {
             self.java_set_type_id(x, y, z, blocks::AIR);
             return;
         }
@@ -1687,6 +1703,12 @@ impl World {
                         let spread_threshold = (enc + 40) / (age + 30);
                         if spread_threshold > 0
                             && rng.next_i32_bound(chance_bound) <= spread_threshold
+                            && (!self.is_raining()
+                                || (!self.is_being_rained_on(ix, iy, iz)
+                                    && !self.is_being_rained_on(ix - 1, iy, iz)
+                                    && !self.is_being_rained_on(ix + 1, iy, iz)
+                                    && !self.is_being_rained_on(ix, iy, iz - 1)
+                                    && !self.is_being_rained_on(ix, iy, iz + 1)))
                         {
                             let new_age = (age + rng.next_i32_bound(5) / 4).min(15) as u8;
                             self.java_set_type_id_and_data(ix, iy, iz, blocks::FIRE, new_age);
@@ -1697,6 +1719,284 @@ impl World {
         }
 
         self.tick_random = rng;
+    }
+
+    // ---------------------------------------------------------------------
+    // Weather, Portals, Crops, and Block Helpers (`World.java`, `Block*.java`)
+    // ---------------------------------------------------------------------
+
+    pub fn is_raining(&self) -> bool {
+        self.level_data.borrow().raining
+    }
+
+    pub fn is_thundering(&self) -> bool {
+        self.level_data.borrow().thundering
+    }
+
+    /// Java `World.e(int i, int j)` (`World.java:1008-1024`): Y above highest solid or liquid block.
+    pub fn top_solid_or_liquid_block(&self, x: i32, z: i32) -> i32 {
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        let Some(chunk) = self.chunks.get(&pos) else {
+            return -1;
+        };
+        let lx = (x & 15) as usize;
+        let lz = (z & 15) as usize;
+        for y in (1..=127).rev() {
+            let id = chunk.get_block(lx, y, lz);
+            let mat = blocks::material(id);
+            if mat.blocks_movement() || mat.is_liquid() {
+                return y as i32 + 1;
+            }
+        }
+        -1
+    }
+
+    /// Java `World.s(int i, int j, int k)` (`World.java:2420-2432`): true if `(x, y, z)` is exposed to liquid rain.
+    pub fn is_being_rained_on(&self, x: i32, y: i32, z: i32) -> bool {
+        if !self.is_raining() {
+            return false;
+        }
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        if !self.chunks.contains_key(&pos) {
+            return false;
+        }
+        if self.top_solid_or_liquid_block(x, z) > y {
+            return false;
+        }
+        let seed = self.seed();
+        let mut mgr = crate::world::biome::WorldChunkManager::new(seed);
+        let biome = mgr.biome_at(x, z);
+        biome.can_rain()
+    }
+
+    /// Java `World.i()` (`World.java:1770-1850`): tick weather timers; returns `Some(new_raining)` when rain state changes.
+    pub fn tick_weather(&mut self) -> Option<bool> {
+        let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+        let mut ld = self.level_data.borrow_mut();
+        let was_raining = ld.raining;
+
+        if ld.thunder_time <= 0 {
+            if ld.thundering {
+                ld.thunder_time = rng.next_i32_bound(12000) + 3600;
+            } else {
+                ld.thunder_time = rng.next_i32_bound(168_000) + 12000;
+            }
+        } else {
+            ld.thunder_time -= 1;
+            if ld.thunder_time <= 0 {
+                ld.thundering = !ld.thundering;
+            }
+        }
+
+        if ld.rain_time <= 0 {
+            if ld.raining {
+                ld.rain_time = rng.next_i32_bound(12000) + 12000;
+            } else {
+                ld.rain_time = rng.next_i32_bound(168_000) + 12000;
+            }
+        } else {
+            ld.rain_time -= 1;
+            if ld.rain_time <= 0 {
+                ld.raining = !ld.raining;
+            }
+        }
+
+        let new_raining = ld.raining;
+        drop(ld);
+        self.tick_random = rng;
+        if new_raining != was_raining {
+            Some(new_raining)
+        } else {
+            None
+        }
+    }
+
+    /// Java `World.y()` (`World.java:1852-1868`): clear rain and thunder (e.g. when waking from beds).
+    /// Returns true if it was raining before clearing.
+    pub fn reset_weather(&mut self) -> bool {
+        let mut ld = self.level_data.borrow_mut();
+        let was_raining = ld.raining;
+        ld.rain_time = 0;
+        ld.raining = false;
+        ld.thunder_time = 0;
+        ld.thundering = false;
+        was_raining
+    }
+
+    /// Java `EntityWeatherStorm` constructor block ignition (`EntityWeatherStorm.java:41-73`).
+    pub fn strike_lightning_at(&mut self, x: i32, y: i32, z: i32) {
+        let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+        if self.chunks_area_loaded(x - 10, y - 10, z - 10, x + 10, y + 10, z + 10) {
+            if (1..128).contains(&y)
+                && self.get_block(x, y, z) == blocks::AIR
+                && (self.is_solid_normal_at(x, y - 1, z) || self.has_flammable_neighbor(x, y, z))
+            {
+                self.java_set_type_id(x, y, z, blocks::FIRE);
+            }
+            for _ in 0..4 {
+                let fx = x + rng.next_i32_bound(3) - 1;
+                let fy = y + rng.next_i32_bound(3) - 1;
+                let fz = z + rng.next_i32_bound(3) - 1;
+                if (1..128).contains(&fy)
+                    && self.get_block(fx, fy, fz) == blocks::AIR
+                    && (self.is_solid_normal_at(fx, fy - 1, fz)
+                        || self.has_flammable_neighbor(fx, fy, fz))
+                {
+                    self.java_set_type_id(fx, fy, fz, blocks::FIRE);
+                }
+            }
+        }
+        self.tick_random = rng;
+        self.world_events
+            .push(WorldEvent::LightningStrike { x, y, z });
+    }
+
+    /// Java `BlockCrops.h(World, i, j, k)` (`BlockCrops.java:40-79`).
+    pub fn crop_growth_rate(&self, x: i32, y: i32, z: i32) -> f32 {
+        let mut f = 1.0f32;
+        let id = blocks::CROPS;
+        let n = self.get_block(x, y, z - 1);
+        let s = self.get_block(x, y, z + 1);
+        let w = self.get_block(x - 1, y, z);
+        let e = self.get_block(x + 1, y, z);
+        let nw = self.get_block(x - 1, y, z - 1);
+        let ne = self.get_block(x + 1, y, z - 1);
+        let se = self.get_block(x + 1, y, z + 1);
+        let sw = self.get_block(x - 1, y, z + 1);
+        let flag = w == id || e == id;
+        let flag1 = n == id || s == id;
+        let flag2 = nw == id || ne == id || se == id || sw == id;
+
+        for lx in (x - 1)..=(x + 1) {
+            for lz in (z - 1)..=(z + 1) {
+                let soil = self.get_block(lx, y - 1, lz);
+                let mut f1 = 0.0f32;
+                if soil == blocks::FARMLAND {
+                    f1 = 1.0;
+                    if self.get_data(lx, y - 1, lz) > 0 {
+                        f1 = 3.0;
+                    }
+                }
+                if lx != x || lz != z {
+                    f1 /= 4.0;
+                }
+                f += f1;
+            }
+        }
+        if flag2 || (flag && flag1) {
+            f /= 2.0;
+        }
+        f
+    }
+
+    /// Java `BlockSoil.b(World, i, j, k, Entity)` (`BlockSoil.java:53-71`): 1/4 chance to trample farmland into dirt.
+    pub fn trample_farmland(&mut self, x: i32, y: i32, z: i32) {
+        if (0..128).contains(&y) && self.get_block(x, y, z) == blocks::FARMLAND {
+            let roll = self.tick_random.next_i32_bound(4);
+            if roll == 0 {
+                self.java_set_type_id(x, y, z, blocks::DIRT);
+            }
+        }
+    }
+
+    /// Java `BlockPortal.a_(World, i, j, k)` (`BlockPortal.java:44-118`): validate 4x5 obsidian frame and fill 2x3 with PORTAL.
+    pub fn try_create_portal(&mut self, mut x: i32, y: i32, mut z: i32) -> bool {
+        let mut b0 = 0i32;
+        let mut b1 = 0i32;
+        if self.get_block(x - 1, y, z) == blocks::OBSIDIAN
+            || self.get_block(x + 1, y, z) == blocks::OBSIDIAN
+        {
+            b0 = 1;
+        }
+        if self.get_block(x, y, z - 1) == blocks::OBSIDIAN
+            || self.get_block(x, y, z + 1) == blocks::OBSIDIAN
+        {
+            b1 = 1;
+        }
+        if b0 == b1 {
+            return false;
+        }
+        if self.get_block(x - b0, y, z - b1) == blocks::AIR {
+            x -= b0;
+            z -= b1;
+        }
+        for l in -1..=2 {
+            for i1 in -1..=3 {
+                let is_frame = l == -1 || l == 2 || i1 == -1 || i1 == 3;
+                if (l != -1 && l != 2) || (i1 != -1 && i1 != 3) {
+                    let ny = y + i1;
+                    if !(0..128).contains(&ny) {
+                        return false;
+                    }
+                    let id = self.get_block(x + b0 * l, ny, z + b1 * l);
+                    if is_frame {
+                        if id != blocks::OBSIDIAN {
+                            return false;
+                        }
+                    } else if id != blocks::AIR && id != blocks::FIRE {
+                        return false;
+                    }
+                }
+            }
+        }
+        let prev_suppress = self.suppress_physics;
+        self.suppress_physics = true;
+        for l in 0..2 {
+            for i1 in 0..3 {
+                self.java_set_type_id(x + b0 * l, y + i1, z + b1 * l, blocks::PORTAL);
+            }
+        }
+        self.suppress_physics = prev_suppress;
+        true
+    }
+
+    /// Java `BlockPortal.doPhysics(World, i, j, k, l)` (`BlockPortal.java:120-157`).
+    pub fn do_physics_portal(&mut self, x: i32, y: i32, z: i32) {
+        let mut b0 = 0i32;
+        let mut b1 = 1i32;
+        if self.get_block(x - 1, y, z) == blocks::PORTAL
+            || self.get_block(x + 1, y, z) == blocks::PORTAL
+        {
+            b0 = 1;
+            b1 = 0;
+        }
+        let mut bottom_y = y;
+        while bottom_y > 0 && self.get_block(x, bottom_y - 1, z) == blocks::PORTAL {
+            bottom_y -= 1;
+        }
+        if bottom_y == 0 || self.get_block(x, bottom_y - 1, z) != blocks::OBSIDIAN {
+            self.java_set_type_id(x, y, z, blocks::AIR);
+            return;
+        }
+        let mut height = 1i32;
+        while height < 4
+            && bottom_y + height < 128
+            && self.get_block(x, bottom_y + height, z) == blocks::PORTAL
+        {
+            height += 1;
+        }
+        if height != 3
+            || bottom_y + 3 >= 128
+            || self.get_block(x, bottom_y + 3, z) != blocks::OBSIDIAN
+        {
+            self.java_set_type_id(x, y, z, blocks::AIR);
+            return;
+        }
+        let adj_x = self.get_block(x - 1, y, z) == blocks::PORTAL
+            || self.get_block(x + 1, y, z) == blocks::PORTAL;
+        let adj_z = self.get_block(x, y, z - 1) == blocks::PORTAL
+            || self.get_block(x, y, z + 1) == blocks::PORTAL;
+        if adj_x && adj_z {
+            self.java_set_type_id(x, y, z, blocks::AIR);
+            return;
+        }
+        let valid_side_1 = self.get_block(x + b0, y, z + b1) == blocks::OBSIDIAN
+            && self.get_block(x - b0, y, z - b1) == blocks::PORTAL;
+        let valid_side_2 = self.get_block(x - b0, y, z - b1) == blocks::OBSIDIAN
+            && self.get_block(x + b0, y, z + b1) == blocks::PORTAL;
+        if !valid_side_1 && !valid_side_2 {
+            self.java_set_type_id(x, y, z, blocks::AIR);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1728,6 +2028,65 @@ impl World {
         for pos in active_chunks {
             let base_x = pos.x * 16;
             let base_z = pos.z * 16;
+
+            // 1. Thunderstorm lightning strike (1/100000 per chunk per tick, World.java:1927-1937)
+            if rng.next_i32_bound(100_000) == 0 && self.is_raining() && self.is_thundering() {
+                lcg = lcg.wrapping_mul(3).wrapping_add(1_013_904_223);
+                let k = lcg >> 2;
+                let wx = base_x + (k & 15);
+                let wz = base_z + ((k >> 8) & 15);
+                let wy = self.top_solid_or_liquid_block(wx, wz);
+                if self.is_being_rained_on(wx, wy, wz) {
+                    self.tick_random = rng;
+                    self.strike_lightning_at(wx, wy, wz);
+                    rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+                }
+            }
+
+            // 2. Snow & ice formation in cold biomes (1/16 per chunk per tick, World.java:1941-1976)
+            if rng.next_i32_bound(16) == 0 {
+                lcg = lcg.wrapping_mul(3).wrapping_add(1_013_904_223);
+                let k = lcg >> 2;
+                let lx = k & 15;
+                let lz = (k >> 8) & 15;
+                let wx = base_x + lx;
+                let wz = base_z + lz;
+                let wy = self.top_solid_or_liquid_block(wx, wz);
+                if (0..128).contains(&wy) {
+                    let mut mgr = crate::world::biome::WorldChunkManager::new(self.seed());
+                    if mgr.biome_at(wx, wz).can_spawn_snow()
+                        && self.java_get_saved_light(
+                            crate::world::lighting::LightType::Block,
+                            wx,
+                            wy,
+                            wz,
+                        ) < 10
+                    {
+                        let below = if wy > 0 {
+                            self.get_block(wx, wy - 1, wz)
+                        } else {
+                            0
+                        };
+                        let at = self.get_block(wx, wy, wz);
+                        if self.is_raining()
+                            && at == blocks::AIR
+                            && below != blocks::AIR
+                            && below != blocks::ICE
+                            && blocks::is_opaque_cube(below)
+                            && blocks::material(below).blocks_movement()
+                        {
+                            self.java_set_type_id(wx, wy, wz, blocks::SNOW);
+                        }
+                        if wy > 0
+                            && below == blocks::STATIONARY_WATER
+                            && self.get_data(wx, wy - 1, wz) == 0
+                        {
+                            self.java_set_type_id(wx, wy - 1, wz, blocks::ICE);
+                        }
+                    }
+                }
+            }
+
             for _ in 0..80 {
                 lcg = lcg.wrapping_mul(3).wrapping_add(1_013_904_223);
                 let k = lcg >> 2;
@@ -1771,8 +2130,12 @@ impl World {
                     blocks::CROPS => {
                         if y < 127 && self.light_at(wx, y + 1, wz) >= 9 {
                             let meta = self.get_data(wx, y, wz);
-                            if meta < 7 && rng.next_i32_bound(10) == 0 {
-                                self.java_set_data(wx, y, wz, meta + 1);
+                            if meta < 7 {
+                                let rate = self.crop_growth_rate(wx, y, wz);
+                                let bound = ((100.0f32 / rate) as i32).max(1);
+                                if rng.next_i32_bound(bound) == 0 {
+                                    self.java_set_data(wx, y, wz, meta + 1);
+                                }
                             }
                         }
                     }
@@ -1808,27 +2171,98 @@ impl World {
                         }
                     }
                     blocks::FARMLAND => {
-                        // Hydrate if water within 4x1x4, else dry out and revert if no crops above
-                        let mut has_water = false;
-                        'water: for dx in -4..=4 {
-                            for dy in 0..=1 {
-                                for dz in -4..=4 {
-                                    if blocks::is_water(self.get_block(wx + dx, y + dy, wz + dz)) {
-                                        has_water = true;
-                                        break 'water;
+                        // BlockSoil.a: 1/5 chance to check hydration / rain
+                        if rng.next_i32_bound(5) == 0 {
+                            let mut has_water = false;
+                            'water: for dx in -4..=4 {
+                                for dy in 0..=1 {
+                                    for dz in -4..=4 {
+                                        if blocks::is_water(self.get_block(
+                                            wx + dx,
+                                            y + dy,
+                                            wz + dz,
+                                        )) {
+                                            has_water = true;
+                                            break 'water;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        let meta = self.get_data(wx, y, wz);
-                        if has_water {
-                            if meta < 7 {
+                            let rained_on = self.is_being_rained_on(wx, y + 1, wz);
+                            if !has_water && !rained_on {
+                                let meta = self.get_data(wx, y, wz);
+                                if meta > 0 {
+                                    self.java_set_data(wx, y, wz, meta - 1);
+                                } else if self.get_block(wx, y + 1, wz) != blocks::CROPS {
+                                    self.java_set_type_id(wx, y, wz, blocks::DIRT);
+                                }
+                            } else {
                                 self.java_set_data(wx, y, wz, 7);
                             }
-                        } else if meta > 0 {
-                            self.java_set_data(wx, y, wz, meta - 1);
-                        } else if self.get_block(wx, y + 1, wz) != blocks::CROPS {
-                            self.java_set_type_id(wx, y, wz, blocks::DIRT);
+                        }
+                    }
+                    blocks::STATIONARY_LAVA => {
+                        // BlockStationary.a (BlockStationary.java:34-76): ignite nearby burnable blocks
+                        let count = rng.next_i32_bound(3);
+                        let mut tx = wx;
+                        let mut ty = y;
+                        let mut tz = wz;
+                        for _ in 0..count {
+                            tx += rng.next_i32_bound(3) - 1;
+                            ty += 1;
+                            tz += rng.next_i32_bound(3) - 1;
+                            if !(0..128).contains(&ty) {
+                                break;
+                            }
+                            let tid = self.get_block(tx, ty, tz);
+                            if tid == blocks::AIR {
+                                let near_burnable =
+                                    blocks::material(self.get_block(tx - 1, ty, tz)).is_burnable()
+                                        || blocks::material(self.get_block(tx + 1, ty, tz))
+                                            .is_burnable()
+                                        || blocks::material(self.get_block(tx, ty, tz - 1))
+                                            .is_burnable()
+                                        || blocks::material(self.get_block(tx, ty, tz + 1))
+                                            .is_burnable()
+                                        || blocks::material(self.get_block(tx, ty - 1, tz))
+                                            .is_burnable()
+                                        || blocks::material(self.get_block(tx, ty + 1, tz))
+                                            .is_burnable();
+                                if near_burnable {
+                                    self.java_set_type_id(tx, ty, tz, blocks::FIRE);
+                                    break;
+                                }
+                            } else if blocks::material(tid).blocks_movement() {
+                                break;
+                            }
+                        }
+                    }
+                    blocks::BROWN_MUSHROOM | blocks::RED_MUSHROOM => {
+                        // BlockMushroom.a (BlockMushroom.java:17-51)
+                        if y > 0
+                            && (self.light_at(wx, y, wz) >= 13
+                                || !blocks::is_opaque_cube(self.get_block(wx, y - 1, wz)))
+                        {
+                            self.world_events.push(WorldEvent::DropItem {
+                                x: wx as f64,
+                                y: y as f64,
+                                z: wz as f64,
+                                item: ItemStack::new(block_id as i16, 1, 0),
+                            });
+                            self.java_set_type_id(wx, y, wz, blocks::AIR);
+                        } else if rng.next_i32_bound(100) == 0 {
+                            let tx = wx + rng.next_i32_bound(3) - 1;
+                            let ty = y + rng.next_i32_bound(2) - rng.next_i32_bound(2);
+                            let tz = wz + rng.next_i32_bound(3) - 1;
+                            if (1..128).contains(&ty)
+                                && self.get_block(tx, ty, tz) == blocks::AIR
+                                && self.light_at(tx, ty, tz) < 13
+                                && blocks::is_opaque_cube(self.get_block(tx, ty - 1, tz))
+                            {
+                                let _ = rng.next_i32_bound(3);
+                                let _ = rng.next_i32_bound(3);
+                                self.java_set_type_id(tx, ty, tz, block_id);
+                            }
                         }
                     }
                     blocks::SNOW => {
@@ -1839,6 +2273,31 @@ impl World {
                             wz,
                         );
                         if block_light > 11 {
+                            self.world_events.push(WorldEvent::DropItem {
+                                x: wx as f64,
+                                y: y as f64,
+                                z: wz as f64,
+                                item: ItemStack::new(crate::gameplay::items::SNOW_BALL, 1, 0),
+                            });
+                            self.java_set_type_id(wx, y, wz, blocks::AIR);
+                        }
+                    }
+                    blocks::SNOW_BLOCK => {
+                        let block_light = self.java_get_saved_light(
+                            crate::world::lighting::LightType::Block,
+                            wx,
+                            y,
+                            wz,
+                        );
+                        if block_light > 11 {
+                            for _ in 0..4 {
+                                self.world_events.push(WorldEvent::DropItem {
+                                    x: wx as f64,
+                                    y: y as f64,
+                                    z: wz as f64,
+                                    item: ItemStack::new(crate::gameplay::items::SNOW_BALL, 1, 0),
+                                });
+                            }
                             self.java_set_type_id(wx, y, wz, blocks::AIR);
                         }
                     }
@@ -1864,34 +2323,75 @@ impl World {
                     blocks::LEAVES => {
                         let meta = self.get_data(wx, y, wz);
                         if (meta & 8) != 0 {
-                            // Check if any LOG is within 4 blocks
-                            let mut near_log = false;
-                            'log_scan: for dx in -4..=4 {
-                                for dy in -4..=4 {
-                                    for dz in -4..=4 {
-                                        if self.get_block(wx + dx, y + dy, wz + dz) == blocks::LOG {
-                                            near_log = true;
-                                            break 'log_scan;
+                            // Exact 4-step 3D Manhattan BFS (`BlockLeaves.java:39-131`)
+                            if self.chunks_area_loaded(wx - 5, y - 5, wz - 5, wx + 5, y + 5, wz + 5)
+                            {
+                                let mut grid = [-1i8; 13 * 13 * 13];
+                                for dx in -4..=4i32 {
+                                    for dy in -4..=4i32 {
+                                        for dz in -4..=4i32 {
+                                            let id = self.get_block(wx + dx, y + dy, wz + dz);
+                                            let idx = ((dx + 6) * 169 + (dy + 6) * 13 + (dz + 6))
+                                                as usize;
+                                            if id == blocks::LOG {
+                                                grid[idx] = 0;
+                                            } else if id == blocks::LEAVES {
+                                                grid[idx] = -2;
+                                            } else {
+                                                grid[idx] = -1;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if near_log {
-                                self.java_set_raw_data(wx, y, wz, meta & !8);
-                            } else {
-                                if rng.next_i32_bound(20) == 0 {
-                                    self.world_events.push(WorldEvent::DropItem {
-                                        x: wx as f64,
-                                        y: y as f64,
-                                        z: wz as f64,
-                                        item: ItemStack::new(
-                                            blocks::SAPLING as i16,
-                                            1,
-                                            (meta & 3) as i16,
-                                        ),
-                                    });
+                                for step in 1..=4i8 {
+                                    for dx in -4..=4i32 {
+                                        for dy in -4..=4i32 {
+                                            for dz in -4..=4i32 {
+                                                let idx =
+                                                    ((dx + 6) * 169 + (dy + 6) * 13 + (dz + 6))
+                                                        as usize;
+                                                if grid[idx] == step - 1 {
+                                                    for (nx, ny, nz) in [
+                                                        (dx - 1, dy, dz),
+                                                        (dx + 1, dy, dz),
+                                                        (dx, dy - 1, dz),
+                                                        (dx, dy + 1, dz),
+                                                        (dx, dy, dz - 1),
+                                                        (dx, dy, dz + 1),
+                                                    ] {
+                                                        let n_idx = ((nx + 6) * 169
+                                                            + (ny + 6) * 13
+                                                            + (nz + 6))
+                                                            as usize;
+                                                        if grid[n_idx] == -2 {
+                                                            grid[n_idx] = step;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                                self.java_set_type_id(wx, y, wz, blocks::AIR);
+                                let center_val = grid[6 * 169 + 6 * 13 + 6];
+                                if center_val >= 0 {
+                                    self.java_set_raw_data(wx, y, wz, meta & !8);
+                                } else {
+                                    if rng.next_i32_bound(20) == 0 {
+                                        self.world_events.push(WorldEvent::DropItem {
+                                            x: wx as f64,
+                                            y: y as f64,
+                                            z: wz as f64,
+                                            item: ItemStack::new(
+                                                blocks::SAPLING as i16,
+                                                1,
+                                                (meta & 3) as i16,
+                                            ),
+                                        });
+                                    }
+                                    self.java_set_type_id(wx, y, wz, blocks::AIR);
+                                }
+                            } else {
+                                self.java_set_raw_data(wx, y, wz, meta & !8);
                             }
                         }
                     }
@@ -2069,5 +2569,82 @@ mod tests {
             }
         }
         assert!(changed, "Fire should eventually burn adjacent wood planks");
+    }
+
+    #[test]
+    fn nether_portal_frame_ignition_and_breaking() {
+        let mut world = make_flat_world();
+        // Build a 4x5 Obsidian frame along X: x = 0..=3, y = 64..=68, z = 0
+        for dx in 0..=3 {
+            for dy in 0..=4 {
+                if dx == 0 || dx == 3 || dy == 0 || dy == 4 {
+                    world.java_set_type_id(dx, 64 + dy, 0, blocks::OBSIDIAN);
+                }
+            }
+        }
+        // Light fire inside at (1, 65, 0) -> should fill 2x3 interior (x=1..=2, y=65..=67) with PORTAL (90)
+        world.java_set_type_id(1, 65, 0, blocks::FIRE);
+        for dx in 1..=2 {
+            for dy in 1..=3 {
+                assert_eq!(
+                    world.get_block(dx, 64 + dy, 0),
+                    blocks::PORTAL,
+                    "Interior ({dx}, {}, 0) should be PORTAL",
+                    64 + dy
+                );
+            }
+        }
+
+        // Break one obsidian frame block at (0, 65, 0) -> entire 2x3 portal must shatter to AIR!
+        world.java_set_type_id(0, 65, 0, blocks::AIR);
+        for dx in 1..=2 {
+            for dy in 1..=3 {
+                assert_eq!(
+                    world.get_block(dx, 64 + dy, 0),
+                    blocks::AIR,
+                    "Portal block ({dx}, {}, 0) should break when frame is broken",
+                    64 + dy
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crop_growth_rate_hydration_and_diagonal_penalty() {
+        let mut world = make_flat_world();
+        // Dry farmland at (5, 63, 5) with crops at (5, 64, 5)
+        world.java_set_type_id_and_data(5, 63, 5, blocks::FARMLAND, 0);
+        world.java_set_type_id(5, 64, 5, blocks::CROPS);
+        let dry_rate = world.crop_growth_rate(5, 64, 5);
+        assert!((dry_rate - 2.0).abs() < 1e-4);
+
+        // Hydrated farmland at (5, 63, 5) (meta = 7) -> +3.0 instead of +1.0 -> rate = 4.0
+        world.java_set_data(5, 63, 5, 7);
+        let wet_rate = world.crop_growth_rate(5, 64, 5);
+        assert!((wet_rate - 4.0).abs() < 1e-4);
+
+        // Diagonal crop at (6, 64, 6) halves the growth rate (`flag2 == true` -> 4.0 / 2.0 = 2.0)
+        world.java_set_type_id(6, 64, 6, blocks::CROPS);
+        let diag_rate = world.crop_growth_rate(5, 64, 5);
+        assert!((diag_rate - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn weather_cycle_and_reset() {
+        let mut world = make_flat_world();
+        {
+            let mut ld = world.level_data.borrow_mut();
+            ld.raining = false;
+            ld.rain_time = 1;
+            ld.thundering = false;
+            ld.thunder_time = 1;
+        }
+        assert_eq!(world.tick_weather(), Some(true));
+        assert!(world.is_raining());
+        assert!(world.is_thundering());
+
+        assert!(world.reset_weather());
+        assert!(!world.is_raining());
+        assert!(!world.is_thundering());
     }
 }

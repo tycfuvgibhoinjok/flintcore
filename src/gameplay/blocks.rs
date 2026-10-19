@@ -184,6 +184,35 @@ impl Material {
             Self::Stone | Self::Ore | Self::SnowLayer | Self::SnowBlock | Self::Web
         )
     }
+
+    pub fn blocks_movement(self) -> bool {
+        self.is_solid() && !matches!(self, Self::Web)
+    }
+
+    /// Java `Material.C.q` (`MaterialMapColor` index `0..=13`).
+    pub fn map_color_index(self) -> u8 {
+        match self {
+            Self::Air
+            | Self::Orientable
+            | Self::Shatterable
+            | Self::Portal
+            | Self::Piston
+            | Self::Cake => 0,
+            Self::Grass => 1,
+            Self::Sand => 2,
+            Self::Cloth | Self::Sponge | Self::Web => 3,
+            Self::Lava | Self::Tnt | Self::Fire => 4,
+            Self::Ice => 5,
+            Self::Ore => 6,
+            Self::Plant | Self::Leaves | Self::Cactus | Self::Pumpkin | Self::Coral => 7,
+            Self::SnowLayer | Self::SnowBlock => 8,
+            Self::Clay => 9,
+            Self::Earth => 10,
+            Self::Stone => 11,
+            Self::Water => 12,
+            Self::Wood => 13,
+        }
+    }
 }
 
 pub fn material(id: u8) -> Material {
@@ -285,6 +314,7 @@ pub fn ticks_randomly(id: u8) -> bool {
             | SAPLING
             | WATER
             | LAVA
+            | STATIONARY_LAVA
             | LEAVES
             | TALL_GRASS
             | DEAD_BUSH

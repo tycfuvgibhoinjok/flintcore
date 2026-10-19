@@ -80,6 +80,20 @@ impl Biome {
         }
     }
 
+    /// Java `BiomeBase.c()` — whether snow and ice form in this biome.
+    pub fn can_spawn_snow(self) -> bool {
+        matches!(self, Biome::Taiga | Biome::IceDesert | Biome::Tundra)
+    }
+
+    /// Java `BiomeBase.d()` — whether liquid rain falls in this biome.
+    pub fn can_rain(self) -> bool {
+        !self.can_spawn_snow()
+            && !matches!(
+                self,
+                Biome::Desert | Biome::IceDesert | Biome::Hell | Biome::Sky
+            )
+    }
+
     pub fn tree_kind(self, random: &mut JavaRandom) -> TreeKind {
         match self {
             Biome::Rainforest => {

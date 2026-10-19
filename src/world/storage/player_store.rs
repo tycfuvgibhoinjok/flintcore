@@ -55,6 +55,22 @@ impl PlayerStore {
             player.health = health.clamp(0, 20);
         }
 
+        if let Some(air) = root.get_i16("Air") {
+            player.air_ticks = air;
+        }
+
+        if let Some(fire) = root.get_i16("Fire") {
+            player.fire_ticks = fire;
+        }
+
+        if let (Some(sx), Some(sy), Some(sz)) = (
+            root.get_i32("SpawnX"),
+            root.get_i32("SpawnY"),
+            root.get_i32("SpawnZ"),
+        ) {
+            player.spawn_bed = Some((sx, sy, sz));
+        }
+
         if let Some(on_ground) = root.get_i8("OnGround") {
             player.on_ground = on_ground != 0;
         }
@@ -107,13 +123,18 @@ impl PlayerStore {
         );
         root.insert("FallDistance", NbtTag::Float(player.fall_distance));
         root.insert("Fire", NbtTag::Short(player.fire_ticks));
-        root.insert("Air", NbtTag::Short(300));
+        root.insert("Air", NbtTag::Short(player.air_ticks));
         root.insert(
             "OnGround",
             NbtTag::Byte(if player.on_ground { 1 } else { 0 }),
         );
         root.insert("Dimension", NbtTag::Int(0));
         root.insert("Health", NbtTag::Short(player.health));
+        if let Some((sx, sy, sz)) = player.spawn_bed {
+            root.insert("SpawnX", NbtTag::Int(sx));
+            root.insert("SpawnY", NbtTag::Int(sy));
+            root.insert("SpawnZ", NbtTag::Int(sz));
+        }
 
         let mut inventory_list = Vec::new();
         for slot in 0..36 {
