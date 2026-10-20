@@ -251,6 +251,13 @@ fn contains_fluid_block(world: &World, aabb: &Aabb, water: bool) -> bool {
     false
 }
 
+/// Java `World.c(AxisAlignedBB)`: is there a liquid in the box?
+///
+/// The reference checks the water and the lava.
+pub fn box_has_fluid(world: &World, aabb: &Aabb) -> bool {
+    intersects_fluid(world, aabb, true) || intersects_fluid(world, aabb, false)
+}
+
 fn intersects_fluid(world: &World, aabb: &Aabb, water: bool) -> bool {
     let min_x = aabb.min_x.floor() as i32;
     let max_x = (aabb.max_x + 1.0).floor() as i32;

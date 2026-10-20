@@ -12145,6 +12145,50 @@ mod tests {
         );
     }
 
+    /// The mob does not swim up when the box it would move to holds a
+    /// liquid.
+    ///
+    /// Java `Entity.d(double, double, double)`: the method returns false
+    /// when the moved box holds a liquid (`World.c(AxisAlignedBB)`) or
+    /// when there is an entity in it, so the mob does not swim up.
+    #[test]
+    fn the_mob_does_not_swim_up_in_a_liquid() {
+        // The mob is in the water and it is blocked by a wall: the
+        // movement changes the position, so the check of the reference
+        // happens.
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        for z in -2..=2 {
+            server.world.set_block(2, 64, z, blocks::STONE);
+            server.world.set_block(2, 65, z, blocks::STONE);
+        }
+        for x in 0..=1 {
+            for z in -2..=2 {
+                server.world.set_block(x, 64, z, blocks::STATIONARY_WATER);
+                server.world.set_block(x, 63, z, blocks::STATIONARY_WATER);
+            }
+        }
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.x = 1.5;
+            mob.y = 64.0;
+            mob.z = 0.5;
+            mob.mot_x = 0.2;
+            mob.mot_y = 0.0;
+            mob.mot_z = 0.0;
+            mob.move_forward = 1.0;
+            mob.yaw = 270.0;
+        }
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(mob.in_water, "the mob is in the water");
+        // The box the mob would move to holds the water, so the mob does
+        // not swim up.
+        assert!(
+            mob.mot_y != 0.300_000_011_920_928_96,
+            "the mob does not swim up when the box holds a liquid (mot_y = {})",
+            mob.mot_y
+        );
+    }
+
     /// The mobs push each other away.
     ///
     /// Java `Entity.collide(Entity)`: the two entities push each other

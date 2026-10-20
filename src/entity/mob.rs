@@ -550,6 +550,20 @@ impl Mob {
         Aabb::for_entity(self.x, self.y, self.z, length, width, 0.0, self.step_offset)
     }
 
+    /// Java `Entity.d(double, double, double)`: the mob swims up when the
+    /// box it would move to is free.
+    ///
+    /// The method returns false when there is an entity in the box or when
+    /// the box holds a liquid (`World.c(AxisAlignedBB)`).
+    fn can_swim_up(&self, world: &World, box_: &Aabb, entity_boxes: &[Aabb]) -> bool {
+        // The entities of the box: the reference asks the world for them.
+        if entity_boxes.iter().any(|other| other.intersects(box_)) {
+            return false;
+        }
+        // The liquid of the box (`World.c(AxisAlignedBB)`).
+        !crate::entity::physics::box_has_fluid(world, box_)
+    }
+
     /// Java `EntityLiving.a(float, float)`: the movement of the mob.
     ///
     /// The acceleration and the drag depend on the ground, the water and the
@@ -714,19 +728,20 @@ impl Mob {
                 self.mot_z *= fluid_drag;
                 self.mot_y -= 0.02;
                 // The mob swims up when it is stuck
-                // (`Entity.d(double, double, double)`).
+                // (`Entity.d(double, double, double)`): the method returns
+                // false when there is an entity in the moved box or when the
+                // box holds a liquid.
                 if result.position_changed {
-                    let box_ =
-                        aabb.moved(self.mot_x, self.mot_y + 0.6 - self.y + y_before, self.mot_z);
-                    let mut scratch = Vec::new();
-                    crate::entity::physics::collect_collision_boxes(
-                        world,
-                        &box_,
-                        &[],
-                        &mut scratch,
+                    // The reference uses the position of the mob after the
+                    // movement (`this.locY`) and the position before it
+                    // (`d0`).
+                    let box_ = aabb.moved(
+                        self.mot_x,
+                        self.mot_y + 0.600_000_023_841_857_9 - result.y + y_before,
+                        self.mot_z,
                     );
-                    if scratch.is_empty() {
-                        self.mot_y = 0.3;
+                    if self.can_swim_up(world, &box_, entity_boxes) {
+                        self.mot_y = 0.300_000_011_920_928_96;
                     }
                 }
             }
