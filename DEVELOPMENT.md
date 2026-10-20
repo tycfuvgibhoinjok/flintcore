@@ -346,6 +346,25 @@ Mob movement parity harness:
     random of the world, and the order of a hash table of Rust is random
     for every process, so the same world and the same seed gave different
     worlds from one run to the next.
+  - The mobs push each other away at the end of their update
+    (`Entity.collide`): the distance is the biggest of the absolute
+    differences (`MathHelper.a(d0, d1)` is not the Euclidean distance)
+    and the square root of it is rounded to a single precision value.
+    The players are pushed too.
+  - The mob swims up when it is stuck only when the box it would move
+    to is free of the entities and of the liquids (`Entity.d`).
+  - The mob suffocates when one of the eight probes around its head holds
+    a solid block (`Entity.K()`); the leaves, the ice, the cactus, the
+    layer of the snow and the TNT are not solid.
+  - The damage of a mob is applied only when it is not in the window of
+    the invulnerability: the packet of the status 2 and the knockback of
+    the attacker happen only then, and the two numbers of the stream are
+    the pitch and the volume of the sound of the hit or of the death.
+  - The arrow of the skeleton starts one block above the mob and flies at
+    the height of the eyes of the mob minus 0.2 (`EntitySkeleton.a`).
+  - The sound of the attack of the slime is played when the damage is
+    applied, and it draws two numbers for the pitch and the volume
+    (`EntitySlime.b`).
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.
