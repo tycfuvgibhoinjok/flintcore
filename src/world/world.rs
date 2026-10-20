@@ -122,14 +122,6 @@ macro_rules! trace_rng {
     };
 }
 
-macro_rules! trace_rng2 {
-    ($x:expr, $y:expr, $z:expr) => {
-        if trace_in($x, $y, $z) {
-            println!("RNG2 {} {} {}", $x, $y, $z);
-        }
-    };
-}
-
 macro_rules! trace_rng3 {
     ($x:expr, $y:expr, $z:expr) => {
         if trace_in($x, $y, $z) {
@@ -1782,7 +1774,8 @@ impl World {
             self.java_set_type_id(x, y, z, blocks::COBBLESTONE);
         }
         // BlockFluids.h plays the fizz sound, consuming `world.random` twice.
-        trace_rng2!(x, y, z);
+        let _ = self.world_random.next_f32();
+        let _ = self.world_random.next_f32();
     }
 
     /// BlockStationary: raw conversion to the flowing counterpart.
@@ -2662,7 +2655,8 @@ impl World {
         if target > 0 {
             if lava {
                 // BlockFluids.h fizz sound (world.random x2).
-                trace_rng2!(x, y, z);
+                let _ = self.world_random.next_f32();
+                let _ = self.world_random.next_f32();
             } else {
                 // Block.g -> dropNaturally (world.random; drops are entities).
                 trace_rng3!(x, y, z);

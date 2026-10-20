@@ -12035,6 +12035,21 @@ mod tests {
         assert_eq!(fires, 0, "the explosion does not set the fire");
     }
 
+    /// The fizz of the lava draws two numbers of the random of the world.
+    ///
+    /// Java `BlockFluids.h()`: the pitch and the volume of the sound of the
+    /// fizz are two numbers of the random of the world.
+    #[test]
+    fn the_fizz_of_the_lava_draws_two_numbers() {
+        let (mut server, _) = mob_scenario_server("flat");
+        // The lava touches the water.
+        server.world.set_block(1, 63, 0, blocks::STATIONARY_WATER);
+        let before = server.world.world_random.draws;
+        server.world.set_block(0, 63, 0, blocks::STATIONARY_LAVA);
+        // The fizz of the lava draws two numbers.
+        assert_eq!(server.world.world_random.draws - before, 2);
+    }
+
     /// The giant has two hundred points of health.
     ///
     /// Java `EntityGiantZombie`: the health of the monster is ten times
@@ -12562,6 +12577,49 @@ mod tests {
             .entities
             .insert_player(1, "Tester".to_string(), 0.0, 64.0, 0.0);
         server
+    }
+
+    /// The spawn of the mobs does not depend on the run of the server.
+    ///
+    /// The sets of the chunks of the spawn and of the random ticks are
+    /// iterated in the order of the hash table of Rust, and the hash table
+    /// is seeded randomly for every process: the same world and the same
+    /// seed gave different worlds from one run to the next.
+    #[test]
+    fn the_spawn_of_the_mobs_is_the_same_in_every_run() {
+        let mut spawning = crate::config::SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        for name in [
+            "zombie", "skeleton", "creeper", "slime", "sheep", "chicken", "cow", "wolf", "squid",
+            "spider",
+        ] {
+            spawning.mobs.get_mut(name).unwrap().enabled = false;
+        }
+        let mut server = spawn_test_server(spawning.clone());
+        for _ in 0..50 {
+            server.tick_mob_spawner();
+        }
+        let first: Vec<_> = server
+            .entities
+            .iter_mobs()
+            .map(|m| (m.mob_type, m.x.to_bits(), m.y.to_bits(), m.z.to_bits()))
+            .collect();
+        assert!(!first.is_empty(), "the mobs spawn");
+
+        // A second server with the same seed spawns the same mobs at the
+        // same places.
+        let mut server = spawn_test_server(spawning);
+        for _ in 0..50 {
+            server.tick_mob_spawner();
+        }
+        let second: Vec<_> = server
+            .entities
+            .iter_mobs()
+            .map(|m| (m.mob_type, m.x.to_bits(), m.y.to_bits(), m.z.to_bits()))
+            .collect();
+        assert_eq!(first, second);
     }
 
     /// The natural spawn of a mob draws the yaw of the mob from the random

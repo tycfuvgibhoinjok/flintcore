@@ -1,7 +1,7 @@
 //! 1:1 port of all 14 Minecraft Beta 1.7.3 Animals & Mobs, `DataWatcher` metadata,
 //! `Pathfinder` navigation, and `SpawnerCreature` natural spawning from `.references/Project-Poseidon`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::config::{MobSpawnSettings, SpawningConfig};
 use crate::entity::physics::{move_entity, Aabb};
@@ -1717,7 +1717,10 @@ pub fn evaluate_natural_spawns(
         return Vec::new();
     }
 
-    let mut candidate_chunks = HashSet::new();
+    // The set is sorted: the order of the chunks decides the draws of the
+    // random of the world, and the order of a hash table of Rust is random
+    // for every process.
+    let mut candidate_chunks = BTreeSet::new();
     let radius = spawning.spawn_radius_chunks.clamp(0, 32);
     for &(px, _, pz) in player_positions {
         let pcx = (px.floor() as i32) >> 4;

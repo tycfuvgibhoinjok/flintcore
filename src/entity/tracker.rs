@@ -1298,8 +1298,12 @@ impl EntityTracker {
         let dy = new_y - entry.encoded_y;
         let dz = new_z - entry.encoded_z;
 
-        let dyaw = (new_yaw.wrapping_sub(entry.encoded_yaw)) as i8;
-        let dpitch = (new_pitch.wrapping_sub(entry.encoded_pitch)) as i8;
+        // The difference of the angles is a byte (the packet carries a
+        // byte), but the absolute value is taken on an `i32`: Java promotes
+        // the byte of the difference to an `int` before `Math.abs`, so the
+        // value `-128` has an absolute value of `128` and not an overflow.
+        let dyaw = i32::from((new_yaw.wrapping_sub(entry.encoded_yaw)) as i8);
+        let dpitch = i32::from((new_pitch.wrapping_sub(entry.encoded_pitch)) as i8);
 
         let pos_changed = dx != 0 || dy != 0 || dz != 0;
         let rot_changed = if pos_changed {
@@ -1570,6 +1574,34 @@ mod tests {
             p2_moves_to_p1[0].packet,
             Clientbound::RelEntityMove(_)
         ));
+    }
+
+    /// The difference of the angles of a half turn does not overflow.
+    ///
+    /// Java `Math.abs` promotes the byte of the difference to an `int`
+    /// before taking the absolute value, so the value `-128` has an
+    /// absolute value of `128`. The port of the `i8::abs` panicked with
+    /// "attempt to negate with overflow" when a mob turned by a half turn.
+    #[test]
+    fn the_difference_of_the_angles_of_a_half_turn_does_not_overflow() {
+        let mut tracker = EntityTracker::new(10);
+        let p1 = Player::new(1, 1, "Player1".to_string(), 0.0, 64.0, 0.0);
+        let mut p2 = Player::new(2, 2, "Player2".to_string(), 10.0, 64.0, 0.0);
+
+        tracker.track_player(&p1);
+        tracker.track_player(&p2);
+
+        let mut players = vec![p1.clone(), p2.clone()];
+        let _ = tracker.tick(&mut players);
+
+        // The yaw of the second player turns by a half turn: the encoded
+        // angle goes from 0 to 128, the difference of the bytes is -128.
+        p2.yaw = 180.0;
+        let mut players2 = vec![p1, p2];
+        let packets = tracker.tick(&mut players2);
+        let to_p1: Vec<_> = packets.iter().filter(|p| p.recipient_id == 1).collect();
+        assert_eq!(to_p1.len(), 1);
+        assert!(matches!(to_p1[0].packet, Clientbound::EntityLook(_)));
     }
 
     #[test]
