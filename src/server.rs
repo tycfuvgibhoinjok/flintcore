@@ -8329,7 +8329,9 @@ impl Server {
         source_mob: Option<i32>,
     ) {
         let mut destroyed_blocks = HashSet::new();
-        let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
+        // The explosion draws from the random of the world (`Explosion.a()`
+        // uses `world.random`).
+        let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
         let step_size = if self.config.mechanics.optimized_explosions {
             2
         } else {
@@ -8471,7 +8473,28 @@ impl Server {
             }
         }
 
-        // Apply block destruction and 30% drop rate
+        // The fire of the explosion (`Explosion.a()`): the reference sets it
+        // before the destruction of the blocks and with the random of the
+        // explosion itself (`new Random()`), not with the random of the
+        // world.
+        if set_fire {
+            let mut fire_rng = JavaRandom::new(Self::explosion_fire_seed(&self.world, ex, ey, ez));
+            let block_list: Vec<(i32, i32, i32)> = destroyed_blocks.iter().copied().collect();
+            for &(bx, by, bz) in block_list.iter().rev() {
+                // The block has to be air and the block below it has to be
+                // flammable (`Block.o[]`).
+                if self.world.get_block(bx, by, bz) == blocks::AIR
+                    && self.world.get_block(bx, by - 1, bz) != blocks::AIR
+                    && fire_rng.next_i32_bound(3) == 0
+                {
+                    self.world.java_set_type_id(bx, by, bz, blocks::FIRE);
+                }
+            }
+        }
+
+        // The destruction of the blocks (`Explosion.a(double, double, double,
+        // float, boolean)`): the particles of the explosion and the drops of
+        // the blocks.
         // Java `Packet60Explosion.java:36-38, 55-57` uses `(int) this.a` (truncation toward zero), NOT floor!
         let mut records = Vec::with_capacity(destroyed_blocks.len());
         let base_x = ex as i32;
@@ -8481,24 +8504,40 @@ impl Server {
         let mut chain_tnts = Vec::new();
 
         for &(bx, by, bz) in &destroyed_blocks {
+            // The particles of the explosion: the position of the particle
+            // and the spread of its speed are five numbers of the random of
+            // the world.
+            let _ = rng.next_f32();
+            let _ = rng.next_f32();
+            let _ = rng.next_f32();
+            let _ = rng.next_f32();
+            let _ = rng.next_f32();
             let id = self.world.get_block(bx, by, bz);
             let meta = self.world.get_data(bx, by, bz);
             if id != blocks::AIR {
                 if id == blocks::TNT {
                     chain_tnts.push((bx, by, bz));
-                } else if rng.next_f32() <= 0.3 {
-                    for item in blocks::get_block_drops(id, meta, &mut rng, None) {
-                        drops_to_spawn.push((bx as f64, by as f64, bz as f64, item));
+                } else {
+                    // The drops of the block (`Block.dropNaturally`): the
+                    // number of the drops is drawn, then the yield of the
+                    // explosion (one, so the block always drops) and then
+                    // the item itself.
+                    let count = blocks::drop_count(id, &mut rng);
+                    for _ in 0..count {
+                        if rng.next_f32() < 1.0 {
+                            let item_id = blocks::drop_item_id(id, meta, &mut rng);
+                            if item_id > 0 {
+                                drops_to_spawn.push((
+                                    bx as f64,
+                                    by as f64,
+                                    bz as f64,
+                                    ItemStack::new(item_id, 1, blocks::drop_damage(id, meta)),
+                                ));
+                            }
+                        }
                     }
                 }
                 self.world.java_set_type_id(bx, by, bz, blocks::AIR);
-            }
-            if set_fire
-                && self.world.get_block(bx, by, bz) == blocks::AIR
-                && blocks::is_opaque_cube(self.world.get_block(bx, by - 1, bz))
-                && rng.next_i32_bound(3) == 0
-            {
-                self.world.java_set_type_id(bx, by, bz, blocks::FIRE);
             }
             records.push((
                 (bx - base_x).clamp(-128, 127) as i8,
@@ -8506,7 +8545,7 @@ impl Server {
                 (bz - base_z).clamp(-128, 127) as i8,
             ));
         }
-        self.world.tick_random = rng;
+        self.world.world_random = rng;
 
         for (tx, ty, tz) in chain_tnts {
             self.world.ignite_tnt(tx, ty, tz, true);
@@ -8524,6 +8563,22 @@ impl Server {
             records,
         }));
         self.flush_dirty_chunks();
+    }
+
+    /// The seed of the random of an explosion.
+    ///
+    /// The reference creates a new random for every explosion
+    /// (`Explosion`: `new Random()`), the seed is taken from the seed of the
+    /// world and the position of the explosion so that the world stays
+    /// deterministic.
+    fn explosion_fire_seed(world: &World, x: f64, y: f64, z: f64) -> i64 {
+        let bx = (x * 8.0) as i64;
+        let by = (y * 8.0) as i64;
+        let bz = (z * 8.0) as i64;
+        (world.seed() as u64
+            ^ (bx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (by as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ (bz as u64).wrapping_mul(0x1656_67B1_9E37_79F9)) as i64
     }
 
     fn block_blast_resistance(id: u8) -> f32 {
@@ -11939,6 +11994,45 @@ mod tests {
         assert!(server.world.java_is_chunk_loaded_at(0, 64, 0));
         // The block inside the terrain is not loaded.
         assert!(!server.world.java_is_chunk_loaded_at(0, 63, 0));
+    }
+
+    /// The blocks of an explosion are always dropped.
+    ///
+    /// Java `Block.dropNaturally`: the yield of the explosion is one, so
+    /// the block always drops (`world.random.nextFloat() < 1.0F`).
+    #[test]
+    fn the_blocks_of_an_explosion_are_always_dropped() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        // A floor of stone under the explosion: the stone drops the
+        // cobblestone.
+        server.world.set_block(0, 63, 0, blocks::STONE);
+        server.world.set_block(1, 63, 0, blocks::STONE);
+        server.create_explosion_ex(0.5, 64.0, 0.5, 2.0, false, true, None);
+        // The blocks are gone and their drops are on the ground.
+        assert_eq!(server.world.get_block(0, 63, 0), blocks::AIR);
+        let drops = server
+            .entities
+            .iter_dropped_items()
+            .filter(|i| i.item.id == blocks::COBBLESTONE as i16)
+            .count();
+        assert!(drops > 0, "the blocks of the explosion are dropped");
+    }
+
+    /// The explosion of the reference does not set the fire.
+    ///
+    /// Java `Explosion.a()`: the fire is set before the destruction of the
+    /// blocks, so the block is not air yet and the fire is never set. It is
+    /// a defect of the reference, the port copies it.
+    #[test]
+    fn the_explosion_of_the_reference_does_not_set_the_fire() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.world.set_block(0, 63, 0, blocks::GRASS);
+        server.create_explosion_ex(0.5, 64.0, 0.5, 2.0, true, true, None);
+        let fires = (0..8)
+            .flat_map(|x| (0..8).map(move |z| (x, z)))
+            .filter(|&(x, z)| server.world.get_block(x, 64, z) == blocks::FIRE)
+            .count();
+        assert_eq!(fires, 0, "the explosion does not set the fire");
     }
 
     /// The giant has two hundred points of health.
