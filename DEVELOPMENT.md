@@ -318,6 +318,34 @@ Mob movement parity harness:
     (`EntityWolf`), and the giant has two hundred (`EntityGiantZombie`). The
     chicken and the ghast do not take the damage of a fall
     (`EntityChicken.a(float)` and `EntityFlying.a(float)`).
+  - The death of a mob draws the number of the items **always**
+    (`EntityLiving.q()` draws `nextInt(3)` even when the mob drops
+    nothing), and the children of a slime are created when the corpse
+    leaves the world (`EntitySlime.die()` is called by `EntityLiving.R()`),
+    not at the moment of the death. Every child draws the size and the
+    delay of its constructor and its own yaw.
+  - The natural spawn draws the yaw of the mob and the colour of a sheep
+    from the stream of the **world** (`SpawnerCreature`), not from the
+    stream of the entities. The skeleton that rides a spider inherits the
+    yaw of the spider.
+  - The explosion of the creeper drops the blocks always
+    (`Block.dropNaturally`: the yield of the explosion is one) and the
+    fire of the explosion is set **before** the destruction of the blocks
+    (`Explosion.a()`), with a random of its own. The reference checks the
+    air of the block before the destruction, so the fire never starts:
+    the port copies that behaviour.
+  - The blocks that tick randomly are the ones whose flag `Block.n[]` is
+    set (`World.java:1978-1988`). The flag is set by `Block.a(boolean)` in
+    the constructor of the block, so the table of the reference is the
+    list of the blocks whose constructor calls it. The classes of the
+    compiled reference gave the list
+    (`tools/poseidon_mobs/BlockTickTable.java` prints it), and the port
+    ticks exactly those blocks.
+  - The sets of the chunks of the natural spawn and of the random ticks
+    are **sorted**: the order of the chunks decides the draws of the
+    random of the world, and the order of a hash table of Rust is random
+    for every process, so the same world and the same seed gave different
+    worlds from one run to the next.
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.
