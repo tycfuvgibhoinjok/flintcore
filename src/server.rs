@@ -5269,6 +5269,40 @@ impl Server {
                 None => false,
             };
 
+            // The boxes of the two entities overlap on the Y axis
+            // (`EntityWolf.b`): the top of the box of the target is above
+            // the bottom of the box of the mob and the bottom of the box of
+            // the target is below the top of the box of the mob.
+            let target_box_overlaps = match attack_target {
+                Some((tid, is_player, _, ty, _)) => {
+                    let mob_box = self
+                        .entities
+                        .get_mob(mob_id)
+                        .map(|mob| mob.aabb())
+                        .unwrap_or_else(|| {
+                            crate::entity::physics::Aabb::new(
+                                mx - 0.3,
+                                my,
+                                mz - 0.3,
+                                mx + 0.3,
+                                my + 1.8,
+                                mz + 0.3,
+                            )
+                        });
+                    let target_bottom = self.target_box_bottom(tid, is_player, ty);
+                    let target_top = if is_player {
+                        target_bottom + 1.8
+                    } else {
+                        self.entities
+                            .get_mob(tid)
+                            .map(|other| other.aabb().max_y)
+                            .unwrap_or(target_bottom + 1.8)
+                    };
+                    target_bottom < mob_box.max_y && mob_box.min_y < target_top
+                }
+                None => false,
+            };
+
             // The attack of the mob (`EntityCreature.c_()`): the melee, the
             // fuse of the creeper and the bow of the skeleton. The reference
             // attacks before the path of the mob, the attack of the creeper
@@ -5373,10 +5407,30 @@ impl Server {
                                 mob.mot_z = dz / h * 0.4 + mob.mot_z * 0.2;
                                 mob.mot_y = 0.4;
                             } else if has_los
+                                && mob.mob_type == MobType::Spider
                                 && dist < 2.0
                                 && dy.abs() < 2.0
                                 && mob.attack_ticks <= 0
                             {
+                                // The spider (`EntitySpider.a`): the counter
+                                // of the attack is checked.
+                                mob.attack_ticks = 20;
+                                let dmg =
+                                    mob.mob_type.attack_damage(mob.slime_size, mob.wolf_tamed);
+                                if is_player {
+                                    melee_hits_player.push((tid, dmg, mob.x, mob.z));
+                                } else {
+                                    melee_hits_mob.push((tid, dmg, mob_id, mob.x, mob.z));
+                                }
+                            } else if has_los
+                                && mob.mob_type == MobType::Wolf
+                                && dist < 1.5
+                                && target_box_overlaps
+                            {
+                                // The wolf (`EntityWolf.b`): the distance
+                                // is less than 1.5 and the boxes of the two
+                                // entities overlap on the Y axis. There is
+                                // no check of the counter of the attack.
                                 mob.attack_ticks = 20;
                                 let dmg =
                                     mob.mob_type.attack_damage(mob.slime_size, mob.wolf_tamed);
@@ -12421,6 +12475,53 @@ mod tests {
         server.tick_mobs();
         let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
         assert_eq!(mob.hurt_ticks, 9);
+    }
+
+    /// The wolf attacks at a distance of less than one and a half blocks.
+    ///
+    /// Java `EntityWolf.b`: the wolf attacks when the distance is less
+    /// than 1.5 and the boxes of the two entities overlap on the Y axis.
+    /// The spider keeps the distance of two blocks.
+    #[test]
+    fn the_wolf_attacks_at_a_distance_of_less_than_one_and_a_half_blocks() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.mob_type = MobType::Wolf;
+            // The angry wolf looks for a player (`EntityWolf.c_()`).
+            mob.wolf_angry = true;
+        }
+        // The player is two blocks away: the wolf does not attack it.
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.x = 2.0;
+            player.y = 64.0;
+            player.z = 0.5;
+        }
+        // The first tick gives the wolf its target (the attack of the
+        // reference uses the target of the previous tick).
+        server.tick_mobs();
+        let health = server
+            .entities
+            .get_player(player_id)
+            .expect("the player is alive")
+            .health;
+        server.tick_mobs();
+        let player = server
+            .entities
+            .get_player(player_id)
+            .expect("the player is alive");
+        assert_eq!(player.health, health, "the wolf does not attack from afar");
+
+        // The player is one block away: the wolf attacks it.
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.x = 1.0;
+        }
+        server.tick_mobs();
+        let player = server
+            .entities
+            .get_player(player_id)
+            .expect("the player is alive");
+        assert!(player.health < health, "the wolf attacks from close by");
     }
 
     /// The mobs push each other away.
