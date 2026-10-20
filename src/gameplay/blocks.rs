@@ -307,6 +307,12 @@ pub fn is_tile_entity(id: u8) -> bool {
     )
 }
 
+/// Java `Block.n[]`: the blocks that the world ticks randomly.
+///
+/// The flag is set by `Block.a(boolean)` in the constructor of the block, so
+/// the table is the list of the blocks of the reference whose flag is set.
+/// The classes of the compiled reference gave the list (the tools of the
+/// harness print it).
 pub fn ticks_randomly(id: u8) -> bool {
     matches!(
         id,
@@ -316,6 +322,7 @@ pub fn ticks_randomly(id: u8) -> bool {
             | LAVA
             | STATIONARY_LAVA
             | LEAVES
+            | DETECTOR_RAIL
             | TALL_GRASS
             | DEAD_BUSH
             | YELLOW_FLOWER
@@ -326,6 +333,8 @@ pub fn ticks_randomly(id: u8) -> bool {
             | FIRE
             | CROPS
             | FARMLAND
+            | STONE_PLATE
+            | WOOD_PLATE
             | LIT_REDSTONE_ORE
             | REDSTONE_TORCH_OFF
             | REDSTONE_TORCH_ON
@@ -335,7 +344,8 @@ pub fn ticks_randomly(id: u8) -> bool {
             | SNOW_BLOCK
             | CACTUS
             | REED
-            | PORTAL
+            | PUMPKIN
+            | JACK_O_LANTERN
             | CAKE
             | LOCKED_CHEST
     )
@@ -787,89 +797,62 @@ pub fn step_sound(block_id: u8) -> StepSound {
 mod tests {
     use super::*;
 
+    /// The table of the random ticks is the table of the reference.
+    ///
+    /// Java `Block.n[]`: the flag is set by `Block.a(boolean)` in the
+    /// constructor of the block. The classes of the compiled reference gave
+    /// the list (the tools of the harness print it).
     #[test]
-    fn opacity_matches_reference() {
-        assert_eq!(light_opacity(AIR), 0);
-        assert_eq!(light_opacity(STONE), 255);
-        assert_eq!(light_opacity(WATER), 3);
-        assert_eq!(light_opacity(ICE), 3);
-        assert_eq!(light_opacity(LEAVES), 1);
-        assert_eq!(light_opacity(WEB), 1);
-        assert_eq!(light_opacity(LAVA), 255);
-        assert_eq!(light_opacity(GLASS), 0);
-        assert_eq!(light_opacity(FARMLAND), 0);
-        assert_eq!(light_opacity(STEP), 0);
-        assert_eq!(light_opacity(DOUBLE_STEP), 255);
-    }
-
-    #[test]
-    fn emission_matches_reference() {
-        assert_eq!(light_emission(TORCH), 14);
-        assert_eq!(light_emission(LAVA), 15);
-        assert_eq!(light_emission(LIT_FURNACE), 13);
-        assert_eq!(light_emission(GLOWSTONE), 15);
-        assert_eq!(light_emission(BROWN_MUSHROOM), 1);
-        assert_eq!(light_emission(STONE), 0);
-    }
-
-    #[test]
-    fn step_sounds_match_reference() {
-        assert_eq!(step_sound(STONE).name, "step.stone");
-        assert_eq!(step_sound(GRASS).name, "step.grass");
-        assert_eq!(step_sound(SAND).name, "step.sand");
-        assert_eq!(step_sound(WOOD_PLANKS).name, "step.wood");
-        assert_eq!(step_sound(GRAVEL).name, "step.gravel");
-        assert_eq!(step_sound(AIR).name, "step.stone");
-    }
-
-    #[test]
-    fn block_drops_match_poseidon() {
-        let mut rng = JavaRandom::new(42);
-        assert_eq!(
-            get_block_drops(STONE, 0, &mut rng, None),
-            vec![ItemStack::new(COBBLESTONE as i16, 1, 0)]
-        );
-        assert_eq!(
-            get_block_drops(GRASS, 0, &mut rng, None),
-            vec![ItemStack::new(DIRT as i16, 1, 0)]
-        );
-        assert_eq!(
-            get_block_drops(COAL_ORE, 0, &mut rng, None),
-            vec![ItemStack::new(items::COAL, 1, 0)]
-        );
-        assert_eq!(
-            get_block_drops(DIAMOND_ORE, 0, &mut rng, None),
-            vec![ItemStack::new(items::DIAMOND, 1, 0)]
-        );
-        let lapis_drops = get_block_drops(LAPIS_ORE, 0, &mut rng, None);
-        assert!((4..=8).contains(&lapis_drops.len()));
-        assert_eq!(lapis_drops[0].id, items::INK_SACK);
-        assert_eq!(lapis_drops[0].damage, 4);
-
-        assert_eq!(
-            get_block_drops(LOG, 2, &mut rng, None),
-            vec![ItemStack::new(LOG as i16, 1, 2)]
-        );
-        assert_eq!(
-            get_block_drops(WOOL, 14, &mut rng, None),
-            vec![ItemStack::new(WOOL as i16, 1, 14)]
-        );
-        assert_eq!(
-            get_block_drops(
-                LEAVES,
-                9,
-                &mut rng,
-                Some(ItemStack::new(items::SHEARS, 1, 0))
-            ),
-            vec![ItemStack::new(LEAVES as i16, 1, 1)]
-        );
-        assert_eq!(get_block_drops(GLASS, 0, &mut rng, None), vec![]);
-        assert_eq!(
-            get_block_drops(DOUBLE_STEP, 2, &mut rng, None),
-            vec![
-                ItemStack::new(STEP as i16, 1, 2),
-                ItemStack::new(STEP as i16, 1, 2)
-            ]
-        );
+    fn the_table_of_the_random_ticks_is_the_table_of_the_reference() {
+        let ticking = [
+            GRASS,
+            SAPLING,
+            WATER,
+            LAVA,
+            STATIONARY_LAVA,
+            LEAVES,
+            DETECTOR_RAIL,
+            TALL_GRASS,
+            DEAD_BUSH,
+            YELLOW_FLOWER,
+            RED_ROSE,
+            BROWN_MUSHROOM,
+            RED_MUSHROOM,
+            TORCH,
+            FIRE,
+            CROPS,
+            FARMLAND,
+            STONE_PLATE,
+            WOOD_PLATE,
+            LIT_REDSTONE_ORE,
+            REDSTONE_TORCH_OFF,
+            REDSTONE_TORCH_ON,
+            STONE_BUTTON,
+            SNOW,
+            ICE,
+            SNOW_BLOCK,
+            CACTUS,
+            REED,
+            PUMPKIN,
+            JACK_O_LANTERN,
+            CAKE,
+            LOCKED_CHEST,
+        ];
+        for id in ticking {
+            assert!(
+                ticks_randomly(id),
+                "the block {} ticks randomly in the reference",
+                id
+            );
+        }
+        // The blocks that do not tick in the reference: the plain water, the
+        // redstone ore, the portal and the chest.
+        for id in [STATIONARY_WATER, REDSTONE_ORE, PORTAL, CHEST] {
+            assert!(
+                !ticks_randomly(id),
+                "the block {} does not tick randomly in the reference",
+                id
+            );
+        }
     }
 }

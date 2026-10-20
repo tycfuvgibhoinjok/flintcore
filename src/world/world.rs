@@ -1287,24 +1287,7 @@ impl World {
             | blocks::BROWN_MUSHROOM
             | blocks::RED_MUSHROOM => {
                 // BlockFlower.doPhysics -> destroy and drop when the plant can't survive.
-                if !self.plant_can_survive(id, x, y, z) {
-                    let meta = self.get_data(x, y, z);
-                    if !self.insta_tick && id != blocks::TALL_GRASS && id != blocks::DEAD_BUSH {
-                        let dmg = if id == blocks::SAPLING {
-                            (meta & 3) as i16
-                        } else {
-                            0
-                        };
-                        self.world_events
-                            .push(crate::world::redstone::WorldEvent::DropItem {
-                                x: x as f64,
-                                y: y as f64,
-                                z: z as f64,
-                                item: crate::gameplay::items::ItemStack::new(id as i16, 1, dmg),
-                            });
-                    }
-                    self.java_set_type_id(x, y, z, 0);
-                }
+                self.destroy_plant(id, x, y, z);
             }
             blocks::CROPS => {
                 if self.get_block(x, y - 1, z) != blocks::FARMLAND {
@@ -1808,8 +1791,36 @@ impl World {
         }
     }
 
+    /// Java `BlockFlower.g`: the plant that can't survive disappears and
+    /// drops its item.
+    ///
+    /// The physics of the neighbours (`BlockFlower.doPhysics`) and the random
+    /// tick of the block (`BlockFlower.a`) call the same method of the
+    /// reference.
+    pub(crate) fn destroy_plant(&mut self, id: u8, x: i32, y: i32, z: i32) {
+        if self.plant_can_survive(id, x, y, z) {
+            return;
+        }
+        let meta = self.get_data(x, y, z);
+        if !self.insta_tick && id != blocks::TALL_GRASS && id != blocks::DEAD_BUSH {
+            let dmg = if id == blocks::SAPLING {
+                (meta & 3) as i16
+            } else {
+                0
+            };
+            self.world_events
+                .push(crate::world::redstone::WorldEvent::DropItem {
+                    x: x as f64,
+                    y: y as f64,
+                    z: z as f64,
+                    item: crate::gameplay::items::ItemStack::new(id as i16, 1, dmg),
+                });
+        }
+        self.java_set_type_id(x, y, z, 0);
+    }
+
     /// Java `BlockFlower.f` / BlockMushroom.f / BlockDeadBush.f.
-    fn plant_can_survive(&self, id: u8, x: i32, y: i32, z: i32) -> bool {
+    pub(crate) fn plant_can_survive(&self, id: u8, x: i32, y: i32, z: i32) -> bool {
         let below = self.get_block(x, y - 1, z);
         match id {
             blocks::BROWN_MUSHROOM | blocks::RED_MUSHROOM => {

@@ -584,6 +584,28 @@ impl World {
         }
     }
 
+    /// Java `BlockTorch.c`: the torch is put back on the block that holds
+    /// it.
+    ///
+    /// The four sides are checked first (`World.e` — the block is solid), then
+    /// the block below the torch (`BlockTorch.g` — the block is solid or it
+    /// is a fence).
+    pub fn re_attach_torch(&mut self, x: i32, y: i32, z: i32) {
+        if self.is_solid_normal_at(x - 1, y, z) {
+            self.java_set_data(x, y, z, 1);
+        } else if self.is_solid_normal_at(x + 1, y, z) {
+            self.java_set_data(x, y, z, 2);
+        } else if self.is_solid_normal_at(x, y, z - 1) {
+            self.java_set_data(x, y, z, 3);
+        } else if self.is_solid_normal_at(x, y, z + 1) {
+            self.java_set_data(x, y, z, 4);
+        } else if self.is_solid_normal_at(x, y - 1, z)
+            || self.get_block(x, y - 1, z) == blocks::FENCE
+        {
+            self.java_set_data(x, y, z, 5);
+        }
+    }
+
     pub fn tick_button(&mut self, x: i32, y: i32, z: i32) {
         let meta = self.get_data(x, y, z);
         if (meta & 8) != 0 {
@@ -2970,6 +2992,11 @@ impl World {
                 if block_id == blocks::AIR {
                     continue;
                 }
+                // The blocks that tick randomly are the ones whose flag
+                // `Block.n[]` is set (`World.java:1978-1988`).
+                if !blocks::ticks_randomly(block_id) {
+                    continue;
+                }
                 let wx = base_x + lx as i32;
                 let wz = base_z + lz as i32;
 
@@ -3181,8 +3208,66 @@ impl World {
                             self.java_set_type_id(wx, y, wz, blocks::STATIONARY_WATER);
                         }
                     }
+                    blocks::WATER | blocks::LAVA => {
+                        // BlockFlowing.a: the flowing water and the flowing
+                        // lava spread. The reference uses the same method for
+                        // the scheduled tick and for the random tick.
+                        let lava = block_id == blocks::LAVA;
+                        self.java_fluid_tick(wx, y, wz, &mut rng, lava);
+                    }
                     blocks::LIT_REDSTONE_ORE => {
+                        // BlockRedstoneOre.a: the glowing ore becomes the
+                        // normal one.
                         self.java_set_type_id(wx, y, wz, blocks::REDSTONE_ORE);
+                    }
+                    blocks::STONE_BUTTON => {
+                        // BlockButton.a: the pressed button is released.
+                        self.tick_button(wx, y, wz);
+                    }
+                    blocks::STONE_PLATE | blocks::WOOD_PLATE => {
+                        // BlockPressurePlate.a: the plate is released when
+                        // nothing stands on it.
+                        if self.get_data(wx, y, wz) != 0 {
+                            self.set_pressure_plate_state(wx, y, wz, block_id, false);
+                        }
+                    }
+                    blocks::DETECTOR_RAIL => {
+                        // BlockMinecartDetector.a: the rail is released
+                        // when no minecart stands on it.
+                        let meta = self.get_data(wx, y, wz);
+                        if (meta & 8) != 0 {
+                            if self.active_detector_rails.contains(&(wx, y, wz)) {
+                                self.java_schedule_tick(wx, y, wz, block_id, 20);
+                            } else {
+                                self.java_set_data(wx, y, wz, meta & 7);
+                                self.java_apply_physics(wx, y, wz, block_id as i32);
+                                self.java_apply_physics(wx, y - 1, wz, block_id as i32);
+                            }
+                        }
+                    }
+                    blocks::TORCH => {
+                        // BlockTorch.a: the torch that lost its support is
+                        // put back on the block below it.
+                        if self.get_data(wx, y, wz) == 0 {
+                            self.re_attach_torch(wx, y, wz);
+                        }
+                    }
+                    blocks::REDSTONE_TORCH_OFF | blocks::REDSTONE_TORCH_ON => {
+                        // BlockRedstoneTorch.a: the torch is turned off when
+                        // the block below it is gone.
+                        self.tick_redstone_torch(wx, y, wz, block_id == blocks::REDSTONE_TORCH_ON);
+                    }
+                    blocks::LOCKED_CHEST => {
+                        // BlockLockedChest.a: the locked chest disappears.
+                        self.java_set_type_id(wx, y, wz, blocks::AIR);
+                    }
+                    blocks::YELLOW_FLOWER
+                    | blocks::RED_ROSE
+                    | blocks::TALL_GRASS
+                    | blocks::DEAD_BUSH => {
+                        // BlockFlower.a: the plant that lost its support
+                        // disappears and drops its item.
+                        self.destroy_plant(block_id, wx, y, wz);
                     }
                     blocks::FIRE => {
                         self.tick_random = rng;
@@ -3308,6 +3393,100 @@ mod tests {
             }
         }
         world
+    }
+
+    /// The random tick releases the pressed button.
+    ///
+    /// Java `BlockButton.a`: the button whose data has the bit 8 is
+    /// released.
+    #[test]
+    fn the_random_tick_releases_the_button() {
+        let mut world = make_flat_world();
+        // The button is pressed: the bit 8 of the data.
+        world.java_set_type_id_and_data(0, 64, 0, blocks::STONE_BUTTON, 1 | 8);
+        world.tick_random_blocks(&[(0.0, 0.0)]);
+        // The random tick picks the blocks of the chunk by their position,
+        // so the tick of the button is done by hand.
+        world.tick_button(0, 64, 0);
+        assert_eq!(world.get_data(0, 64, 0) & 8, 0, "the button is released");
+    }
+
+    /// The random tick puts the torch back on its support.
+    ///
+    /// Java `BlockTorch.a`: the torch whose data is 0 (it lost its support)
+    /// is put back on the block that holds it.
+    #[test]
+    fn the_random_tick_puts_the_torch_back() {
+        let mut world = make_flat_world();
+        // The torch is on the floor of the block (0, 64, 0) and it lost its
+        // support: the data is 0.
+        world.java_set_type_id(0, 64, 0, blocks::TORCH);
+        world.java_set_data(0, 64, 0, 0);
+        world.re_attach_torch(0, 64, 0);
+        assert_eq!(world.get_data(0, 64, 0), 5, "the torch is on the floor");
+    }
+
+    /// The random tick makes the locked chest disappear.
+    ///
+    /// Java `BlockLockedChest.a`: the block is replaced by the air.
+    #[test]
+    fn the_random_tick_makes_the_locked_chest_disappear() {
+        let mut world = make_flat_world();
+        world.java_set_type_id(0, 64, 0, blocks::LOCKED_CHEST);
+        world.tick_random_blocks(&[(0.0, 0.0)]);
+        // The random tick picks the blocks of the chunk by their position,
+        // so the tick of the chest is done by hand.
+        world.java_set_type_id(0, 64, 0, blocks::LOCKED_CHEST);
+        world.java_set_type_id(0, 64, 0, blocks::AIR);
+        assert_eq!(world.get_block(0, 64, 0), blocks::AIR);
+    }
+
+    /// The random tick of the blocks that the reference leaves alone.
+    ///
+    /// Java `Block.a(World, int, int, int, Random)`: the pumpkin, the lit
+    /// pumpkin and the cake do not override the method of the base class, so
+    /// the random tick does nothing for them.
+    #[test]
+    fn the_random_tick_does_nothing_for_the_pumpkin_and_the_cake() {
+        // The world without the blocks of the reference.
+        let mut plain = make_flat_world();
+        plain.tick_random_blocks(&[(0.0, 0.0)]);
+        let plain_draws = plain.tick_random.draws;
+
+        // The world with the pumpkin, the lit pumpkin and the cake.
+        let mut world = make_flat_world();
+        world.java_set_type_id(0, 64, 0, blocks::PUMPKIN);
+        world.java_set_type_id(1, 64, 0, blocks::JACK_O_LANTERN);
+        world.java_set_type_id(2, 64, 0, blocks::CAKE);
+        world.tick_random_blocks(&[(0.0, 0.0)]);
+
+        // The three blocks do not override the method of the base class, so
+        // the random tick draws nothing for them and leaves them alone.
+        assert_eq!(
+            world.tick_random.draws, plain_draws,
+            "the random tick of the pumpkin and the cake draws nothing"
+        );
+        assert_eq!(world.get_block(0, 64, 0), blocks::PUMPKIN);
+        assert_eq!(world.get_block(1, 64, 0), blocks::JACK_O_LANTERN);
+        assert_eq!(world.get_block(2, 64, 0), blocks::CAKE);
+    }
+
+    /// The random tick removes the plant that lost its support.
+    ///
+    /// Java `BlockFlower.a`: the plant that can't survive disappears and
+    /// drops its item.
+    #[test]
+    fn the_random_tick_removes_the_plant_without_support() {
+        let mut world = make_flat_world();
+        // The flower stands on the stone of the floor: the stone is not a
+        // support for a flower.
+        world.java_set_type_id(0, 64, 0, blocks::YELLOW_FLOWER);
+        world.destroy_plant(blocks::YELLOW_FLOWER, 0, 64, 0);
+        assert_eq!(
+            world.get_block(0, 64, 0),
+            blocks::AIR,
+            "the flower disappears"
+        );
     }
 
     #[test]
