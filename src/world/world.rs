@@ -970,6 +970,56 @@ impl World {
         }
     }
 
+    /// Java `World.e(int, int)`: the height of the terrain at the column.
+    pub fn height_map_at(&self, x: i32, z: i32) -> i32 {
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        match self.chunks.get(&pos) {
+            Some(chunk) => chunk.height_map[(((z & 15) << 4) | (x & 15)) as usize] as i32,
+            None => 0,
+        }
+    }
+
+    /// Java `World.s(int, int, int)`: can a mob live at the position?
+    ///
+    /// The height of the terrain has to be below the position and the biome
+    /// has to be one where the mobs can spawn.
+    pub fn can_spawn_at(&self, x: i32, y: i32, z: i32) -> bool {
+        if !self.is_chunk_loaded(ChunkPos::new(x >> 4, z >> 4)) {
+            return false;
+        }
+        if self.height_map_at(x, z) > y {
+            return false;
+        }
+        // The biomes of the reference where the mobs cannot spawn (the ocean
+        // and the ones with the flag of the jungle).
+        !matches!(
+            self.biome_at(x, z),
+            crate::world::biome::Biome::Swampland | crate::world::biome::Biome::Sky
+        )
+    }
+
+    /// Java `World.d(AxisAlignedBB)`: is there a fire or a lava block in the
+    /// box?
+    pub fn has_fire_or_lava_in(&self, aabb: &crate::entity::physics::Aabb) -> bool {
+        let min_x = aabb.min_x.floor() as i32;
+        let max_x = (aabb.max_x + 1.0).floor() as i32;
+        let min_y = aabb.min_y.floor() as i32;
+        let max_y = (aabb.max_y + 1.0).floor() as i32;
+        let min_z = aabb.min_z.floor() as i32;
+        let max_z = (aabb.max_z + 1.0).floor() as i32;
+        for x in min_x..max_x {
+            for y in min_y..max_y {
+                for z in min_z..max_z {
+                    let id = self.get_block(x, y, z);
+                    if id == blocks::FIRE || id == blocks::LAVA || id == blocks::STATIONARY_LAVA {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub fn get_data(&self, x: i32, y: i32, z: i32) -> u8 {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return 0;

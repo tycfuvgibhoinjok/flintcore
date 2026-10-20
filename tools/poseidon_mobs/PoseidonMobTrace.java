@@ -406,7 +406,7 @@ public class PoseidonMobTrace {
         for (int x = -scenario.radius; x <= scenario.radius; x++) {
             for (int z = -scenario.radius; z <= scenario.radius; z++) {
                 Chunk chunk = world.getChunkAt(x >> 4, z >> 4);
-                for (int y = 0; y < 256; y++) {
+                for (int y = 0; y < 128; y++) {
                     chunk.f.a(x & 15, y, z & 15, y > scenario.floorY ? 15 : 0);
                 }
             }
@@ -478,6 +478,9 @@ public class PoseidonMobTrace {
         return path == null ? 0 : path.a;
     }
 
+    /** The tick of the loop, the trace of the random prints it. */
+    static int TICK = 0;
+
     private static void dump(PrintWriter out, int tick, EntityLiving mob) {
         if (System.getenv("FLINT_IDLE") != null) {
             try {
@@ -496,9 +499,13 @@ public class PoseidonMobTrace {
             try {
                 Field ac = EntityLiving.class.getDeclaredField("aC");
                 ac.setAccessible(true);
+                Field ay = EntityLiving.class.getDeclaredField("ay");
+                ay.setAccessible(true);
                 System.err.printf(java.util.Locale.ROOT,
-                    "JUMP %d ad=%s ae=%s aC=%s motY=%.9f y=%.9f onGround=%s%n",
-                    tick, mob.ad(), mob.ae(), ac.getBoolean(mob), mob.motY, mob.locY, mob.onGround);
+                    "JUMP %d ad=%s ae=%s aC=%s ac=%s ay=%d motY=%.9f y=%.9f onGround=%s fire=%d%n",
+                    tick, mob.ad(), mob.ae(), ac.getBoolean(mob), mob.ac(),
+                    ay.getInt(mob), mob.motY, mob.locY,
+                    mob.onGround, mob.fireTicks);
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
@@ -512,6 +519,42 @@ public class PoseidonMobTrace {
             System.err.printf(java.util.Locale.ROOT,
                 "PRECISE %d x=%.10f y=%.10f z=%.10f motX=%.10f motY=%.10f motZ=%.10f yaw=%.10f pitch=%.10f%n",
                 tick, mob.locX, mob.locY, mob.locZ, mob.motX, mob.motY, mob.motZ, mob.yaw, mob.pitch);
+        }
+        if (System.getenv("FLINT_BLOCK_DEBUG") != null) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("BLOCK ").append(tick).append(" ");
+            int bx = (int) Math.floor(mob.locX);
+            int bz = (int) Math.floor(mob.locZ);
+            for (int x = bx - 6; x <= bx + 6; x++) {
+                for (int z = bz - 6; z <= bz + 6; z++) {
+                    sb.append(x).append(",").append(z).append(":");
+                    for (int y = 55; y <= 66; y++) {
+                        sb.append(mob.world.getTypeId(x, y, z)).append(",");
+                    }
+                    sb.append(" ");
+                }
+            }
+            System.err.println(sb.toString());
+        }
+        if (System.getenv("FLINT_LIGHT_DEBUG") != null) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("LIGHT ").append(tick).append(" ");
+            int bx = (int) Math.floor(mob.locX);
+            int by = (int) Math.floor(mob.locY);
+            int bz = (int) Math.floor(mob.locZ);
+            for (int y = by - 3; y <= by + 3; y++) {
+                for (int z = bz - 6; z <= bz + 6; z++) {
+                    for (int x = bx - 6; x <= bx + 6; x++) {
+                        net.minecraft.server.Chunk chunk = mob.world.getChunkAt(x >> 4, z >> 4);
+                        sb.append(x).append(",").append(y).append(",").append(z).append("=")
+                          .append((int) (mob.world.n(x, y, z) * 100.0F))
+                          .append("/").append(chunk.f.a(x & 15, y, z & 15))
+                          .append("/").append(chunk.g.a(x & 15, y, z & 15))
+                          .append(" ");
+                    }
+                }
+            }
+            System.err.println(sb.toString());
         }
         if (System.getenv("FLINT_PATH_DEBUG") != null) {
             StringBuilder sb = new StringBuilder();
@@ -585,9 +628,6 @@ public class PoseidonMobTrace {
             protected int next(int bits) {
                 if (trace) {
                     int value = super.next(bits);
-                    if (System.getenv("FLINT_RNG_VALUE") != null) {
-                        // The value is printed with the call site below.
-                    }
                     StackTraceElement[] frames = new Throwable().getStackTrace();
                     StringBuilder where = new StringBuilder();
                     for (int i = 2; i < Math.min(frames.length, 6); i++) {
@@ -598,7 +638,7 @@ public class PoseidonMobTrace {
                             .append(frames[i].getLineNumber())
                             .append(" <- ");
                     }
-                    System.out.println("RNG " + bits + " " + value + " " + where);
+                    System.out.println("RNG t=" + TICK + " " + bits + " " + value + " " + where);
                     return value;
                 }
                 return super.next(bits);
@@ -653,6 +693,7 @@ public class PoseidonMobTrace {
             parent.mkdirs();
         }
         try (PrintWriter out = new PrintWriter(new BufferedWriter(new FileWriter(outFile)))) {
+            boolean in_world = true;
             out.printf("# scenario=%s seed=%d ticks=%d mob=%s%n",
                     scenario.name, seed, ticks, scenario.mobClass);
             out.printf("# tick x y z motX motY motZ yaw pitch onGround fallDistance target pathLen pathHash%n");
@@ -672,7 +713,18 @@ public class PoseidonMobTrace {
                                 MathHelper.floor(mob.locY),
                                 MathHelper.floor(mob.locZ)));
                 }
-                mob.m_();
+                TICK = t;
+                // The world removes the dead entities at the end of its tick
+                // (`World.tickEntities`), so the mob is not updated any more
+                // once it left the world.
+                if (in_world) {
+                    mob.m_();
+                    if (mob.deathTicks > 20) {
+                        // `EntityLiving.die()`: the world removes the entity
+                        // at the end of its tick.
+                        in_world = false;
+                    }
+                }
                 if (System.getenv("FLINT_SQUID_DEBUG") != null && t >= 50 && t < 55) {
                     System.out.printf("SDEBUG t=%d post motY=%.9f ad=%s%n", t, mob.motY, mob.ad());
                 }

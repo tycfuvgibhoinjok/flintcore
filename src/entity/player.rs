@@ -89,6 +89,17 @@ pub struct Player {
 }
 
 impl Player {
+    /// The box of the player (`Entity.setPosition`).
+    pub fn bounding_box(&self) -> crate::entity::physics::Aabb {
+        let (length, width) = self.box_size;
+        crate::entity::physics::Aabb::for_entity(self.x, self.y, self.z, length, width, 0.0, 0.0)
+    }
+
+    /// The bottom of the box of the player (`Entity.boundingBox.b`).
+    pub fn box_bottom(&self) -> f64 {
+        self.bounding_box().min_y
+    }
+
     pub fn new(entity_id: i32, conn_id: ConnId, username: String, x: f64, y: f64, z: f64) -> Self {
         Self {
             entity_id,

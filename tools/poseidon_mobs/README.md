@@ -60,7 +60,17 @@ header of the golden file documents the command).
 - The light of the scenario is set by hand (`scenarioLight`): the world of
   the harness is generated with the normal generator, so the light of the
   hills around the floor would be an artefact of the terrain. The port sets
-  the same light, otherwise the mobs would walk to a different goal.
+  the same light, otherwise the mobs would walk to a different goal. The
+  light of a column is written for the whole height of the chunk (`y` from 0
+  to 127): a bigger loop overflows the index of the `NibbleArray` into the
+  neighbouring column and lights the world in a way the reference never
+  does.
+- A mob that died is not updated any more: the world removes the dead
+  entities at the end of its tick (`World.tickEntities`), so the harness
+  stops the mob when the counter of the death (`EntityLiving.deathTicks`)
+  passes twenty and prints the frozen state of the mob. The flag `dead` of
+  the entity cannot be used: the monsters of the harness die at once
+  (`EntityMonster.m_()`: the world of the harness is in the peaceful mode).
 - The floor of the scenarios is grass: the animals score the blocks of their
   walk with the grass below them (`EntityAnimal.a`), so the goal of the walk
   does not depend on the light.

@@ -186,7 +186,9 @@ Mob movement parity harness:
 - The traces are the golden file `tests/golden/poseidon_mob_traces.txt`; the
   test `the_mob_movement_matches_the_poseidon_reference` in `src/server.rs`
   reproduces the eight scenarios and compares them tick by tick. The test is
-  `#[ignore]`d while the port of the movement model is in progress.
+  `#[ignore]`d (it is slow), the test
+  `the_mob_scenarios_of_the_reference_match` compares the same eight scenarios
+  and runs in the normal test suite.
 - The port follows the reference classes one by one: `AxisAlignedBB` and
   `Entity.move` (`src/entity/physics.rs`), `EntityLiving.a(float, float)`
   (the acceleration, the drag and the jump), `Pathfinder`/`Path` (the A* with
@@ -202,9 +204,9 @@ Mob movement parity harness:
   debug build.
 - The state of the port (the divergence of the trace against the reference,
   the comparison lives in `the_mob_movement_matches_the_poseidon_reference`
-  (it is ignored while some scenarios differ) and in
-  `the_mob_scenarios_of_the_reference_match` (the scenarios that match, they
-  must not diverge), the golden traces live in
+  (it is `#[ignore]`d, it is slow) and in
+  `the_mob_scenarios_of_the_reference_match` (the eight scenarios, they must
+  not diverge), the golden traces live in
   `tests/golden/poseidon_mob_traces.txt`):
 
   | scenario | the trace matches for | the difference |
@@ -213,10 +215,10 @@ Mob movement parity harness:
   | `flat`   | **300 ticks (all)**   | - |
   | `ghast`  | **300 ticks (all)**   | - |
   | `chase`  | **300 ticks (all)**   | - |
-  | `wall`   | 89 ticks              | the path of the spider |
-  | `squid`  | 52 ticks              | the velocity of the squid |
-  | `water`  | 24 ticks              | the position of the zombie in the water |
-  | `lava`   | 18 ticks              | the position of the zombie in the lava |
+  | `wall`   | **300 ticks (all)**   | - |
+  | `squid`  | **300 ticks (all)**   | - |
+  | `water`  | **300 ticks (all)**   | - |
+  | `lava`   | **300 ticks (all)**   | - |
 
   - The random stream of the entities is identical to the reference: the
     numbers are drawn in the same order and with the same values (the
@@ -258,7 +260,19 @@ Mob movement parity harness:
   - The light of the scenario is set by hand (the harness and the port set
     the sky light of the floor to 15): the world of the reference is
     generated with the normal generator, so the light of the hills around
-    the floor would be an artefact of the terrain.
+    the floor would be an artefact of the terrain. The harness writes the
+    light of the whole column (`y > floorY`), the port does the same.
+  - The counter of the ticks without a target (`EntityLiving.ay`) grows by
+    one in `EntityLiving.c_()` and by two in the light
+    (`EntityMonster.v()`), the despawn of the mob (`EntityLiving.U()`) draws
+    a number when the counter passes 600. The port has the same counter, so
+    the number is drawn in the same tick.
+  - The corpse of a dead mob lives twenty ticks (`EntityLiving.R()`), the
+    mob has no artificial intelligence while it is dead
+    (`EntityLiving.v()`: the input of the movement is zero) and it leaves the
+    world when the counter of the death passes twenty. The harness of the
+    reference prints the frozen state of the mob after that, the port does
+    the same.
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.
@@ -266,10 +280,10 @@ Mob movement parity harness:
     so it has no box at all: the mob walks through it. The scenario of the
     port uses a player without a box too (`Player::box_size`).
   - The differences that are left are the parts of the reference that are
-    not ported yet: the path of the mobs in some situations (the tie
-    breaking of the heap of the path finder), the position of a mob in the
-    water and in the lava (a difference of one unit in the ninth decimal)
-    and the branch of the swim of the squid.
+    not ported yet: the damage of the mobs from the other sources than the
+    attacks, the items of the dead mobs and the packets of the death. The
+    movement of the mobs, the fire, the lava, the corpse of the dead mob and
+    the stream of the random numbers are the same as in the reference.
 
 ## 7. Performance discipline
 

@@ -286,6 +286,10 @@ pub struct Mob {
     pub look_ticks: i32,
     pub velocity_changed: bool,
     pub dead: bool,
+    /// Java `EntityLiving.deathTicks`: the number of the ticks the corpse of
+    /// the mob lives. The mob leaves the world when the counter passes
+    /// twenty.
+    pub death_ticks: i32,
     pub no_despawn_ticks: i32,
     pub target_id: Option<i32>,
     pub path: Vec<(i32, i32, i32)>,
@@ -420,6 +424,7 @@ impl Mob {
             look_ticks: 0,
             velocity_changed: false,
             dead: false,
+            death_ticks: 0,
             no_despawn_ticks: 0,
             target_id: None,
             path: Vec::new(),
@@ -525,52 +530,57 @@ impl Mob {
         // The position of the mob before the movement (`EntityLiving.a`).
         let y_before = self.y;
 
-        // The acceleration (`Entity.a(float, float, float)`).
-        // The reference computes the acceleration with single precision.
-        let input = crate::util::math::math_helper_a(
-            (self.move_strafe * self.move_strafe + self.move_forward * self.move_forward) as f64,
-        );
-        // The squid has its own check for the water (`EntitySquid.ad()`).
-        let in_water = if self.mob_type == MobType::Squid {
-            crate::entity::physics::squid_in_water(world, &aabb)
-        } else {
-            self.in_water
-        };
-        let in_lava = self.in_lava;
-        let (acceleration, drag): (f32, f32) = if in_water || in_lava {
-            (0.02, 0.5)
-        } else {
-            // The friction of the ground (`EntityLiving.a(float, float)`): the
-            // block below the mob has its own friction factor.
-            let friction = if self.on_ground {
-                let below = world.get_block(
-                    self.x.floor() as i32,
-                    (self.y.floor() as i32) - 1,
-                    self.z.floor() as i32,
-                );
-                if below > 0 {
-                    blocks::friction_factor(below) * 0.91
-                } else {
-                    0.54600006
-                }
+        // The squid has its own movement (`EntitySquid.a(float, float)`): it
+        // only moves, without the acceleration, the gravity and the drag of
+        // the water.
+        let squid = self.mob_type == MobType::Squid;
+
+        let mut drag = 0.0f32;
+        if !squid {
+            // The acceleration (`Entity.a(float, float, float)`).
+            // The reference computes the acceleration with single precision.
+            let input = crate::util::math::math_helper_a(
+                (self.move_strafe * self.move_strafe + self.move_forward * self.move_forward)
+                    as f64,
+            );
+            let in_water = self.in_water;
+            let in_lava = self.in_lava;
+            let (acceleration, friction): (f32, f32) = if in_water || in_lava {
+                (0.02, 0.5)
             } else {
-                0.91
+                // The friction of the ground (`EntityLiving.a(float, float)`): the
+                // block below the mob has its own friction factor.
+                let friction = if self.on_ground {
+                    let below = world.get_block(
+                        self.x.floor() as i32,
+                        (self.y.floor() as i32) - 1,
+                        self.z.floor() as i32,
+                    );
+                    if below > 0 {
+                        blocks::friction_factor(below) * 0.91
+                    } else {
+                        0.54600006
+                    }
+                } else {
+                    0.91
+                };
+                let f3 = 0.16277136 / (friction * friction * friction);
+                (if self.on_ground { 0.1 * f3 } else { 0.02 }, friction)
             };
-            let f3 = 0.16277136 / (friction * friction * friction);
-            (if self.on_ground { 0.1 * f3 } else { 0.02 }, friction)
-        };
-        if input >= 0.01 {
-            let scale = acceleration / input.max(1.0);
-            let strafe = self.move_strafe * scale;
-            let forward = self.move_forward * scale;
-            // The sine and the cosine come from the table of the reference
-            // (`MathHelper.sin` and `MathHelper.cos`), the plain functions
-            // would drift a few units in the last place.
-            let radians = self.yaw * JAVA_PI / 180.0f32;
-            let sin = crate::util::math::sin(radians);
-            let cos = crate::util::math::cos(radians);
-            self.mot_x += (strafe * cos - forward * sin) as f64;
-            self.mot_z += (strafe * sin + forward * cos) as f64;
+            drag = friction;
+            if input >= 0.01 {
+                let scale = acceleration / input.max(1.0);
+                let strafe = self.move_strafe * scale;
+                let forward = self.move_forward * scale;
+                // The sine and the cosine come from the table of the reference
+                // (`MathHelper.sin` and `MathHelper.cos`), the plain functions
+                // would drift a few units in the last place.
+                let radians = self.yaw * JAVA_PI / 180.0f32;
+                let sin = crate::util::math::sin(radians);
+                let cos = crate::util::math::cos(radians);
+                self.mot_x += (strafe * cos - forward * sin) as f64;
+                self.mot_z += (strafe * sin + forward * cos) as f64;
+            }
         }
 
         // The spider clings to the wall it touches (`EntitySpider.p()`).
@@ -629,16 +639,35 @@ impl Mob {
             self.mot_z = 0.0;
         }
 
-        if in_water || in_lava {
+        if squid {
+            // `EntitySquid.a(float, float)`: the squid only moves, the
+            // velocity of the axes is not changed by the movement.
+        } else if self.in_water || self.in_lava {
             if flying {
                 // `EntityFlying.a(float, float)`: the drag of the flying mobs.
-                self.mot_x *= if in_water { 0.800_000_011_920_929 } else { 0.5 };
-                self.mot_y *= if in_water { 0.800_000_011_920_929 } else { 0.5 };
-                self.mot_z *= if in_water { 0.800_000_011_920_929 } else { 0.5 };
+                self.mot_x *= if self.in_water {
+                    0.800_000_011_920_929
+                } else {
+                    0.5
+                };
+                self.mot_y *= if self.in_water {
+                    0.800_000_011_920_929
+                } else {
+                    0.5
+                };
+                self.mot_z *= if self.in_water {
+                    0.800_000_011_920_929
+                } else {
+                    0.5
+                };
             } else {
                 // The water and the lava slow the mob down
                 // (`EntityLiving.a(float, float)`).
-                let fluid_drag: f64 = if in_water { 0.800_000_011_920_929 } else { 0.5 };
+                let fluid_drag: f64 = if self.in_water {
+                    0.800_000_011_920_929
+                } else {
+                    0.5
+                };
                 self.mot_x *= fluid_drag;
                 self.mot_y *= fluid_drag;
                 self.mot_z *= fluid_drag;
@@ -756,14 +785,10 @@ impl Mob {
         matches!(self.mob_type, MobType::Ghast | MobType::PigZombie)
     }
 
+    /// Java `EntityLiving.h_()`: can the mob leave the world when it is far
+    /// from the players? Every mob can, except the tamed wolf.
     pub fn can_despawn(&self) -> bool {
-        if self.mob_type == MobType::Wolf && self.wolf_tamed {
-            return false;
-        }
-        if self.mob_type == MobType::Pig && self.pig_saddled {
-            return false;
-        }
-        self.mob_type.is_monster() || self.mob_type.is_water_animal()
+        !(self.mob_type == MobType::Wolf && self.wolf_tamed)
     }
 
     pub fn held_item(&self) -> Option<ItemStack> {
@@ -1850,6 +1875,23 @@ pub fn world_sky_subtracted(world_time: i64) -> i32 {
     let mut f3 = 1.0 - ((f1 * std::f32::consts::PI * 2.0).cos() * 2.0 + 0.5);
     f3 = f3.clamp(0.0, 1.0);
     (f3 * 11.0) as i32
+}
+
+/// Java `Entity.c(float)`: the light of the block the mob is in.
+///
+/// The reference uses the light of the block under the middle of the box of
+/// the mob, the value is the curve of the light of the reference.
+pub fn mob_light_at(world: &World, mob: &Mob, sky_sub: i32) -> f32 {
+    let box_ = mob.aabb();
+    let offset = (box_.max_y - box_.min_y) * 0.66;
+    let y = (mob.y + offset).floor() as i32;
+    light_curve(chunk_light_at(
+        world,
+        mob.x.floor() as i32,
+        y,
+        mob.z.floor() as i32,
+        sky_sub,
+    ))
 }
 
 pub fn chunk_light_at(world: &World, x: i32, y: i32, z: i32, sky_sub: i32) -> i32 {

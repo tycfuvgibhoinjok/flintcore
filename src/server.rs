@@ -106,7 +106,7 @@ pub struct Server {
     /// The reference shares one `Random` between all the entities and seeds
     /// it with the seed of the world, so the behaviour of the mobs is
     /// reproducible.
-    entity_random: JavaRandom,
+    pub entity_random: JavaRandom,
 }
 
 impl Server {
@@ -4703,6 +4703,9 @@ impl Server {
 
             if mob.health <= 0 {
                 mob.dead = true;
+                // The counter of the death (`EntityLiving.deathTicks`): the
+                // corpse leaves the world when it passes twenty.
+                mob.death_ticks = 0;
                 died = true;
                 let mut drops =
                     mob.get_death_drops(&mut self.entity_random, killed_by_skeleton_arrow);
@@ -4775,10 +4778,10 @@ impl Server {
                         rider_mob.vehicle_id = None;
                     }
                 }
-                let _ = self.entities.remove_mob(mob_id);
-                for out in self.tracker.untrack_mob(mob_id) {
-                    self.send_tracked(out.recipient_id, out.packet);
-                }
+                // The mob is not removed from the world right away: the
+                // corpse lives twenty more ticks (`EntityLiving.R()`), the
+                // mob leaves the world when the counter of the death passes
+                // twenty.
                 for item in drops {
                     self.spawn_dropped_item_random(mx, my + 0.2, mz, item, 10);
                 }
@@ -4803,6 +4806,18 @@ impl Server {
 
     fn tick_mobs(&mut self) {
         let active_dimension = self.active_dimension;
+        // The corpses of the dead mobs leave the world at the end of the tick
+        // in which they die (`World.tickEntities` removes the dead entities
+        // after the update of the entities).
+        let corpses: Vec<i32> = self
+            .entities
+            .iter_mobs()
+            .filter(|m| m.dead && m.death_ticks > 20)
+            .map(|m| m.entity_id)
+            .collect();
+        for mob_id in corpses {
+            let _ = self.entities.remove_mob(mob_id);
+        }
         // The mobs are updated in the order of their entity id, the reference
         // walks its entity list in the order of the insertion. The order
         // matters: the mobs share one random stream.
@@ -4840,7 +4855,7 @@ impl Server {
 
         for mob_id in mob_ids {
             let Some((mtype, mx, my, mz, can_desp, length, width, step_offset)) =
-                self.entities.get_mob(mob_id).filter(|m| !m.dead).map(|m| {
+                self.entities.get_mob(mob_id).map(|m| {
                     let (length, width) = m.size();
                     (
                         m.mob_type,
@@ -4880,29 +4895,35 @@ impl Server {
             // `EntityLiving.R()`): the splash in the water, the damage of the
             // fire and the lava and the idle sound of the mob draw from the
             // shared random of the entities.
-            self.mob_update_phase(mob_id);
+            //
+            // The corpse of a dead mob leaves the world at the end of the
+            // tick (`World.tickEntities`), so the mob is still updated.
+            let left_the_world = self.mob_update_phase(mob_id);
             if self.entities.get_mob(mob_id).is_none() {
                 continue;
             }
 
-            if can_desp {
-                if let Some((_, _, _, _, dsq)) = closest_player {
-                    if dsq > 128.0 * 128.0 {
-                        despawn_list.push(mob_id);
-                        continue;
-                    }
-                    if let Some(m) = self.entities.get_mob_mut(mob_id) {
-                        if dsq > 32.0 * 32.0 {
-                            m.no_despawn_ticks += 1;
-                            if m.no_despawn_ticks > 600
-                                && self.entity_random.next_i32_bound(800) == 0
-                            {
-                                despawn_list.push(mob_id);
-                                continue;
-                            }
-                        } else {
-                            m.no_despawn_ticks = 0;
-                        }
+            // The corpse of a dead mob is not despawned, it leaves the world
+            // when the counter of the death passes twenty. A dead mob has no
+            // artificial intelligence (`EntityLiving.v()`), it only falls.
+            let corpse = self.entities.get_mob(mob_id).is_some_and(|m| m.dead);
+            if can_desp && !corpse {
+                // The despawn of the mob (`EntityLiving.U()`) is checked when
+                // the mob walks without a path (see the update of the mob
+                // below).
+            }
+
+            // The counter of the ticks without a target grows faster in the
+            // light (`EntityMonster.v()`).
+            if !corpse && mtype.is_monster() {
+                let light = self
+                    .entities
+                    .get_mob(mob_id)
+                    .map(|mob| crate::entity::mob::mob_light_at(&self.world, mob, sky_sub))
+                    .unwrap_or(0.0);
+                if light > 0.5 {
+                    if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                        mob.no_despawn_ticks += 2;
                     }
                 }
             }
@@ -4961,7 +4982,7 @@ impl Server {
             }
 
             // Acquire new target if none
-            if target_pos.is_none() {
+            if target_pos.is_none() && !corpse {
                 match mtype {
                     MobType::Zombie | MobType::Skeleton | MobType::Creeper | MobType::Giant => {
                         if let Some((pid, px, py, pz, dsq)) = closest_player {
@@ -5068,7 +5089,10 @@ impl Server {
             // Compute A* path when needed
             let mut new_path: Option<Vec<(i32, i32, i32)>> = None;
             let mut teleport_to_owner: Option<(f64, f64, f64)> = None;
-            if let Some((ox, oy, oz)) = owner_pos {
+            if corpse {
+                // A dead mob has no artificial intelligence
+                // (`EntityLiving.v()`): the input of the movement is zero.
+            } else if let Some((ox, oy, oz)) = owner_pos {
                 let dist = ((ox - mx).powi(2) + (oy - my).powi(2) + (oz - mz).powi(2)).sqrt();
                 if dist > 12.0 {
                     // Teleport wolf near owner (`EntityWolf.c`)
@@ -5120,7 +5144,7 @@ impl Server {
                 // The path to the target is computed as soon as the mob finds
                 // its target (`EntityCreature.c_()`).
                 if cur_target_id.is_none() {
-                    if let Some((_, _, tx, ty, tz)) = target_pos {
+                    if let Some((tid, is_player, tx, ty, tz)) = target_pos {
                         new_path = Some(find_path(
                             &self.world,
                             mx,
@@ -5129,7 +5153,7 @@ impl Server {
                             length,
                             width,
                             tx,
-                            ty,
+                            self.target_box_bottom(tid, is_player, ty),
                             tz,
                             16.0,
                         ));
@@ -5141,7 +5165,7 @@ impl Server {
                         .entities
                         .get_mob(mob_id)
                         .is_some_and(|m| !m.path.is_empty());
-                if let Some((_, _, tx, ty, tz)) = target_pos {
+                if let Some((tid, is_player, tx, ty, tz)) = target_pos {
                     // The path to the target: it is computed when the path is
                     // missing or when the roll of the reference hits.
                     let should_repath = !has_path || self.entity_random.next_i32_bound(20) == 0;
@@ -5154,7 +5178,7 @@ impl Server {
                             length,
                             width,
                             tx,
-                            ty,
+                            self.target_box_bottom(tid, is_player, ty),
                             tz,
                             16.0,
                         ));
@@ -5245,6 +5269,10 @@ impl Server {
             // mob and the fall of the mob).
             let mut pre_y = 0.0;
             let mut pre_mot_y = 0.0;
+            // The state of the mob before the movement and the fall damage
+            // (`EntityLiving.a(float, float)`).
+            let mut was_on_ground = false;
+            let mut fall_damage = 0.0f32;
             if let Some(mob) = self.entities.get_mob_mut(mob_id) {
                 pre_y = mob.y;
                 pre_mot_y = mob.mot_y;
@@ -5328,320 +5356,370 @@ impl Server {
                 }
 
                 // Specific AI movement & attacks
-                match mob.mob_type {
-                    MobType::Squid => {
-                        // The direction of the swim (`EntitySquid.c_()`): the
-                        // squid picks a new direction now and then, the
-                        // reference draws the number every tick.
-                        if self.entity_random.next_i32_bound(50) == 0
-                            || !mob.in_water
-                            || (mob.squid_swim_vec.0 == 0.0
-                                && mob.squid_swim_vec.1 == 0.0
-                                && mob.squid_swim_vec.2 == 0.0)
-                        {
-                            let angle = self.entity_random.next_f32() * std::f32::consts::PI * 2.0;
-                            mob.squid_swim_vec = (
-                                crate::util::math::cos(angle) * 0.2,
-                                -0.1 + self.entity_random.next_f32() * 0.2,
-                                crate::util::math::sin(angle) * 0.2,
-                            );
-                        }
-                    }
-                    MobType::Slime => {
-                        // The slime looks at a nearby player (`EntitySlime.c_()`).
-                        let mut player_nearby = false;
-                        if let Some((pid, px, py, pz, dsq)) = closest_player {
-                            if dsq <= 16.0 * 16.0 {
-                                player_nearby = true;
-                                look_at(mob, px, py, pz, PLAYER_EYE_HEIGHT, 10.0, 20.0);
-                                let reach = 0.6 * (mob.slime_size as f64);
-                                if mob.slime_size > 1
-                                    && dsq < reach * reach
-                                    && (py - mob.y).abs() < 2.0
-                                {
-                                    melee_hits_player.push((
-                                        pid,
-                                        mob.slime_size as i16,
-                                        mob.x,
-                                        mob.z,
-                                    ));
-                                }
+                if corpse {
+                    // A dead mob has no artificial intelligence
+                    // (`EntityLiving.v()`): the input of the movement is zero
+                    // and the mob does not jump.
+                    mob.move_strafe = 0.0;
+                    mob.move_forward = 0.0;
+                    mob.jump_flag = false;
+                } else {
+                    match mob.mob_type {
+                        MobType::Squid => {
+                            // The direction of the swim (`EntitySquid.c_()`): the
+                            // squid picks a new direction now and then, the
+                            // reference draws the number every tick.
+                            if self.entity_random.next_i32_bound(50) == 0
+                                || !mob.in_water
+                                || (mob.squid_swim_vec.0 == 0.0
+                                    && mob.squid_swim_vec.1 == 0.0
+                                    && mob.squid_swim_vec.2 == 0.0)
+                            {
+                                let angle =
+                                    self.entity_random.next_f32() * std::f32::consts::PI * 2.0;
+                                mob.squid_swim_vec = (
+                                    crate::util::math::cos(angle) * 0.2,
+                                    -0.1 + self.entity_random.next_f32() * 0.2,
+                                    crate::util::math::sin(angle) * 0.2,
+                                );
                             }
                         }
-                        // The hop of the slime (`EntitySlime.c_()`): the timer
-                        // of the reference is decremented on the ground and
-                        // the slime hops when it reaches zero.
-                        if mob.on_ground {
-                            let timer = mob.slime_jump_delay;
-                            mob.slime_jump_delay -= 1;
-                            if timer <= 0 {
-                                mob.slime_jump_delay = self.entity_random.next_i32_bound(20) + 10;
-                                if player_nearby {
-                                    mob.slime_jump_delay /= 3;
+                        MobType::Slime => {
+                            // The slime looks at a nearby player (`EntitySlime.c_()`).
+                            let mut player_nearby = false;
+                            if let Some((pid, px, py, pz, dsq)) = closest_player {
+                                if dsq <= 16.0 * 16.0 {
+                                    player_nearby = true;
+                                    look_at(mob, px, py, pz, PLAYER_EYE_HEIGHT, 10.0, 20.0);
+                                    let reach = 0.6 * (mob.slime_size as f64);
+                                    if mob.slime_size > 1
+                                        && dsq < reach * reach
+                                        && (py - mob.y).abs() < 2.0
+                                    {
+                                        melee_hits_player.push((
+                                            pid,
+                                            mob.slime_size as i16,
+                                            mob.x,
+                                            mob.z,
+                                        ));
+                                    }
                                 }
-                                mob.jump_flag = true;
-                                if mob.slime_size > 1 {
-                                    // The sound of the hop: two numbers.
-                                    let _ = self.entity_random.next_f32();
-                                    let _ = self.entity_random.next_f32();
+                            }
+                            // The hop of the slime (`EntitySlime.c_()`): the timer
+                            // of the reference is decremented on the ground and
+                            // the slime hops when it reaches zero.
+                            if mob.on_ground {
+                                let timer = mob.slime_jump_delay;
+                                mob.slime_jump_delay -= 1;
+                                if timer <= 0 {
+                                    mob.slime_jump_delay =
+                                        self.entity_random.next_i32_bound(20) + 10;
+                                    if player_nearby {
+                                        mob.slime_jump_delay /= 3;
+                                    }
+                                    mob.jump_flag = true;
+                                    if mob.slime_size > 1 {
+                                        // The sound of the hop: two numbers.
+                                        let _ = self.entity_random.next_f32();
+                                        let _ = self.entity_random.next_f32();
+                                    }
+                                    // The direction of the hop.
+                                    mob.move_strafe = 1.0 - self.entity_random.next_f32() * 2.0;
+                                    mob.move_forward = mob.slime_size as f32;
+                                } else {
+                                    mob.jump_flag = false;
+                                    mob.move_strafe = 0.0;
+                                    mob.move_forward = 0.0;
                                 }
-                                // The direction of the hop.
-                                mob.move_strafe = 1.0 - self.entity_random.next_f32() * 2.0;
-                                mob.move_forward = mob.slime_size as f32;
                             } else {
                                 mob.jump_flag = false;
-                                mob.move_strafe = 0.0;
-                                mob.move_forward = 0.0;
                             }
-                        } else {
-                            mob.jump_flag = false;
                         }
-                    }
-                    MobType::Ghast => {
-                        // The flight of the ghast (`EntityGhast.c_()`): the
-                        // ghast flies to a waypoint and picks a new one when
-                        // it reaches it.
-                        let dx = mob.ghast_waypoint.0 - mob.x;
-                        let dy = mob.ghast_waypoint.1 - mob.y;
-                        let dz = mob.ghast_waypoint.2 - mob.z;
-                        // `MathHelper.a(double)`: the square root is a single
-                        // precision value.
-                        let dist = ((dx * dx + dy * dy + dz * dz).sqrt() as f32) as f64;
-                        if dist < 1.0 || dist > 60.0 {
-                            mob.ghast_waypoint = (
-                                mob.x + ((self.entity_random.next_f32() * 2.0 - 1.0) * 16.0) as f64,
-                                mob.y + ((self.entity_random.next_f32() * 2.0 - 1.0) * 16.0) as f64,
-                                mob.z + ((self.entity_random.next_f32() * 2.0 - 1.0) * 16.0) as f64,
-                            );
-                        } else {
-                            let cooldown = mob.ghast_course_cooldown;
-                            mob.ghast_course_cooldown -= 1;
-                            if cooldown <= 0 {
-                                mob.ghast_course_cooldown +=
-                                    self.entity_random.next_i32_bound(5) + 2;
-                                // The way of the ghast has to be free
-                                // (`EntityGhast.a(double, double, double,
-                                // double)`).
-                                if ghast_path_is_free(mob, &self.world, dist) {
-                                    mob.mot_x += dx / dist * 0.1;
-                                    mob.mot_y += dy / dist * 0.1;
-                                    mob.mot_z += dz / dist * 0.1;
-                                } else {
-                                    mob.ghast_waypoint = (mob.x, mob.y, mob.z);
+                        MobType::Ghast => {
+                            // The flight of the ghast (`EntityGhast.c_()`): the
+                            // ghast flies to a waypoint and picks a new one when
+                            // it reaches it.
+                            let dx = mob.ghast_waypoint.0 - mob.x;
+                            let dy = mob.ghast_waypoint.1 - mob.y;
+                            let dz = mob.ghast_waypoint.2 - mob.z;
+                            // `MathHelper.a(double)`: the square root is a single
+                            // precision value.
+                            let dist = ((dx * dx + dy * dy + dz * dz).sqrt() as f32) as f64;
+                            if dist < 1.0 || dist > 60.0 {
+                                mob.ghast_waypoint = (
+                                    mob.x
+                                        + ((self.entity_random.next_f32() * 2.0 - 1.0) * 16.0)
+                                            as f64,
+                                    mob.y
+                                        + ((self.entity_random.next_f32() * 2.0 - 1.0) * 16.0)
+                                            as f64,
+                                    mob.z
+                                        + ((self.entity_random.next_f32() * 2.0 - 1.0) * 16.0)
+                                            as f64,
+                                );
+                            } else {
+                                let cooldown = mob.ghast_course_cooldown;
+                                mob.ghast_course_cooldown -= 1;
+                                if cooldown <= 0 {
+                                    mob.ghast_course_cooldown +=
+                                        self.entity_random.next_i32_bound(5) + 2;
+                                    // The way of the ghast has to be free
+                                    // (`EntityGhast.a(double, double, double,
+                                    // double)`).
+                                    if ghast_path_is_free(mob, &self.world, dist) {
+                                        mob.mot_x += dx / dist * 0.1;
+                                        mob.mot_y += dy / dist * 0.1;
+                                        mob.mot_z += dz / dist * 0.1;
+                                    } else {
+                                        mob.ghast_waypoint = (mob.x, mob.y, mob.z);
+                                    }
                                 }
                             }
-                        }
 
-                        if let Some((_, _, tx, ty, tz)) = target_pos {
-                            let tdx = tx - mob.x;
-                            let tdy = (ty + 1.0) - (mob.y + 2.0);
-                            let tdz = tz - mob.z;
-                            if tdx * tdx + tdy * tdy + tdz * tdz < 64.0 * 64.0 && has_los {
-                                mob.yaw = -(crate::util::fdlibm::atan2(tdx, tdz) as f32) * 180.0
-                                    / crate::entity::mob::JAVA_PI;
-                                mob.look_yaw = mob.yaw;
-                                mob.ghast_charge += 1;
-                                if mob.ghast_charge == 20 {
-                                    fireballs_to_shoot.push((
-                                        mob_id,
-                                        mob.x,
-                                        mob.y + 2.0,
-                                        mob.z,
-                                        tdx,
-                                        tdy,
-                                        tdz,
-                                    ));
-                                    mob.ghast_charge = -40;
+                            if let Some((_, _, tx, ty, tz)) = target_pos {
+                                let tdx = tx - mob.x;
+                                let tdy = (ty + 1.0) - (mob.y + 2.0);
+                                let tdz = tz - mob.z;
+                                if tdx * tdx + tdy * tdy + tdz * tdz < 64.0 * 64.0 && has_los {
+                                    mob.yaw = -(crate::util::fdlibm::atan2(tdx, tdz) as f32)
+                                        * 180.0
+                                        / crate::entity::mob::JAVA_PI;
+                                    mob.look_yaw = mob.yaw;
+                                    mob.ghast_charge += 1;
+                                    if mob.ghast_charge == 20 {
+                                        fireballs_to_shoot.push((
+                                            mob_id,
+                                            mob.x,
+                                            mob.y + 2.0,
+                                            mob.z,
+                                            tdx,
+                                            tdy,
+                                            tdz,
+                                        ));
+                                        mob.ghast_charge = -40;
+                                    }
+                                } else if mob.ghast_charge > 0 {
+                                    mob.ghast_charge -= 1;
                                 }
-                            } else if mob.ghast_charge > 0 {
-                                mob.ghast_charge -= 1;
-                            }
-                        } else {
-                            // The ghast looks into the direction of the
-                            // flight (`EntityGhast.c_()`).
-                            let yaw = -(crate::util::fdlibm::atan2(mob.mot_x, mob.mot_z) as f32)
-                                * 180.0
-                                / crate::entity::mob::JAVA_PI;
-                            mob.yaw = yaw;
-                            mob.look_yaw = yaw;
-                            if mob.ghast_charge > 0 {
-                                mob.ghast_charge -= 1;
+                            } else {
+                                // The ghast looks into the direction of the
+                                // flight (`EntityGhast.c_()`).
+                                let yaw = -(crate::util::fdlibm::atan2(mob.mot_x, mob.mot_z)
+                                    as f32)
+                                    * 180.0
+                                    / crate::entity::mob::JAVA_PI;
+                                mob.yaw = yaw;
+                                mob.look_yaw = yaw;
+                                if mob.ghast_charge > 0 {
+                                    mob.ghast_charge -= 1;
+                                }
                             }
                         }
-                    }
-                    _ => {
-                        // The path following (`EntityCreature.c_()`).
-                        //
-                        // The mob walks to the next point of the path, turns at
-                        // most 30 degrees and jumps when the point is higher
-                        // or when it is blocked without a path.
-                        //
-                        // The pitch of a creature is reset before it looks at
-                        // its target (`EntityCreature.c_()`).
-                        mob.pitch = 0.0;
-                        let mut jump = false;
-                        if !mob.wolf_sitting && !mob.wolf_shaking {
-                            if !mob.path.is_empty() && self.entity_random.next_i32_bound(100) != 0 {
-                                // The jump flag is reset (`EntityCreature.c_()`).
-                                mob.jump_flag = false;
-                                // The next point of the path (`PathEntity.a`).
-                                let half = ((length + 1.0) as i32) as f64 * 0.5;
-                                let mut point = mob.path.get(mob.path_index).copied();
-                                let threshold = (length * 2.0) as f64;
-                                while let Some((wx, _wy, wz)) = point {
-                                    let dx = wx as f64 + half - mob.x;
-                                    let dz = wz as f64 + half - mob.z;
-                                    if dx * dx + dz * dz >= threshold * threshold {
-                                        break;
+                        _ => {
+                            // The path following (`EntityCreature.c_()`).
+                            //
+                            // The mob walks to the next point of the path, turns at
+                            // most 30 degrees and jumps when the point is higher
+                            // or when it is blocked without a path.
+                            //
+                            // The pitch of a creature is reset before it looks at
+                            // its target (`EntityCreature.c_()`).
+                            mob.pitch = 0.0;
+                            let mut jump = false;
+                            if !mob.wolf_sitting && !mob.wolf_shaking {
+                                if !mob.path.is_empty()
+                                    && self.entity_random.next_i32_bound(100) != 0
+                                {
+                                    // The jump flag is reset (`EntityCreature.c_()`).
+                                    mob.jump_flag = false;
+                                    // The next point of the path (`PathEntity.a`).
+                                    let half = ((length + 1.0) as i32) as f64 * 0.5;
+                                    let mut point = mob.path.get(mob.path_index).copied();
+                                    let threshold = (length * 2.0) as f64;
+                                    while let Some((wx, _wy, wz)) = point {
+                                        let dx = wx as f64 + half - mob.x;
+                                        let dz = wz as f64 + half - mob.z;
+                                        if dx * dx + dz * dz >= threshold * threshold {
+                                            break;
+                                        }
+                                        mob.path_index += 1;
+                                        if mob.path_index >= mob.path.len() {
+                                            mob.path.clear();
+                                            mob.path_index = 0;
+                                            point = None;
+                                            break;
+                                        }
+                                        point = mob.path.get(mob.path_index).copied();
                                     }
-                                    mob.path_index += 1;
-                                    if mob.path_index >= mob.path.len() {
-                                        mob.path.clear();
-                                        mob.path_index = 0;
-                                        point = None;
-                                        break;
+                                    if let Some((wx, wy, wz)) = point {
+                                        let dx = wx as f64 + half - mob.x;
+                                        let dz = wz as f64 + half - mob.z;
+                                        // The height of the mob
+                                        // (`EntityCreature.c_()`): the reference
+                                        // takes the floor of the bottom of the box
+                                        // plus a half.
+                                        let level = (mob.y + 0.5).floor();
+                                        let dy = wy as f64 - level;
+                                        // The reference uses its own
+                                        // `TrigMath.atan2` here.
+                                        let target_yaw = (crate::util::math::trig::atan2(dz, dx)
+                                            * 180.0
+                                            / crate::entity::mob::JAVA_PI_DOUBLE)
+                                            as f32
+                                            - 90.0;
+                                        let mut diff = target_yaw - mob.yaw;
+                                        while diff < -180.0 {
+                                            diff += 360.0;
+                                        }
+                                        while diff >= 180.0 {
+                                            diff -= 360.0;
+                                        }
+                                        mob.yaw += diff.clamp(-30.0, 30.0);
+                                        // The forward input of the mob (`EntityLiving.aA`).
+                                        mob.move_forward = mob.mob_type.move_speed();
+                                        if dy > 0.0 {
+                                            jump = true;
+                                        }
                                     }
-                                    point = mob.path.get(mob.path_index).copied();
-                                }
-                                if let Some((wx, wy, wz)) = point {
-                                    let dx = wx as f64 + half - mob.x;
-                                    let dz = wz as f64 + half - mob.z;
-                                    let dy = wy as f64 - (mob.y.floor() + 0.5);
-                                    // The reference uses its own
-                                    // `TrigMath.atan2` here.
-                                    let target_yaw = (crate::util::math::trig::atan2(dz, dx)
-                                        * 180.0
-                                        / crate::entity::mob::JAVA_PI_DOUBLE)
-                                        as f32
-                                        - 90.0;
-                                    let mut diff = target_yaw - mob.yaw;
-                                    while diff < -180.0 {
-                                        diff += 360.0;
+                                    // The mob looks at its target (`EntityCreature.c_()`).
+                                    if let Some((_, _, tx, ty, tz)) = target_pos {
+                                        look_at(mob, tx, ty, tz, target_eye_height, 30.0, 30.0);
                                     }
-                                    while diff >= 180.0 {
-                                        diff -= 360.0;
-                                    }
-                                    mob.yaw += diff.clamp(-30.0, 30.0);
-                                    // The forward input of the mob (`EntityLiving.aA`).
-                                    mob.move_forward = mob.mob_type.move_speed();
-                                    if dy > 0.0 {
+                                    // The jump when the mob is blocked and has no path.
+                                    if mob.position_changed && mob.path.is_empty() {
                                         jump = true;
                                     }
+                                    // The jump in the water or the lava
+                                    // (`EntityCreature.c_()`); the reference draws
+                                    // the number only while it follows a path.
+                                    if self.entity_random.next_f32() < 0.8
+                                        && (mob.in_water || mob.in_lava)
+                                    {
+                                        jump = true;
+                                    }
+                                } else {
+                                    // The random look around (`EntityLiving.c_()`).
+                                    mob.path.clear();
+                                    mob.path_index = 0;
+                                    // The counter of the ticks without a target
+                                    // (`EntityLiving.ay`).
+                                    mob.no_despawn_ticks += 1;
+                                    // The despawn of the mob (`EntityLiving.U()`).
+                                    if can_desp {
+                                        if let Some((_, _, _, _, dsq)) = closest_player {
+                                            if dsq > 128.0 * 128.0 {
+                                                despawn_list.push(mob_id);
+                                            } else if mob.no_despawn_ticks > 600
+                                                && self.entity_random.next_i32_bound(800) == 0
+                                            {
+                                                if dsq < 32.0 * 32.0 {
+                                                    mob.no_despawn_ticks = 0;
+                                                } else {
+                                                    despawn_list.push(mob_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    random_look(mob, &mut self.entity_random, &players_snapshot);
                                 }
-                                // The mob looks at its target (`EntityCreature.c_()`).
-                                if let Some((_, _, tx, ty, tz)) = target_pos {
-                                    look_at(mob, tx, ty, tz, target_eye_height, 30.0, 30.0);
-                                }
-                                // The jump when the mob is blocked and has no path.
-                                if mob.position_changed && mob.path.is_empty() {
-                                    jump = true;
-                                }
-                                // The jump in the water or the lava
-                                // (`EntityCreature.c_()`); the reference draws
-                                // the number only while it follows a path.
-                                if self.entity_random.next_f32() < 0.8
-                                    && (mob.in_water || mob.in_lava)
-                                {
-                                    jump = true;
-                                }
-                            } else {
-                                // The random look around (`EntityLiving.c_()`).
-                                mob.path.clear();
-                                mob.path_index = 0;
-                                random_look(mob, &mut self.entity_random, &players_snapshot);
                             }
-                        }
-                        if jump {
-                            mob.jump_flag = true;
-                        }
+                            if jump {
+                                mob.jump_flag = true;
+                            }
 
-                        // Target engagement (Melee / Creeper fuse / Skeleton bow / Spider & Wolf leap)
-                        if let Some((tid, is_player, tx, ty, tz)) = target_pos {
-                            let dx = tx - mob.x;
-                            let dy = ty - mob.y;
-                            let dz = tz - mob.z;
-                            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                            // Target engagement (Melee / Creeper fuse / Skeleton bow / Spider & Wolf leap)
+                            if let Some((tid, is_player, tx, ty, tz)) = target_pos {
+                                let dx = tx - mob.x;
+                                let dy = ty - mob.y;
+                                let dz = tz - mob.z;
+                                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
-                            match mob.mob_type {
-                                MobType::Creeper => {
-                                    if has_los
-                                        && ((mob.creeper_state > 0 && dist < 7.0) || dist < 3.0)
-                                    {
-                                        mob.creeper_state = 1;
-                                        mob.creeper_fuse += 1;
-                                        if mob.creeper_fuse >= 30 {
-                                            let radius =
-                                                if mob.creeper_powered { 6.0 } else { 3.0 };
-                                            mob.dead = true;
-                                            creeper_explosions
-                                                .push((mob_id, mob.x, mob.y, mob.z, radius));
-                                        }
-                                    } else {
-                                        mob.creeper_state = -1;
-                                        if mob.creeper_fuse > 0 {
-                                            mob.creeper_fuse -= 1;
-                                        }
-                                    }
-                                }
-                                MobType::Skeleton => {
-                                    if dist < 10.0 && has_los && mob.attack_ticks == 0 {
+                                match mob.mob_type {
+                                    MobType::Creeper => {
+                                        if has_los
+                                            && ((mob.creeper_state > 0 && dist < 7.0) || dist < 3.0)
                                         {
-                                            arrows_to_shoot.push((
-                                                mob_id,
-                                                mob.x,
-                                                mob.y + 1.0,
-                                                mob.z,
-                                                dx,
-                                                (ty + 1.4) - (mob.y + 1.2),
-                                                dz,
-                                            ));
-                                            mob.attack_ticks = 30;
+                                            mob.creeper_state = 1;
+                                            mob.creeper_fuse += 1;
+                                            if mob.creeper_fuse >= 30 {
+                                                let radius =
+                                                    if mob.creeper_powered { 6.0 } else { 3.0 };
+                                                mob.dead = true;
+                                                creeper_explosions
+                                                    .push((mob_id, mob.x, mob.y, mob.z, radius));
+                                            }
+                                        } else {
+                                            mob.creeper_state = -1;
+                                            if mob.creeper_fuse > 0 {
+                                                mob.creeper_fuse -= 1;
+                                            }
                                         }
                                     }
-                                }
-                                MobType::Spider | MobType::Wolf => {
-                                    if dist > 2.0
-                                        && dist < 6.0
-                                        && mob.on_ground
-                                        && self.entity_random.next_i32_bound(10) == 0
-                                    {
-                                        let h = (dx * dx + dz * dz).sqrt().max(0.01);
-                                        mob.mot_x = dx / h * 0.4 + mob.mot_x * 0.2;
-                                        mob.mot_z = dz / h * 0.4 + mob.mot_z * 0.2;
-                                        mob.mot_y = 0.4;
-                                    } else if dist < 2.0 && dy.abs() < 2.0 && mob.attack_ticks <= 0
-                                    {
-                                        mob.attack_ticks = 20;
+                                    MobType::Skeleton => {
+                                        if dist < 10.0 && has_los && mob.attack_ticks == 0 {
+                                            {
+                                                arrows_to_shoot.push((
+                                                    mob_id,
+                                                    mob.x,
+                                                    mob.y + 1.0,
+                                                    mob.z,
+                                                    dx,
+                                                    (ty + 1.4) - (mob.y + 1.2),
+                                                    dz,
+                                                ));
+                                                mob.attack_ticks = 30;
+                                            }
+                                        }
+                                    }
+                                    MobType::Spider | MobType::Wolf => {
+                                        if dist > 2.0
+                                            && dist < 6.0
+                                            && mob.on_ground
+                                            && self.entity_random.next_i32_bound(10) == 0
+                                        {
+                                            let h = (dx * dx + dz * dz).sqrt().max(0.01);
+                                            mob.mot_x = dx / h * 0.4 + mob.mot_x * 0.2;
+                                            mob.mot_z = dz / h * 0.4 + mob.mot_z * 0.2;
+                                            mob.mot_y = 0.4;
+                                        } else if dist < 2.0
+                                            && dy.abs() < 2.0
+                                            && mob.attack_ticks <= 0
+                                        {
+                                            mob.attack_ticks = 20;
+                                            let dmg = mob
+                                                .mob_type
+                                                .attack_damage(mob.slime_size, mob.wolf_tamed);
+                                            if is_player {
+                                                melee_hits_player.push((tid, dmg, mob.x, mob.z));
+                                            } else {
+                                                melee_hits_mob
+                                                    .push((tid, dmg, mob_id, mob.x, mob.z));
+                                            }
+                                        }
+                                    }
+                                    _ => {
                                         let dmg = mob
                                             .mob_type
                                             .attack_damage(mob.slime_size, mob.wolf_tamed);
-                                        if is_player {
-                                            melee_hits_player.push((tid, dmg, mob.x, mob.z));
-                                        } else {
-                                            melee_hits_mob.push((tid, dmg, mob_id, mob.x, mob.z));
+                                        if dmg > 0
+                                            && dist < 2.0
+                                            && dy.abs() < 2.0
+                                            && mob.attack_ticks <= 0
+                                        {
+                                            mob.attack_ticks = 20;
+                                            if is_player {
+                                                melee_hits_player.push((tid, dmg, mob.x, mob.z));
+                                            } else {
+                                                melee_hits_mob
+                                                    .push((tid, dmg, mob_id, mob.x, mob.z));
+                                            }
                                         }
                                     }
                                 }
-                                _ => {
-                                    let dmg =
-                                        mob.mob_type.attack_damage(mob.slime_size, mob.wolf_tamed);
-                                    if dmg > 0
-                                        && dist < 2.0
-                                        && dy.abs() < 2.0
-                                        && mob.attack_ticks <= 0
-                                    {
-                                        mob.attack_ticks = 20;
-                                        if is_player {
-                                            melee_hits_player.push((tid, dmg, mob.x, mob.z));
-                                        } else {
-                                            melee_hits_mob.push((tid, dmg, mob_id, mob.x, mob.z));
-                                        }
-                                    }
-                                }
+                            } else if mob.mob_type == MobType::Creeper && mob.creeper_fuse > 0 {
+                                mob.creeper_state = -1;
+                                mob.creeper_fuse -= 1;
                             }
-                        } else if mob.mob_type == MobType::Creeper && mob.creeper_fuse > 0 {
-                            mob.creeper_state = -1;
-                            mob.creeper_fuse -= 1;
                         }
                     }
                 }
@@ -5650,7 +5728,9 @@ impl Server {
                 // and jumps on the ground.
                 if mob.jump_flag {
                     if mob.in_water || mob.in_lava {
-                        mob.mot_y += 0.04;
+                        // The constant of the reference is the single precision
+                        // value of `0.04` (`EntityLiving.v()`).
+                        mob.mot_y += 0.039_999_999_105_930_33;
                     } else if mob.on_ground {
                         // `EntityLiving.O()`: the constant of the reference
                         // is the single precision value.
@@ -5664,15 +5744,23 @@ impl Server {
                 mob.yaw_drift *= 0.9;
 
                 // The movement of the mob (`EntityLiving.a(float, float)`).
-                let was_on_ground = mob.on_ground;
-                let fall_damage = mob.apply_movement(
+                was_on_ground = mob.on_ground;
+                fall_damage = mob.apply_movement(
                     &self.world,
                     &entity_boxes,
                     &mut collision_scratch,
                     self.config.mechanics.spiders_climb_walls,
                     mob.mob_type == MobType::Ghast,
                 );
+            }
 
+            // The fire of the mob (`Entity.move()`): the damage of the fire,
+            // the counter of the fire and the sound of the fizz. The
+            // reference does it inside the movement of the entity, so it is
+            // between the movement of the mob and the rest of its update.
+            self.mob_fire_phase(mob_id);
+
+            if let Some(mob) = self.entities.get_mob_mut(mob_id) {
                 // The swim of the squid (`EntitySquid.v()`): the phase of the
                 // swim and the velocity of the squid, they are set after the
                 // movement of the mob.
@@ -5726,7 +5814,9 @@ impl Server {
                         if !mob.dead {
                             mob.mot_x = 0.0;
                             mob.mot_y -= 0.08;
-                            mob.mot_y *= 0.98;
+                            // The constant of the reference is the single
+                            // precision value of `0.98`.
+                            mob.mot_y *= 0.980_000_019_073_486_3;
                             mob.mot_z = 0.0;
                         }
                     }
@@ -5754,10 +5844,10 @@ impl Server {
                     let moved = crate::util::math::math_helper_a(dx * dx + dz * dz);
                     let mut look = mob.look_yaw;
                     if moved > 0.05 {
-                        // The reference uses its own `TrigMath.atan2` here.
-                        look = (crate::util::math::trig::atan2(dz, dx) * 180.0
-                            / crate::entity::mob::JAVA_PI_DOUBLE)
-                            as f32
+                        // The reference uses its own `TrigMath.atan2` here and
+                        // the whole expression is a single precision one.
+                        look = (crate::util::math::trig::atan2(dz, dx) as f32) * 180.0
+                            / crate::entity::mob::JAVA_PI
                             - 90.0;
                     }
                     let mut diff = look - mob.look_yaw;
@@ -5788,6 +5878,15 @@ impl Server {
                     for _ in 0..fdmg {
                         burned_mobs.push(mob_id);
                     }
+                }
+            }
+
+            if left_the_world {
+                // The corpse of the mob left the world (`Entity.die()` and
+                // `World.tickEntities`): the client stops to see it, the
+                // entity itself is removed at the beginning of the next tick.
+                for out in self.tracker.untrack_mob(mob_id) {
+                    self.send_tracked(out.recipient_id, out.packet);
                 }
             }
 
@@ -5933,10 +6032,7 @@ impl Server {
             out.push(other.aabb());
         }
         for player in self.entities.iter_players() {
-            let (length, width) = player.box_size;
-            out.push(Aabb::for_entity(
-                player.x, player.y, player.z, length, width, 0.0, 0.0,
-            ));
+            out.push(player.bounding_box());
         }
     }
 
@@ -5947,9 +6043,84 @@ impl Server {
     /// idle sound of the mob draw from the shared random of the entities. The
     /// order of the draws is the order of the reference: the splash, the
     /// damage of the fire, the damage of the lava, the idle sound.
-    fn mob_update_phase(&mut self, mob_id: i32) {
+    /// The bottom of the box of the target (`Entity.boundingBox.b`).
+    ///
+    /// The goal of the path of a mob is the bottom of the box of its target,
+    /// not its position.
+    fn target_box_bottom(&self, target_id: i32, is_player: bool, target_y: f64) -> f64 {
+        if is_player {
+            self.entities
+                .get_player(target_id)
+                .map(|player| player.box_bottom())
+                .unwrap_or(target_y)
+        } else {
+            self.entities
+                .get_mob(target_id)
+                .map(|mob| mob.y + mob.step_offset as f64)
+                .unwrap_or(target_y)
+        }
+    }
+
+    /// The fire of the mob (`Entity.move()`).
+    ///
+    /// The reference checks the blocks of the box of the entity at the end
+    /// of the movement: a fire or a lava block in the box damages the mob and
+    /// sets the counter of the fire, the sound of the fizz is played when the
+    /// entity leaves the fire.
+    fn mob_fire_phase(&mut self, mob_id: i32) {
+        let mut burn = false;
+        let mut fizz = false;
+        if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+            let box_ = mob.aabb();
+            // `Entity.ac()`: the entity is in the water or the position is
+            // one where the mobs can live.
+            let burning = mob.was_in_water
+                || self.world.can_spawn_at(
+                    mob.x.floor() as i32,
+                    mob.y.floor() as i32,
+                    mob.z.floor() as i32,
+                );
+            if self
+                .world
+                .has_fire_or_lava_in(&box_.shrunk(0.001, 0.001, 0.001))
+            {
+                burn = true;
+                if !burning {
+                    mob.fire_ticks = 300;
+                }
+            } else if mob.fire_ticks <= 0 {
+                mob.fire_ticks = -1;
+            }
+            if burning && mob.fire_ticks > 0 {
+                fizz = true;
+                mob.fire_ticks = -1;
+            }
+        }
+        if burn {
+            // `Entity.burn(1)`: the damage of the fire.
+            self.damage_mob(mob_id, 1, None, false);
+        }
+        if fizz {
+            // The sound of the fizz (`Entity.move()`): the pitch and the
+            // volume are two numbers.
+            let _ = self.entity_random.next_f32();
+            let _ = self.entity_random.next_f32();
+        }
+    }
+
+    /// The update of the mob before the AI of the mob.
+    ///
+    /// Java `Entity.R()` and `EntityLiving.R()`: the splash in the water, the
+    /// damage of the fire and the lava and the idle sound of the mob draw
+    /// from the shared random of the entities. The order of the draws is the
+    /// order of the reference: the splash, the damage of the fire, the damage
+    /// of the lava, the idle sound.
+    ///
+    /// The function answers whether the mob left the world: the corpse of a
+    /// dead mob lives twenty ticks (`EntityLiving.R()`).
+    fn mob_update_phase(&mut self, mob_id: i32) -> bool {
         let Some(mob) = self.entities.get_mob(mob_id) else {
-            return;
+            return false;
         };
         let (x, _y, z) = (mob.x, mob.y, mob.z);
         let aabb = mob.aabb();
@@ -6027,13 +6198,15 @@ impl Server {
         if in_lava {
             let mut burning = false;
             if let Some(mob) = self.entities.get_mob_mut(mob_id) {
-                if !mob.fire_proof() {
-                    mob.fire_ticks = 600;
-                    burning = true;
-                }
+                burning = !mob.fire_proof();
             }
             if burning {
+                // The reference damages the mob first and sets the counter of
+                // the fire afterwards (`Entity.ab()`).
                 self.damage_mob(mob_id, 4, None, false);
+                if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                    mob.fire_ticks = 600;
+                }
             }
         }
 
@@ -6081,6 +6254,31 @@ impl Server {
             }
             mob.just_created = false;
         }
+
+        // The death of the mob (`EntityLiving.R()`): the counter of the death
+        // is increased and the mob leaves the world when it passes twenty.
+        // The particles of the death are drawn then.
+        let mut left_the_world = false;
+        if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+            if mob.health <= 0 {
+                mob.death_ticks += 1;
+                if mob.death_ticks > 20 {
+                    left_the_world = true;
+                }
+            }
+        }
+        if left_the_world {
+            // The particles of the death (`EntityLiving.R()`): twenty times
+            // three normal values and one number.
+            for _ in 0..20 {
+                let _ = self.entity_random.next_gaussian();
+                let _ = self.entity_random.next_gaussian();
+                let _ = self.entity_random.next_gaussian();
+                let _ = self.entity_random.next_f32();
+            }
+            return true;
+        }
+        false
     }
 
     fn damage_player_from_mob(
@@ -10731,10 +10929,9 @@ mod tests {
     /// The light of a scenario: the sky light is 15 above the floor of the
     /// scenario and 0 below it.
     ///
-    /// The world of the reference harness is generated with the normal
-    /// generator, so the light of the hills around the floor would be an
-    /// artefact of the terrain. The port sets the same light, otherwise the
-    /// mobs would walk to a different goal.
+    /// The harness of the reference sets the sky light of the area of the
+    /// scenario by hand, so the mobs score the blocks of their walk with the
+    /// same light.
     fn scenario_sky_light(world: &mut World, floor_y: i32, radius: i32) {
         let min = -radius;
         let max = radius;
@@ -10782,10 +10979,11 @@ mod tests {
         let mut server = Server::new(config, rx, Arc::new(AtomicBool::new(true)));
 
         // The chunks of the scenario: they hold the terrain of the scenario
-        // and the light.
+        // and the light. The harness of the reference generates the chunks
+        // with the normal generator, so the port does the same.
         for cx in -2..=1 {
             for cz in -2..=1 {
-                server.world.ensure_chunk_base(ChunkPos::new(cx, cz));
+                server.world.populate_chunk(ChunkPos::new(cx, cz));
             }
         }
 
@@ -10863,6 +11061,8 @@ mod tests {
             }
         }
         while server.world.java_do_lighting() {}
+
+        // The sky light of the scenario (`scenarioLight` of the harness).
         scenario_sky_light(&mut server.world, floor_y, radius);
 
         if let Some((px, py, pz)) = player {
@@ -10981,11 +11181,17 @@ mod tests {
     /// The trace of a scenario: the state of the mob after every tick.
     fn mob_scenario_trace(scenario: &str, ticks: usize) -> Vec<String> {
         let (mut server, mob_id) = mob_scenario_server(scenario);
-        let mut lines = Vec::with_capacity(ticks);
+        let mut lines: Vec<String> = Vec::with_capacity(ticks);
         for tick in 0..ticks {
             server.tick_mobs();
             let Some(mob) = server.entities.get_mob(mob_id) else {
-                break;
+                // The mob left the world: the harness of the reference keeps
+                // the entity and prints its frozen state.
+                if let Some(last) = lines.last() {
+                    let rest = &last[last.find(' ').unwrap_or(0)..];
+                    lines.push(format!("{tick}{rest}"));
+                }
+                continue;
             };
             // The target of the reference trace is the player (the id 1000 of
             // the harness) or nothing.
@@ -11015,15 +11221,15 @@ mod tests {
         lines
     }
 
-    /// The scenarios that match the reference for the whole trace.
-    ///
-    /// The other scenarios still differ (see DEVELOPMENT.md), the test keeps
-    /// the ones that match from diverging.
+    /// The traces of the port have to be the traces of the reference, tick by
+    /// tick and without a tolerance.
     #[test]
     fn the_mob_scenarios_of_the_reference_match() {
         let golden = golden_mob_traces();
         let mut failures = Vec::new();
-        for name in ["flat", "chase", "slime", "ghast"] {
+        for name in [
+            "flat", "chase", "water", "wall", "lava", "slime", "squid", "ghast",
+        ] {
             let Some(expected) = golden.iter().find(|(scenario, _)| *scenario == name) else {
                 failures.push(format!("{name}: the golden trace is missing"));
                 continue;
@@ -11135,7 +11341,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "the comparison with the traces of the reference"]
+    #[ignore = "the long comparison with the traces of the reference"]
     fn the_mob_movement_matches_the_poseidon_reference() {
         let golden = golden_mob_traces();
         let mut failures = Vec::new();

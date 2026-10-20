@@ -1,12 +1,13 @@
-//! The `fdlibm` implementation of `atan` and `atan2`.
+//! The `fdlibm` implementation of `atan`, `atan2` and `log`.
 //!
 //! The JVM computes `Math.atan2` with the `fdlibm` library (the `StrictMath`
 //! one), and its result differs from the result of the system library in the
 //! last bit. The port has to use the same algorithm, otherwise the angles of
-//! the mobs differ by one unit in the last place.
+//! the mobs differ by one unit in the last place. The same is true for the
+//! logarithm of the normal distribution of `java.util.Random`.
 //!
-//! The code is a direct translation of the `s_atan.c` and `e_atan2.c` files of
-//! the `libfdlibm` of the OpenJDK.
+//! The code is a direct translation of the `s_atan.c`, `e_atan2.c` and
+//! `e_log.c` files of the `libfdlibm` of the OpenJDK.
 
 #[allow(clippy::excessive_precision, clippy::approx_constant)]
 const ATANHI: [f64; 4] = [
@@ -58,6 +59,105 @@ fn hi(value: f64) -> u32 {
 /// The low word of the bits of the value.
 fn lo(value: f64) -> u32 {
     value.to_bits() as u32
+}
+
+/// The high word of the bits of the value, replaced.
+fn set_hi(value: f64, high: u32) -> f64 {
+    f64::from_bits((value.to_bits() & 0x0000_0000_ffff_ffff) | ((high as u64) << 32))
+}
+
+#[allow(clippy::excessive_precision)]
+const LN2_HI: f64 = 6.93147180369123816490e-01;
+#[allow(clippy::excessive_precision)]
+const LN2_LO: f64 = 1.90821492927058770002e-10;
+#[allow(clippy::excessive_precision)]
+const LG1: f64 = 6.666666666666735130e-01;
+#[allow(clippy::excessive_precision)]
+const LG2: f64 = 3.999999999940941908e-01;
+#[allow(clippy::excessive_precision)]
+const LG3: f64 = 2.857142874366239149e-01;
+#[allow(clippy::excessive_precision)]
+const LG4: f64 = 2.222219843214978396e-01;
+#[allow(clippy::excessive_precision)]
+const LG5: f64 = 1.818357216161805012e-01;
+#[allow(clippy::excessive_precision)]
+const LG6: f64 = 1.531383769920937332e-01;
+#[allow(clippy::excessive_precision)]
+const LG7: f64 = 1.479819860511658591e-01;
+#[allow(clippy::excessive_precision)]
+const TWO54: f64 = 1.80143985094819840000e+16;
+
+/// Java `StrictMath.log(double)`.
+///
+/// The `fdlibm` logarithm of the OpenJDK, the normal distribution of
+/// `java.util.Random` uses it.
+#[allow(clippy::excessive_precision)]
+pub fn log(x: f64) -> f64 {
+    let mut value = x;
+    let mut high = hi(value);
+    let mut k: i32 = 0;
+
+    if high < 0x0010_0000 {
+        if high & 0x7fff_ffff < 0x0010_0000 {
+            // The zero and the negative numbers.
+            if (high & 0x7fff_ffff) | lo(value) == 0 {
+                return f64::NEG_INFINITY;
+            }
+            return f64::NAN;
+        }
+        // A subnormal number, the value is scaled up.
+        k -= 54;
+        value *= TWO54;
+        high = hi(value);
+    }
+    if high >= 0x7ff0_0000 {
+        // The infinities and the not a number.
+        return value + value;
+    }
+    k += ((high >> 20) as i32) - 1023;
+    high &= 0x000f_ffff;
+    let i = (high + 0x95f64) & 0x0010_0000;
+    value = set_hi(value, high | (i ^ 0x3ff0_0000));
+    k += (i >> 20) as i32;
+    let f = value - 1.0;
+    if (0x000f_ffff & (2 + high)) < 3 {
+        // The logarithm of a number that is very close to one.
+        if f == 0.0 {
+            if k == 0 {
+                return 0.0;
+            }
+            let dk = k as f64;
+            return dk * LN2_HI + dk * LN2_LO;
+        }
+        let r = f * f * (0.5 - 0.333_333_333_333_333_33 * f);
+        if k == 0 {
+            return f - r;
+        }
+        let dk = k as f64;
+        return dk * LN2_HI - ((r - dk * LN2_LO) - f);
+    }
+    let s = f / (2.0 + f);
+    let dk = k as f64;
+    let z = s * s;
+    let i = high as i32 - 0x6147a;
+    let w = z * z;
+    let j = 0x6b851 - high as i32;
+    let t1 = w * (LG2 + w * (LG4 + w * LG6));
+    let t2 = z * (LG1 + w * (LG3 + w * (LG5 + w * LG7)));
+    let i = i | j;
+    let r = t2 + t1;
+    if i > 0 {
+        let hfsq = 0.5 * f * f;
+        if k == 0 {
+            f - (hfsq - s * (hfsq + r))
+        } else {
+            dk * LN2_HI - ((hfsq - (s * (hfsq + r) + dk * LN2_LO)) - f)
+        }
+    } else if k == 0 {
+        f - s * (f - r)
+    } else {
+        dk * LN2_HI - ((s * (f - r) - dk * LN2_LO) - f)
+    }
 }
 
 /// Java `StrictMath.atan(double)`.

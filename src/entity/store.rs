@@ -71,7 +71,15 @@ pub struct EntityStore {
     chunk_index: HashMap<ChunkPos, HashSet<i32>>,
     dropped_items: HashMap<i32, DroppedItem>,
     boats: HashMap<i32, Boat>,
-    mobs: HashMap<i32, Mob>,
+    /// The mobs in the order of their insertion (`World.entityList` of the
+    /// reference).
+    ///
+    /// The reference keeps the entities in a list and walks it in the order of
+    /// the insertion. The mobs share one random stream, so the order of the
+    /// update decides the order of the draws: it has to be reproducible.
+    mobs: Vec<Mob>,
+    /// The position of a mob in `mobs` (`World.entityList.indexOf`).
+    mob_index: HashMap<i32, usize>,
     projectiles: HashMap<i32, Projectile>,
     primed_tnts: HashMap<i32, PrimedTnt>,
     minecarts: HashMap<i32, Minecart>,
@@ -93,7 +101,8 @@ impl EntityStore {
             chunk_index: HashMap::new(),
             dropped_items: HashMap::new(),
             boats: HashMap::new(),
-            mobs: HashMap::new(),
+            mobs: Vec::new(),
+            mob_index: HashMap::new(),
             projectiles: HashMap::new(),
             primed_tnts: HashMap::new(),
             minecarts: HashMap::new(),
@@ -365,44 +374,62 @@ impl EntityStore {
     ) -> i32 {
         let entity_id = self.allocate_id();
         let mob = Mob::new(entity_id, mob_type, x, y, z, rng);
-        self.mobs.insert(entity_id, mob);
-        self.tag_spawned(entity_id);
+        self.insert_mob(mob);
         entity_id
     }
 
     pub fn insert_mob(&mut self, mob: Mob) -> i32 {
         let id = mob.entity_id;
-        self.mobs.insert(id, mob);
+        match self.mob_index.get(&id).copied() {
+            Some(index) => self.mobs[index] = mob,
+            None => {
+                self.mob_index.insert(id, self.mobs.len());
+                self.mobs.push(mob);
+            }
+        }
         self.tag_spawned(id);
         id
     }
 
     pub fn get_mob(&self, entity_id: i32) -> Option<&Mob> {
-        self.mobs.get(&entity_id)
+        self.mob_index
+            .get(&entity_id)
+            .and_then(|index| self.mobs.get(*index))
     }
 
     pub fn get_mob_mut(&mut self, entity_id: i32) -> Option<&mut Mob> {
-        self.mobs.get_mut(&entity_id)
+        let index = *self.mob_index.get(&entity_id)?;
+        self.mobs.get_mut(index)
     }
 
     pub fn remove_mob(&mut self, entity_id: i32) -> Option<Mob> {
         self.remove_dimension(entity_id);
-        self.mobs.remove(&entity_id)
+        let index = self.mob_index.remove(&entity_id)?;
+        let mob = self.mobs.remove(index);
+        // The positions of the mobs after the removed one are shifted.
+        for position in self.mob_index.values_mut() {
+            if *position > index {
+                *position -= 1;
+            }
+        }
+        Some(mob)
     }
 
+    /// The mobs in the order of their insertion (`World.entityList`).
     pub fn iter_mobs(&self) -> impl Iterator<Item = &Mob> {
-        self.mobs.values()
+        self.mobs.iter()
     }
 
+    /// The mobs in the order of their insertion (`World.entityList`).
     pub fn iter_mobs_mut(&mut self) -> impl Iterator<Item = &mut Mob> {
-        self.mobs.values_mut()
+        self.mobs.iter_mut()
     }
 
     pub fn count_mob_categories(&self, dimension: i32) -> (usize, usize, usize) {
         let mut monsters = 0;
         let mut animals = 0;
         let mut water = 0;
-        for m in self.mobs.values() {
+        for m in self.iter_mobs() {
             if m.dead || self.dimension_of(m.entity_id) != dimension {
                 continue;
             }
