@@ -39,6 +39,14 @@ pub fn sqrt_f32(value: f32) -> f32 {
     value.sqrt()
 }
 
+/// Java `MathHelper.c(float)`: the square root of a single precision value.
+///
+/// The reference takes the square root in a double precision and rounds
+/// the result to a single precision value.
+pub fn math_helper_c(value: f32) -> f32 {
+    (value as f64).sqrt() as f32
+}
+
 /// Java `MathHelper.a(double)`: the square root of a double, rounded to a
 /// single precision value.
 ///
@@ -141,6 +149,20 @@ pub fn cos(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Java `MathHelper.c(float)`: the square root of a single precision
+    /// value, taken in a double precision and rounded to a single
+    /// precision one.
+    #[test]
+    fn the_square_root_of_the_reference_is_a_single_precision_value() {
+        assert_eq!(math_helper_c(4.0), 2.0);
+        assert_eq!(math_helper_c(0.0), 0.0);
+        // The root of a value that is not a square is rounded to a single
+        // precision value.
+        assert_eq!(math_helper_c(3.0), 1.732_050_8);
+        assert_eq!(math_helper_c(9.0), 3.0);
+    }
+
     #[test]
     #[allow(clippy::excessive_precision, clippy::approx_constant)]
     fn trig_matches_the_reference() {

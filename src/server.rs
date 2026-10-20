@@ -5233,12 +5233,17 @@ impl Server {
                 }
             }
 
-            // Spider forgets target in bright daylight with 1/100 chance
+            // The spider forgets its target in the light of the day with a
+            // chance of one in a hundred (`EntitySpider.a`): the light of
+            // the mob is the **curve** of the light of the reference
+            // (`c(1.0F)`), the raw level of the light must be at least 12.
             if mtype == MobType::Spider && target_pos.is_some() {
-                let bx = mx.floor() as i32;
-                let by = my.floor() as i32;
-                let bz = mz.floor() as i32;
-                if chunk_light_at(&self.world, bx, by, bz, sky_sub) > 7
+                let light = self
+                    .entities
+                    .get_mob(mob_id)
+                    .map(|mob| crate::entity::mob::mob_light_at(&self.world, mob, sky_sub))
+                    .unwrap_or(0.0);
+                if light > 0.5
                     && self
                         .entities
                         .get_mob_mut(mob_id)
@@ -5325,7 +5330,16 @@ impl Server {
                     let dx = tx - mob.x;
                     let dy = ty - mob.y;
                     let dz = tz - mob.z;
-                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                    // The distance to the target (`Entity.f(Entity)`): the
+                    // differences are single precision values, their sum is
+                    // a single precision one and the square root is taken in
+                    // a double precision and rounded to a single precision
+                    // value (`MathHelper.c`).
+                    let dist = f64::from(crate::util::math::math_helper_c(
+                        (dx as f32) * (dx as f32)
+                            + (dy as f32) * (dy as f32)
+                            + (dz as f32) * (dz as f32),
+                    ));
 
                     match mob.mob_type {
                         MobType::Creeper => {
@@ -5402,16 +5416,28 @@ impl Server {
                             }
                         }
                         MobType::Spider | MobType::Wolf => {
+                            // The leap of the spider and of the wolf
+                            // (`EntitySpider.a` and `EntityWolf.a`): the
+                            // number of the reference is drawn before the
+                            // check of the ground.
                             if has_los
                                 && dist > 2.0
                                 && dist < 6.0
-                                && mob.on_ground
                                 && self.entity_random.next_i32_bound(10) == 0
                             {
-                                let h = (dx * dx + dz * dz).sqrt().max(0.01);
-                                mob.mot_x = dx / h * 0.4 + mob.mot_x * 0.2;
-                                mob.mot_z = dz / h * 0.4 + mob.mot_z * 0.2;
-                                mob.mot_y = 0.4;
+                                if mob.on_ground {
+                                    // The horizontal distance is a single
+                                    // precision square root
+                                    // (`MathHelper.a`).
+                                    let h = f64::from(crate::util::math::math_helper_a(
+                                        dx * dx + dz * dz,
+                                    ));
+                                    mob.mot_x = dx / h * 0.5 * 0.800_000_011_920_929
+                                        + mob.mot_x * 0.200_000_002_980_232_24;
+                                    mob.mot_z = dz / h * 0.5 * 0.800_000_011_920_929
+                                        + mob.mot_z * 0.200_000_002_980_232_24;
+                                    mob.mot_y = 0.400_000_005_960_464_5;
+                                }
                             } else if has_los
                                 && mob.mob_type == MobType::Spider
                                 && dist < 2.0
@@ -11701,6 +11727,35 @@ mod tests {
     /// The harness of the reference sets the sky light of the area of the
     /// scenario by hand, so the mobs score the blocks of their walk with the
     /// same light.
+    /// The sky light of the region of the scenario.
+    ///
+    /// The level of the light is the same everywhere, the raw level of the
+    /// light of the reference is not always 15.
+    fn scenario_light_level(world: &mut World, level: u8) {
+        let radius = 24;
+        let min = -radius;
+        let max = radius;
+        for cx in (min >> 4)..=(max >> 4) {
+            for cz in (min >> 4)..=(max >> 4) {
+                let Some(chunk) = world.get_chunk_mut(ChunkPos::new(cx, cz)) else {
+                    continue;
+                };
+                for x in 0..16usize {
+                    for z in 0..16usize {
+                        let wx = cx * 16 + x as i32;
+                        let wz = cz * 16 + z as i32;
+                        if !(min..=max).contains(&wx) || !(min..=max).contains(&wz) {
+                            continue;
+                        }
+                        for y in 0..128usize {
+                            chunk.set_sky_light(x, y, z, level);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn scenario_sky_light(world: &mut World, floor_y: i32, radius: i32) {
         let min = -radius;
         let max = radius;
@@ -12637,6 +12692,53 @@ mod tests {
         // The flag is set again at the end of the movement, the mob is
         // still in the web.
         assert!(mob.web, "the mob is still in the web");
+    }
+
+    /// The spider draws a number only in the light of the day.
+    ///
+    /// Java `EntitySpider.a`: the light of the mob is the **curve** of the
+    /// light of the reference (`c(1.0F)`), the spider draws the number of
+    /// the target only when the curve is greater than 0.5, that is when the
+    /// raw level of the light is at least 12.
+    #[test]
+    fn the_spider_draws_a_number_only_in_the_light_of_the_day() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.mob_type = MobType::Spider;
+        }
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.x = 3.0;
+            player.y = 64.0;
+            player.z = 0.5;
+        }
+        // The target of the spider is set by hand: in the light the spider
+        // does not look for a player (`EntitySpider.findTarget()`).
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.target_id = Some(player_id);
+        }
+        // The light of the column of the mob is 11: the curve of the light
+        // is 0.437, the spider does not draw the number of the reference.
+        scenario_light_level(&mut server.world, 11);
+        let before = server.entity_random.draws;
+        for _ in 0..10 {
+            server.tick_mobs();
+        }
+        let dim = server.entity_random.draws - before;
+        // The light is 15: the curve is 1.0, the spider draws one number
+        // every tick.
+        scenario_light_level(&mut server.world, 15);
+        let before = server.entity_random.draws;
+        for _ in 0..10 {
+            server.tick_mobs();
+        }
+        let bright = server.entity_random.draws - before;
+        assert!(
+            bright - dim >= 10,
+            "the spider draws a number every tick in the light of the day ({} - {})",
+            bright,
+            dim
+        );
     }
 
     /// The mobs push each other away.
