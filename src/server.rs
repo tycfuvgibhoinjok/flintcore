@@ -4722,6 +4722,8 @@ impl Server {
             // mob is not in the window of the invulnerability.
             // The flag of the reference: the hit is applied only when the
             // mob is not in the window of the invulnerability.
+            // The time of the animation of the hit (`EntityLiving.ao`).
+            mob.attack_anim = 1.5;
             let (eff_dmg, applied) = if mob.no_damage_ticks > 10 {
                 if adj_dmg <= mob.last_damage {
                     return false;
@@ -4731,7 +4733,11 @@ impl Server {
                 (diff, false)
             } else {
                 mob.last_damage = adj_dmg;
+                mob.health_before_damage = mob.health;
                 mob.no_damage_ticks = 20;
+                // The time of the red flash of the hurt
+                // (`EntityLiving.hurtTicks = this.ae = 10`).
+                mob.hurt_ticks = 10;
                 // The sound of the hit (`EntityLiving.damageEntity`): the
                 // reference draws two numbers for the pitch and the volume.
                 let pitch =
@@ -6824,6 +6830,11 @@ impl Server {
         if let Some(mob) = self.entities.get_mob_mut(mob_id) {
             if mob.no_damage_ticks > 0 {
                 mob.no_damage_ticks -= 1;
+            }
+            // The time of the red flash of the hurt
+            // (`EntityLiving.hurtTicks`).
+            if mob.hurt_ticks > 0 {
+                mob.hurt_ticks -= 1;
             }
             if mob.attack_ticks > 0 {
                 mob.attack_ticks -= 1;
@@ -12380,6 +12391,36 @@ mod tests {
             2,
             "the sound of the hit draws two numbers"
         );
+    }
+
+    /// The mob has the state of the hit of the reference.
+    ///
+    /// Java `EntityLiving.damageEntity`: the mob has ten ticks of the red
+    /// flash of the hurt (`ae`) and the health it had before the hit
+    /// (`ac`).
+    #[test]
+    fn the_mob_has_the_state_of_the_hit() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        let health = server
+            .entities
+            .get_mob(mob_id)
+            .expect("the mob is alive")
+            .health;
+        server.damage_mob(mob_id, 3, None, false);
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.health, health - 3);
+        // The time of the red flash of the hurt.
+        assert_eq!(mob.hurt_ticks, 10);
+        // The health of the mob before the hit.
+        assert_eq!(mob.health_before_damage, health);
+        // The time of the animation of the hit.
+        assert_eq!(mob.attack_anim, 1.5);
+
+        // The time of the red flash is decreased every tick
+        // (`EntityLiving.R()`).
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.hurt_ticks, 9);
     }
 
     /// The mobs push each other away.

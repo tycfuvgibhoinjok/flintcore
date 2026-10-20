@@ -273,6 +273,18 @@ pub struct Mob {
     pub air_ticks: i16,
     pub no_damage_ticks: u8,
     pub last_damage: i16,
+    /// Java `EntityLiving.ae`: the time of the red flash of the hurt. The
+    /// mob has ten ticks of it after a hit (`EntityLiving.damageEntity`).
+    pub hurt_ticks: i32,
+    /// Java `EntityLiving.ac`: the health of the mob before the last hit.
+    pub health_before_damage: i16,
+    /// Java `EntityLiving.ao`: the time of the animation of the hit.
+    pub attack_anim: f32,
+    /// Java `EntityLiving.an`: the value of `ao` of the previous tick.
+    pub attack_anim_prev: f32,
+    /// Java `EntityLiving.ap`: the distance the mob walked, the client
+    /// uses it for the legs of the mob.
+    pub walk_dist: f32,
     pub attack_ticks: i32,
     pub fire_ticks: i32,
     pub fall_distance: f32,
@@ -438,6 +450,11 @@ impl Mob {
             air_ticks: 300,
             no_damage_ticks: 0,
             last_damage: 0,
+            hurt_ticks: 0,
+            health_before_damage: 0,
+            attack_anim: 0.0,
+            attack_anim_prev: 0.0,
+            walk_dist: 0.0,
             attack_ticks: 0,
             fire_ticks: 0,
             fall_distance: 0.0,
@@ -669,6 +686,19 @@ impl Mob {
         self.on_ground = result.on_ground;
         self.position_changed = result.position_changed;
         self.horiz_collided = result.moved_x != self.mot_x || result.moved_z != self.mot_z;
+
+        // The animation of the walk (`EntityLiving.v()`): the time of the
+        // animation of the hit follows the speed of the mob, and the
+        // distance of the walk grows with it.
+        self.attack_anim_prev = self.attack_anim;
+        let dx = self.x - self.last_x;
+        let dz = self.z - self.last_z;
+        let mut walk = crate::util::math::math_helper_a(dx * dx + dz * dz) * 4.0;
+        if walk > 1.0 {
+            walk = 1.0;
+        }
+        self.attack_anim += (walk - self.attack_anim) * 0.4;
+        self.walk_dist += self.attack_anim;
 
         // The fall distance (`Entity.a(double, boolean)`).
         let mut fall_damage = 0.0;
@@ -1121,6 +1151,10 @@ impl Mob {
         tag.insert("Fire", NbtTag::Short(self.fire_ticks as i16));
         tag.insert("Health", NbtTag::Short(self.health));
         tag.insert("OnGround", NbtTag::Byte(i8::from(self.on_ground)));
+        // The state of the hit of the reference (`EntityLiving`): the time of
+        // the red flash of the hurt and the distance of the walk.
+        tag.insert("HurtTime", NbtTag::Short(self.hurt_ticks as i16));
+        tag.insert("WalkDist", NbtTag::Float(self.walk_dist));
 
         match self.mob_type {
             MobType::Pig => {
@@ -1204,6 +1238,12 @@ impl Mob {
         }
         if let Some(og) = tag.get_bool("OnGround") {
             mob.on_ground = og;
+        }
+        if let Some(h) = tag.get_i16("HurtTime") {
+            mob.hurt_ticks = h as i32;
+        }
+        if let Some(w) = tag.get_f32("WalkDist") {
+            mob.walk_dist = w;
         }
 
         match mob_type {
