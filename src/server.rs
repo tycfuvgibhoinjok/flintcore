@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::entity::mob::{
-    chunk_light_at, evaluate_natural_spawns, find_path, light_curve, world_sky_subtracted, MobType,
+    chunk_light_at, evaluate_natural_spawns, find_path, light_curve, MobType,
 };
 use crate::entity::physics::Aabb;
 use crate::entity::player::DiggingState;
@@ -4280,7 +4280,7 @@ impl Server {
             return;
         }
 
-        let sky_sub = world_sky_subtracted(self.world.world_time());
+        let sky_sub = self.world.sky_factor();
         let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
         let mut to_spawn = Vec::new();
         let mut delay_updates = Vec::new();
@@ -4940,7 +4940,7 @@ impl Server {
         if mob_ids.is_empty() {
             return;
         }
-        let sky_sub = world_sky_subtracted(self.world.world_time());
+        let sky_sub = self.world.sky_factor();
         let is_daytime = sky_sub < 4;
         let players_snapshot: Vec<(i32, String, f64, f64, f64, bool)> = self
             .entities
@@ -13119,6 +13119,91 @@ mod tests {
             server.world.get_block(1, 64, 0),
             blocks::WATER,
             "the flower is replaced by the water"
+        );
+    }
+
+    /// The tile entity is created when the block is written.
+    ///
+    /// Java `BlockContainer.c`: the block creates its tile entity when it is
+    /// written, and the tile entity of the old block is removed
+    /// (`Chunk.a`).
+    #[test]
+    fn the_tile_entity_is_created_when_the_block_is_written() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        // The chest is written by the world, it is not placed by a player.
+        server.world.java_set_type_id(0, 64, 0, blocks::CHEST);
+        assert!(
+            server.world.get_tile_entity(0, 64, 0).is_some(),
+            "the chest has a tile entity"
+        );
+        // The block is overwritten: the tile entity is removed.
+        server.world.java_set_type_id(0, 64, 0, blocks::STONE);
+        assert!(
+            server.world.get_tile_entity(0, 64, 0).is_none(),
+            "the tile entity of the old block is removed"
+        );
+    }
+
+    /// The direction of the furnace is set from the neighbours.
+    ///
+    /// Java `BlockFurnace.g`: the direction of the furnace is the direction
+    /// of the neighbour that is not opaque (`Block.o[]`).
+    #[test]
+    fn the_direction_of_the_furnace_is_set_from_the_neighbours() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        // A stone in front of the furnace (the north).
+        server.world.set_block(0, 64, -1, blocks::STONE);
+        server.world.java_set_type_id(0, 64, 0, blocks::FURNACE);
+        assert_eq!(
+            server.world.get_data(0, 64, 0),
+            3,
+            "the furnace looks to the north"
+        );
+    }
+
+    /// The rain dims the light of the sky.
+    ///
+    /// Java `World.a(float)`: the factor of the sky is multiplied by
+    /// `1 - intensity * 5 / 16` for the rain and for the thunder.
+    #[test]
+    fn the_rain_dims_the_light_of_the_sky() {
+        let (server, _mob_id) = mob_scenario_server("flat");
+        // The middle of the day: the factor of the sky is zero.
+        server.world.level_data.borrow_mut().time = 6000;
+        assert_eq!(server.world.sky_factor(), 0, "the factor of the noon");
+        // The rain dims the light of the sky.
+        server.world.rain_intensity.set(1.0);
+        assert_eq!(
+            server.world.sky_factor(),
+            3,
+            "the factor of the sky in the rain"
+        );
+        // The thunder dims it even more.
+        server.world.thunder_intensity.set(1.0);
+        assert_eq!(
+            server.world.sky_factor(),
+            5,
+            "the factor of the sky in the thunder"
+        );
+    }
+
+    /// The intensity of the rain rises while it rains.
+    ///
+    /// Java `World.g()`: the intensity of the rain and of the thunder rise
+    /// by one hundredth every tick while the weather lasts.
+    #[test]
+    fn the_intensity_of_the_rain_rises_while_it_rains() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.world.level_data.borrow_mut().raining = true;
+        server.world.level_data.borrow_mut().thundering = true;
+        server.world.tick_weather();
+        assert!(
+            server.world.rain_intensity.get() > 0.0,
+            "the intensity of the rain rises"
+        );
+        assert!(
+            server.world.thunder_intensity.get() > 0.0,
+            "the intensity of the thunder rises"
         );
     }
 

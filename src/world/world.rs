@@ -210,6 +210,10 @@ pub struct World {
     /// instant-tick cascades (lava flow randomness). Kept here so the port
     /// mirrors the reference implementation.
     pub(crate) world_random: JavaRandom,
+    /// Java `World.j`: the intensity of the rain (0 to 1).
+    pub(crate) rain_intensity: std::cell::Cell<f32>,
+    /// Java `World.l`: the intensity of the thunder (0 to 1).
+    pub(crate) thunder_intensity: std::cell::Cell<f32>,
     /// `BlockFlowing.b` — the per-direction flow flags returned by `j()`. In
     /// Java this is a mutable field on the shared `BlockFlowing` singleton:
     /// nested cascade ticks call `j()` again and overwrite it, and the outer
@@ -516,6 +520,8 @@ impl World {
             suppress_physics: false,
             insta_tick: false,
             world_random: JavaRandom::new(0),
+            rain_intensity: std::cell::Cell::new(0.0),
+            thunder_intensity: std::cell::Cell::new(0.0),
             fluid_sides: [[false; 4]; 2],
             live,
             fresh_world,
@@ -1073,6 +1079,9 @@ impl World {
             return false;
         }
         trace_a4!(x, y, z, old_id, id);
+        // The tile entity of the old block is removed (`Chunk.a`:
+        // `this.e.a(i, j, k, 0)`).
+        let _ = self.remove_world_tile_entity(x, y, z);
 
         {
             let chunk = self.chunks.get_mut(&pos).unwrap();
@@ -1897,7 +1906,7 @@ impl World {
         if self.live.active && self.live_resolve_read(pos) {
             return 0;
         }
-        let sky_sub = crate::entity::mob::world_sky_subtracted(self.world_time());
+        let sky_sub = self.sky_factor();
         match self.chunks.get(&pos) {
             Some(chunk) => chunk.get_block_light_value(
                 (x & 15) as usize,
@@ -2085,6 +2094,15 @@ impl World {
             f = (f as f64 + step_x) as f32;
         }
         visible as f32 / total as f32
+    }
+
+    /// Java `World.f`: the factor of the sky of the world.
+    ///
+    /// The factor is dimmed by the rain and by the thunder.
+    pub fn sky_factor(&self) -> i32 {
+        let rain = self.rain_intensity.get();
+        let thunder = self.thunder_intensity.get() * rain;
+        crate::entity::mob::world_sky_subtracted_with_weather(self.world_time(), rain, thunder)
     }
 
     /// Java `World.a(EnumSkyBlock, int i, int j, int k)` (lines 598-621).
@@ -2477,6 +2495,7 @@ impl World {
 
     /// `Block.c` on-place dispatch for the freshly written block.
     fn block_on_place(&mut self, id: u8, x: i32, y: i32, z: i32) {
+        use crate::gameplay::tile::TileEntity;
         match id {
             blocks::WATER | blocks::LAVA => {
                 // BlockFlowing.c: super.c (fizz) then schedule a tick when the
@@ -2494,6 +2513,40 @@ impl World {
             blocks::SAND | blocks::GRAVEL => {
                 // BlockSand.c: schedule a fall check (delay 3).
                 self.java_schedule_tick(x, y, z, id, 3);
+            }
+            // The blocks with a tile entity (`Block.isTileEntity[]`): the
+            // tile entity is created when the block is written
+            // (`BlockContainer.c`).
+            blocks::CHEST => {
+                self.set_world_tile_entity(TileEntity::new_chest(x, y, z));
+            }
+            blocks::FURNACE | blocks::LIT_FURNACE => {
+                self.set_world_tile_entity(TileEntity::new_furnace(x, y, z));
+                // `BlockFurnace.g`: the direction is set from the neighbours.
+                self.container_facing_from_neighbours(x, y, z);
+            }
+            blocks::DISPENSER => {
+                self.set_world_tile_entity(TileEntity::new_dispenser(x, y, z));
+                // `BlockDispenser.g`: the direction is set from the
+                // neighbours.
+                self.container_facing_from_neighbours(x, y, z);
+            }
+            blocks::NOTE_BLOCK => {
+                self.set_world_tile_entity(TileEntity::new_note(x, y, z));
+            }
+            blocks::JUKEBOX => {
+                self.set_world_tile_entity(TileEntity::new_record_player(x, y, z));
+            }
+            blocks::MOB_SPAWNER => {
+                self.set_world_tile_entity(TileEntity::new_spawner(x, y, z, "Pig".to_string()));
+            }
+            blocks::SIGN | blocks::WALL_SIGN => {
+                self.set_world_tile_entity(TileEntity::new_sign(
+                    x,
+                    y,
+                    z,
+                    [String::new(), String::new(), String::new(), String::new()],
+                ));
             }
             blocks::REDSTONE_WIRE => {
                 if !self.suppress_physics {
@@ -3013,6 +3066,32 @@ impl World {
         }
     }
 
+    /// Java `BlockFurnace.g` and `BlockDispenser.g`: the direction of the
+    /// block is set from the neighbours.
+    ///
+    /// The block that is in front of the furnace is the one that is not
+    /// opaque (`Block.o[]`).
+    fn container_facing_from_neighbours(&mut self, x: i32, y: i32, z: i32) {
+        let north = blocks::is_opaque_cube(self.get_block(x, y, z - 1));
+        let south = blocks::is_opaque_cube(self.get_block(x, y, z + 1));
+        let west = blocks::is_opaque_cube(self.get_block(x - 1, y, z));
+        let east = blocks::is_opaque_cube(self.get_block(x + 1, y, z));
+        let mut meta = 3u8;
+        if north && !south {
+            meta = 3;
+        }
+        if south && !north {
+            meta = 2;
+        }
+        if west && !east {
+            meta = 5;
+        }
+        if east && !west {
+            meta = 4;
+        }
+        self.java_set_data(x, y, z, meta);
+    }
+
     /// Reproduce `Block.postPlace` + `Block.c` orientation and `TileEntity` setup on player placement.
     #[allow(clippy::too_many_arguments, clippy::if_same_then_else)]
     pub fn post_place_block(
@@ -3025,7 +3104,6 @@ impl World {
         yaw: f32,
         _pitch: f32,
     ) {
-        use crate::gameplay::tile::TileEntity;
         let facing_4 = (((yaw * 4.0 / 360.0) + 0.5).floor() as i32) & 3;
 
         match block_id {
@@ -3090,23 +3168,6 @@ impl World {
                     _ => 4,
                 };
                 self.java_set_data(x, y, z, meta);
-                if block_id == blocks::DISPENSER {
-                    self.set_world_tile_entity(TileEntity::new_dispenser(x, y, z));
-                } else {
-                    self.set_world_tile_entity(TileEntity::new_furnace(x, y, z));
-                }
-            }
-            blocks::CHEST => {
-                self.set_world_tile_entity(TileEntity::new_chest(x, y, z));
-            }
-            blocks::NOTE_BLOCK => {
-                self.set_world_tile_entity(TileEntity::new_note(x, y, z));
-            }
-            blocks::JUKEBOX => {
-                self.set_world_tile_entity(TileEntity::new_record_player(x, y, z));
-            }
-            blocks::MOB_SPAWNER => {
-                self.set_world_tile_entity(TileEntity::new_spawner(x, y, z, "Pig".to_string()));
             }
             blocks::PUMPKIN | blocks::JACK_O_LANTERN => {
                 let meta = (((yaw * 4.0 / 360.0) + 2.5).floor() as i32 & 3) as u8;

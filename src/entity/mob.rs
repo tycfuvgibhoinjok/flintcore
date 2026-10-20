@@ -1909,7 +1909,7 @@ pub fn evaluate_natural_spawns(
     }
 
     let (spawn_x, spawn_y, spawn_z) = world.spawn_point();
-    let sky_sub = world_sky_subtracted(world.world_time());
+    let sky_sub = world.sky_factor();
     let min_player_distance = spawning.min_player_distance;
     let min_spawn_distance = spawning.min_spawn_distance;
     let sample_divisor = spawning.chunk_sample_divisor.max(1);
@@ -2108,6 +2108,14 @@ pub fn evaluate_natural_spawns(
 }
 
 pub fn world_sky_subtracted(world_time: i64) -> i32 {
+    world_sky_subtracted_with_weather(world_time, 0.0, 0.0)
+}
+
+/// Java `World.a(float)`: the factor of the sky of the world.
+///
+/// The light of the sky is dimmed by the rain and by the thunder: the
+/// factor is multiplied by `1 - intensity * 5 / 16` for each of them.
+pub fn world_sky_subtracted_with_weather(world_time: i64, rain: f32, thunder: f32) -> i32 {
     let time_of_day = world_time.rem_euclid(24000) as f32;
     let mut f1 = (time_of_day + 1.0) / 24000.0 - 0.25;
     if f1 < 0.0 {
@@ -2121,7 +2129,11 @@ pub fn world_sky_subtracted(world_time: i64) -> i32 {
     f1 = f2 + (f1 - f2) / 3.0;
     let mut f3 = 1.0 - ((f1 * std::f32::consts::PI * 2.0).cos() * 2.0 + 0.5);
     f3 = f3.clamp(0.0, 1.0);
-    (f3 * 11.0) as i32
+    // The rain and the thunder dim the light of the sky.
+    let mut f = 1.0 - f3;
+    f *= 1.0 - (rain * 5.0) / 16.0;
+    f *= 1.0 - (thunder * 5.0) / 16.0;
+    ((1.0 - f) * 11.0) as i32
 }
 
 /// Java `Entity.c(float)`: the light of the block the mob is in.

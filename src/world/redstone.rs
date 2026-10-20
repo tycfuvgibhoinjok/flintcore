@@ -2367,6 +2367,16 @@ impl World {
 
     /// Java `World.i()` (`World.java:1770-1850`): tick weather timers; returns `Some(new_raining)` when rain state changes.
     pub fn tick_weather(&mut self) -> Option<bool> {
+        // The intensity of the rain and of the thunder (`World.g()`): they
+        // rise by one hundredth every tick while the weather lasts.
+        let storm = self.level_data.borrow().raining;
+        let thundering = self.level_data.borrow().thundering;
+        let rain = self.rain_intensity.get();
+        let thunder = self.thunder_intensity.get();
+        self.rain_intensity
+            .set((rain + if storm { 0.01 } else { -0.01 }).clamp(0.0, 1.0));
+        self.thunder_intensity
+            .set((thunder + if thundering { 0.01 } else { -0.01 }).clamp(0.0, 1.0));
         if !self.mechanics.do_weather {
             let mut ld = self.level_data.borrow_mut();
             let was_raining = ld.raining;
