@@ -379,6 +379,16 @@ Mob movement parity harness:
   - The mob in a web is slowed down: the flag of the web is set at the
     end of the movement and the movement of the next tick is damped
     (`Entity.move()`).
+  - The tables of the blocks are the tables of the reference: the opaque
+    cube, the opacity of the light, the solid block, the mobility for the
+    pistons, the resistance to the explosion and the flag of the
+    notification of the data. The tools of `tools/poseidon_mobs/` print
+    them, the tables are in `tests/golden/` and the test of the tables
+    compares them with the port.
+  - The time of the world is sent to the players every twenty ticks
+    (`MinecraftServer.tick`).
+  - The light of the sky is reduced by the time of the day
+    (`World.a(i, j, k, true)`), the light of the blocks is not.
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.
