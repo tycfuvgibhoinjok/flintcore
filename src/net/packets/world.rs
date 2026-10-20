@@ -177,6 +177,48 @@ impl LevelSound {
     }
 }
 
+/// The packet of a named sound (the packet 41 of the protocol of 1.7.3).
+///
+/// The name of the sound, its pitch and its volume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedSound {
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub volume: f64,
+    pub pitch: f64,
+}
+
+impl NamedSound {
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self> {
+        let name = reader.read_string(256)?;
+        let x = reader.read_f64()?;
+        let y = reader.read_f64()?;
+        let z = reader.read_f64()?;
+        let volume = reader.read_f64()?;
+        let pitch = reader.read_f64()?;
+        Ok(Self {
+            name,
+            x,
+            y,
+            z,
+            volume,
+            pitch,
+        })
+    }
+
+    pub fn encode(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_string(&self.name, 256)?;
+        writer.write_f64(self.x);
+        writer.write_f64(self.y);
+        writer.write_f64(self.z);
+        writer.write_f64(self.volume);
+        writer.write_f64(self.pitch);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bed {
     pub reason: u8,

@@ -24,9 +24,9 @@ use crate::net::packets::chat::{is_allowed_char, wrap_text};
 use crate::net::packets::{
     ArmAnimation, AttachEntity, Bed, BlockChange, Chat, Clientbound, CloseWindow, Collect,
     CraftProgressBar, EntityMetadata, EntityStatus, EntityVelocity, Explosion, Handshake,
-    KeepAlive, KickDisconnect, LevelSound, Login, MapData, MultiBlockChange, OpenWindow,
-    PlayNoteBlock, PlayerLookMove, PreChunk, Respawn, Serverbound, SetSlot, Sleep, SpawnPosition,
-    Transaction, UpdateHealth, UpdateSign, UpdateTime, Weather, WindowItems,
+    KeepAlive, KickDisconnect, LevelSound, Login, MapData, MultiBlockChange, NamedSound,
+    OpenWindow, PlayNoteBlock, PlayerLookMove, PreChunk, Respawn, Serverbound, SetSlot, Sleep,
+    SpawnPosition, Transaction, UpdateHealth, UpdateSign, UpdateTime, Weather, WindowItems,
 };
 use crate::net::protocol::PROTOCOL_VERSION;
 use crate::net::{ConnId, NetEvent, Outbound};
@@ -4697,6 +4697,11 @@ impl Server {
         killed_by_skeleton_arrow: bool,
     ) -> bool {
         let mut died = false;
+        // The flag of the reference: the hit is applied only when the mob is
+        // not in the window of the invulnerability.
+        let hit_applied;
+        // The pitch of the sound of the hit or of the death.
+        let mut sound_pitch: Option<f32> = None;
         let mut death_info = None;
         let mut wolf_pack_alert = None;
         let mut pigzombie_alert = None;
@@ -4713,25 +4718,30 @@ impl Server {
             if mob.mob_type == MobType::Wolf && attacker.is_some() && !attacker_is_player {
                 adj_dmg = (adj_dmg + 1) / 2;
             }
-            let eff_dmg = if mob.no_damage_ticks > 10 {
+            // The flag of the reference: the hit is applied only when the
+            // mob is not in the window of the invulnerability.
+            // The flag of the reference: the hit is applied only when the
+            // mob is not in the window of the invulnerability.
+            let (eff_dmg, applied) = if mob.no_damage_ticks > 10 {
                 if adj_dmg <= mob.last_damage {
                     return false;
                 }
                 let diff = adj_dmg - mob.last_damage;
                 mob.last_damage = adj_dmg;
-                diff
+                (diff, false)
             } else {
                 mob.last_damage = adj_dmg;
                 mob.no_damage_ticks = 20;
                 // The sound of the hit (`EntityLiving.damageEntity`): the
                 // reference draws two numbers for the pitch and the volume.
-                let _ = self.entity_random.next_f32();
-                let _ = self.entity_random.next_f32();
-                adj_dmg
+                let pitch =
+                    (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.2 + 1.0;
+                sound_pitch = Some(pitch);
+                (adj_dmg, true)
             };
             mob.health -= eff_dmg;
 
-            if let Some((att_id, ax, az)) = attacker {
+            if let Some((att_id, ax, az)) = attacker.filter(|_| applied) {
                 let dx = ax - mob.x;
                 let dz = az - mob.z;
                 let dist = (dx * dx + dz * dz).sqrt().max(0.001);
@@ -4779,6 +4789,7 @@ impl Server {
                 }
                 death_info = Some((mob.mob_type, mob.x, mob.y, mob.z, mob.passenger_id, drops));
             }
+            hit_applied = applied;
         } else {
             return false;
         }
@@ -4812,10 +4823,39 @@ impl Server {
             }
         }
 
-        self.broadcast(Clientbound::EntityStatus(EntityStatus {
-            entity_id: mob_id,
-            status: 2,
-        }));
+        // The packet of the status 2 (`EntityLiving.damageEntity`): it is
+        // sent only when the hit is applied.
+        if hit_applied {
+            self.broadcast(Clientbound::EntityStatus(EntityStatus {
+                entity_id: mob_id,
+                status: 2,
+            }));
+        }
+
+        // The sound of the hit or of the death (`EntityLiving.damageEntity`):
+        // the sound of the death is played when the mob dies, the sound of
+        // the hit otherwise.
+        if let Some(pitch) = sound_pitch {
+            let sound = self
+                .entities
+                .get_mob(mob_id)
+                .map(|mob| (mob.death_sound(), mob.hurt_sound(), mob.x, mob.y, mob.z));
+            if let Some((death, hurt, x, y, z)) = sound {
+                let name = if died { death } else { hurt };
+                if !name.is_empty() {
+                    // The volume of the sound of the reference: `k()` is
+                    // one for every mob.
+                    self.broadcast(Clientbound::NamedSound(NamedSound {
+                        name: name.to_string(),
+                        x,
+                        y,
+                        z,
+                        volume: 1.0,
+                        pitch: f64::from(pitch),
+                    }));
+                }
+            }
+        }
 
         if died {
             self.broadcast(Clientbound::EntityStatus(EntityStatus {
@@ -12315,6 +12355,30 @@ mod tests {
         assert_eq!(
             mob.health, before,
             "the mob does not suffocate in a block that is not solid"
+        );
+    }
+
+    /// The mob plays the sound of the hit and the sound of the death.
+    ///
+    /// Java `EntityLiving.damageEntity`: the sound of the death is played
+    /// when the mob dies, the sound of the hit otherwise, and the two
+    /// numbers of the stream are the pitch and the volume of the sound.
+    #[test]
+    fn the_mob_plays_the_sound_of_the_hit_and_of_the_death() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        // The name of the sound of the hit and of the death of the pig.
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.hurt_sound(), "mob.pig");
+        assert_eq!(mob.death_sound(), "mob.pigdeath");
+
+        // The sound of the hit draws the two numbers of the pitch and of
+        // the volume of the reference.
+        let before = server.entity_random.draws;
+        server.damage_mob(mob_id, 1, None, false);
+        assert_eq!(
+            server.entity_random.draws - before,
+            2,
+            "the sound of the hit draws two numbers"
         );
     }
 

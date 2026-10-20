@@ -775,6 +775,46 @@ impl Mob {
         (width * 0.85f32) as f64
     }
 
+    /// Java `EntityLiving.h()`: the sound of the hit of the mob.
+    pub fn hurt_sound(&self) -> &'static str {
+        match self.mob_type {
+            MobType::Pig => "mob.pig",
+            MobType::Cow => "mob.cowhurt",
+            MobType::Sheep => "mob.sheep",
+            MobType::Chicken => "mob.chickenhurt",
+            MobType::Wolf => "mob.wolf.hurt",
+            MobType::Spider => "mob.spider",
+            MobType::Creeper => "mob.creeper",
+            MobType::Slime => "mob.slime",
+            MobType::Zombie => "mob.zombiehurt",
+            MobType::Skeleton => "mob.skeletonhurt",
+            MobType::PigZombie => "mob.zombiepig.zpighurt",
+            MobType::Ghast => "mob.ghast.scream",
+            MobType::Squid => "",
+            MobType::Giant => "mob.zombiehurt",
+        }
+    }
+
+    /// Java `EntityLiving.i()`: the sound of the death of the mob.
+    pub fn death_sound(&self) -> &'static str {
+        match self.mob_type {
+            MobType::Pig => "mob.pigdeath",
+            MobType::Cow => "mob.cowhurt",
+            MobType::Sheep => "mob.sheep",
+            MobType::Chicken => "mob.chickenhurt",
+            MobType::Wolf => "mob.wolf.death",
+            MobType::Spider => "mob.spiderdeath",
+            MobType::Creeper => "mob.creeperdeath",
+            MobType::Slime => "mob.slime",
+            MobType::Zombie => "mob.zombiedeath",
+            MobType::Skeleton => "mob.skeletonhurt",
+            MobType::PigZombie => "mob.zombiepig.zpigdeath",
+            MobType::Ghast => "mob.ghast.death",
+            MobType::Squid => "",
+            MobType::Giant => "mob.zombiedeath",
+        }
+    }
+
     pub fn mounted_y_offset(&self) -> f64 {
         let (_, h) = self.size();
         if self.mob_type == MobType::Spider {
