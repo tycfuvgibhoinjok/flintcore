@@ -44,6 +44,14 @@ header of the golden file documents the command).
 | `slime`  | slime    | a flat stone floor, the slime hops                 |
 | `squid`  | squid    | a tank of water                                     |
 | `ghast`  | ghast    | a flat stone floor, the ghast flies                 |
+| `creeper`| creeper  | a flat floor, the creeper walks to the player       |
+| `skeleton`| skeleton| a flat floor, the skeleton shoots at the player     |
+| `chicken`| chicken  | a flat grass floor, the chicken wanders             |
+| `cow`    | cow      | a flat grass floor, the cow wanders                 |
+| `sheep`  | sheep    | a flat grass floor, the sheep wanders               |
+| `wolf`   | wolf     | a flat grass floor, the wolf walks to the player    |
+| `pigzombie` | pig zombie | a flat floor, the mob walks to the player       |
+| `giant`  | giant zombie | a flat floor, the mob walks to the player        |
 
 ## Notes
 

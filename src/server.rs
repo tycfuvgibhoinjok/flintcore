@@ -3982,11 +3982,15 @@ impl Server {
                 || !self.config.spawning.spawn_brown_and_pink_sheep)
         {
             if let Some(m) = self.entities.get_mob_mut(mob_id) {
+                // The colour of the sheep is drawn with the random of the
+                // world (`SpawnerCreature`), not with the one of the entities.
+                let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
                 m.sheep_color = crate::entity::mob::Mob::natural_sheep_color_ex(
-                    &mut self.entity_random,
+                    &mut rng,
                     self.config.spawning.spawn_sheep_shades_of_black,
                     self.config.spawning.spawn_brown_and_pink_sheep,
                 );
+                self.world.world_random = rng;
             }
         }
         let active_dimension = self.active_dimension;
@@ -5027,10 +5031,15 @@ impl Server {
                             // The wolf hunts a sheep (`EntityWolf.c_()`): the
                             // reference draws a number of the world, not of
                             // the entities.
-                            let hunt_sheep = self
-                                .entities
-                                .get_mob_mut(mob_id)
-                                .is_some_and(|_| self.entity_random.next_i32_bound(100) == 0);
+                            let hunt_sheep = {
+                                let mut rng = std::mem::replace(
+                                    &mut self.world.world_random,
+                                    JavaRandom::new(0),
+                                );
+                                let hunt = rng.next_i32_bound(100) == 0;
+                                self.world.world_random = rng;
+                                hunt
+                            };
                             if hunt_sheep {
                                 let sheep = self.entities.iter_mobs().find_map(|s| {
                                     if !s.dead
@@ -5321,15 +5330,6 @@ impl Server {
                     }
                 }
 
-                // Chicken egg timer (`EntityChicken.v()`)
-                if mob.mob_type == MobType::Chicken {
-                    mob.chicken_egg_timer -= 1;
-                    if mob.chicken_egg_timer <= 0 {
-                        eggs_to_drop.push((mob.x, mob.y, mob.z));
-                        mob.chicken_egg_timer = self.entity_random.next_i32_bound(6000) + 6000;
-                    }
-                }
-
                 // Wolf water shaking (`EntityWolf.v()`, `m_()`)
                 if mob.mob_type == MobType::Wolf {
                     if mob.in_water || in_rain {
@@ -5516,6 +5516,106 @@ impl Server {
                             }
                         }
                         _ => {
+                            // Target engagement (Melee / Creeper fuse / Skeleton bow / Spider & Wolf leap)
+                            if let Some((tid, is_player, tx, ty, tz)) = target_pos {
+                                let dx = tx - mob.x;
+                                let dy = ty - mob.y;
+                                let dz = tz - mob.z;
+                                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+                                match mob.mob_type {
+                                    MobType::Creeper => {
+                                        if has_los
+                                            && ((mob.creeper_state > 0 && dist < 7.0) || dist < 3.0)
+                                        {
+                                            mob.creeper_state = 1;
+                                            mob.creeper_fuse += 1;
+                                            if mob.creeper_fuse >= 30 {
+                                                let radius =
+                                                    if mob.creeper_powered { 6.0 } else { 3.0 };
+                                                mob.dead = true;
+                                                creeper_explosions
+                                                    .push((mob_id, mob.x, mob.y, mob.z, radius));
+                                            }
+                                        } else {
+                                            mob.creeper_state = -1;
+                                            if mob.creeper_fuse > 0 {
+                                                mob.creeper_fuse -= 1;
+                                            }
+                                        }
+                                    }
+                                    MobType::Skeleton => {
+                                        if dist < 10.0 && has_los && mob.attack_ticks == 0 {
+                                            // The arrow of the reference
+                                            // (`EntitySkeleton.a`): the
+                                            // constructor of the arrow and its
+                                            // spread draw twelve normal
+                                            // values.
+                                            let spread: Vec<f64> = (0..12)
+                                                .map(|_| self.entity_random.next_gaussian())
+                                                .collect();
+                                            arrows_to_shoot.push((
+                                                mob_id,
+                                                mob.x,
+                                                mob.y + 1.0,
+                                                mob.z,
+                                                dx,
+                                                (ty + 1.4) - (mob.y + 1.2),
+                                                dz,
+                                                spread,
+                                            ));
+                                            mob.attack_ticks = 30;
+                                        }
+                                    }
+                                    MobType::Spider | MobType::Wolf => {
+                                        if dist > 2.0
+                                            && dist < 6.0
+                                            && mob.on_ground
+                                            && self.entity_random.next_i32_bound(10) == 0
+                                        {
+                                            let h = (dx * dx + dz * dz).sqrt().max(0.01);
+                                            mob.mot_x = dx / h * 0.4 + mob.mot_x * 0.2;
+                                            mob.mot_z = dz / h * 0.4 + mob.mot_z * 0.2;
+                                            mob.mot_y = 0.4;
+                                        } else if dist < 2.0
+                                            && dy.abs() < 2.0
+                                            && mob.attack_ticks <= 0
+                                        {
+                                            mob.attack_ticks = 20;
+                                            let dmg = mob
+                                                .mob_type
+                                                .attack_damage(mob.slime_size, mob.wolf_tamed);
+                                            if is_player {
+                                                melee_hits_player.push((tid, dmg, mob.x, mob.z));
+                                            } else {
+                                                melee_hits_mob
+                                                    .push((tid, dmg, mob_id, mob.x, mob.z));
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        let dmg = mob
+                                            .mob_type
+                                            .attack_damage(mob.slime_size, mob.wolf_tamed);
+                                        if dmg > 0
+                                            && dist < 2.0
+                                            && dy.abs() < 2.0
+                                            && mob.attack_ticks <= 0
+                                        {
+                                            mob.attack_ticks = 20;
+                                            if is_player {
+                                                melee_hits_player.push((tid, dmg, mob.x, mob.z));
+                                            } else {
+                                                melee_hits_mob
+                                                    .push((tid, dmg, mob_id, mob.x, mob.z));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if mob.mob_type == MobType::Creeper && mob.creeper_fuse > 0 {
+                                mob.creeper_state = -1;
+                                mob.creeper_fuse -= 1;
+                            }
                             // The path following (`EntityCreature.c_()`).
                             //
                             // The mob walks to the next point of the path, turns at
@@ -5576,7 +5676,8 @@ impl Server {
                                         }
                                         mob.yaw += diff.clamp(-30.0, 30.0);
                                         // The forward input of the mob (`EntityLiving.aA`).
-                                        mob.move_forward = mob.mob_type.move_speed();
+                                        mob.move_forward =
+                                            mob.mob_type.move_speed(mob.target_id.is_some());
                                         if dy > 0.0 {
                                             jump = true;
                                         }
@@ -5625,100 +5726,6 @@ impl Server {
                             }
                             if jump {
                                 mob.jump_flag = true;
-                            }
-
-                            // Target engagement (Melee / Creeper fuse / Skeleton bow / Spider & Wolf leap)
-                            if let Some((tid, is_player, tx, ty, tz)) = target_pos {
-                                let dx = tx - mob.x;
-                                let dy = ty - mob.y;
-                                let dz = tz - mob.z;
-                                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-
-                                match mob.mob_type {
-                                    MobType::Creeper => {
-                                        if has_los
-                                            && ((mob.creeper_state > 0 && dist < 7.0) || dist < 3.0)
-                                        {
-                                            mob.creeper_state = 1;
-                                            mob.creeper_fuse += 1;
-                                            if mob.creeper_fuse >= 30 {
-                                                let radius =
-                                                    if mob.creeper_powered { 6.0 } else { 3.0 };
-                                                mob.dead = true;
-                                                creeper_explosions
-                                                    .push((mob_id, mob.x, mob.y, mob.z, radius));
-                                            }
-                                        } else {
-                                            mob.creeper_state = -1;
-                                            if mob.creeper_fuse > 0 {
-                                                mob.creeper_fuse -= 1;
-                                            }
-                                        }
-                                    }
-                                    MobType::Skeleton => {
-                                        if dist < 10.0 && has_los && mob.attack_ticks == 0 {
-                                            {
-                                                arrows_to_shoot.push((
-                                                    mob_id,
-                                                    mob.x,
-                                                    mob.y + 1.0,
-                                                    mob.z,
-                                                    dx,
-                                                    (ty + 1.4) - (mob.y + 1.2),
-                                                    dz,
-                                                ));
-                                                mob.attack_ticks = 30;
-                                            }
-                                        }
-                                    }
-                                    MobType::Spider | MobType::Wolf => {
-                                        if dist > 2.0
-                                            && dist < 6.0
-                                            && mob.on_ground
-                                            && self.entity_random.next_i32_bound(10) == 0
-                                        {
-                                            let h = (dx * dx + dz * dz).sqrt().max(0.01);
-                                            mob.mot_x = dx / h * 0.4 + mob.mot_x * 0.2;
-                                            mob.mot_z = dz / h * 0.4 + mob.mot_z * 0.2;
-                                            mob.mot_y = 0.4;
-                                        } else if dist < 2.0
-                                            && dy.abs() < 2.0
-                                            && mob.attack_ticks <= 0
-                                        {
-                                            mob.attack_ticks = 20;
-                                            let dmg = mob
-                                                .mob_type
-                                                .attack_damage(mob.slime_size, mob.wolf_tamed);
-                                            if is_player {
-                                                melee_hits_player.push((tid, dmg, mob.x, mob.z));
-                                            } else {
-                                                melee_hits_mob
-                                                    .push((tid, dmg, mob_id, mob.x, mob.z));
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        let dmg = mob
-                                            .mob_type
-                                            .attack_damage(mob.slime_size, mob.wolf_tamed);
-                                        if dmg > 0
-                                            && dist < 2.0
-                                            && dy.abs() < 2.0
-                                            && mob.attack_ticks <= 0
-                                        {
-                                            mob.attack_ticks = 20;
-                                            if is_player {
-                                                melee_hits_player.push((tid, dmg, mob.x, mob.z));
-                                            } else {
-                                                melee_hits_mob
-                                                    .push((tid, dmg, mob_id, mob.x, mob.z));
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if mob.mob_type == MobType::Creeper && mob.creeper_fuse > 0 {
-                                mob.creeper_state = -1;
-                                mob.creeper_fuse -= 1;
                             }
                         }
                     }
@@ -5819,6 +5826,32 @@ impl Server {
                             mob.mot_y *= 0.980_000_019_073_486_3;
                             mob.mot_z = 0.0;
                         }
+                    }
+                }
+
+                // The chicken (`EntityChicken.v()`): the flap of the wings and
+                // the timer of the egg. The reference does it after the
+                // movement of the mob.
+                if mob.mob_type == MobType::Chicken {
+                    mob.chicken_wing = mob.chicken_wing_tip;
+                    mob.chicken_wing_tip += if mob.on_ground { -0.3 } else { 1.2 };
+                    mob.chicken_wing_tip = mob.chicken_wing_tip.clamp(0.0, 1.0);
+                    if !mob.on_ground && mob.chicken_flap < 1.0 {
+                        mob.chicken_flap = 1.0;
+                    }
+                    mob.chicken_flap *= 0.9;
+                    if !mob.on_ground && mob.mot_y < 0.0 {
+                        mob.mot_y *= 0.6;
+                    }
+                    mob.chicken_wing += mob.chicken_flap * 2.0;
+                    mob.chicken_egg_timer -= 1;
+                    if mob.chicken_egg_timer <= 0 {
+                        // The sound of the chicken: the pitch and the volume
+                        // are two numbers.
+                        let _ = self.entity_random.next_f32();
+                        let _ = self.entity_random.next_f32();
+                        eggs_to_drop.push((mob.x, mob.y, mob.z));
+                        mob.chicken_egg_timer = self.entity_random.next_i32_bound(6000) + 6000;
                     }
                 }
 
@@ -5963,12 +5996,14 @@ impl Server {
             let _ = self.damage_mob(target_mob_id, dmg, Some((att_id, ax, az)), false);
         }
 
-        for (skel_id, sx, sy, sz, dx, dy, dz) in arrows_to_shoot {
+        for (skel_id, sx, sy, sz, dx, dy, dz, spread) in arrows_to_shoot {
             let h = (dx * dx + dz * dz).sqrt() * 0.2;
             let len = (dx * dx + (dy + h).powi(2) + dz * dz).sqrt().max(0.001);
-            let vx = (dx / len) * 0.6;
-            let vy = ((dy + h) / len) * 0.6;
-            let vz = (dz / len) * 0.6;
+            // The spread of the arrow (`EntityArrow.a`): three normal values
+            // with the factor of the spread of the arrow.
+            let vx = (dx / len + spread[3] * 0.007_499_999_832_361_937 * 12.0) * 0.6;
+            let vy = ((dy + h) / len + spread[4] * 0.007_499_999_832_361_937 * 12.0) * 0.6;
+            let vz = (dz / len + spread[5] * 0.007_499_999_832_361_937 * 12.0) * 0.6;
             self.spawn_projectile_at(
                 ProjectileKind::Arrow,
                 Some(skel_id),
@@ -11049,6 +11084,38 @@ mod tests {
                 scenario_flat_floor(&mut server.world, 63, 24);
                 (MobType::Ghast, None, 63, 24)
             }
+            "creeper" => {
+                scenario_flat_floor(&mut server.world, 63, 24);
+                (MobType::Creeper, Some((10.5, 64.0, 0.5)), 63, 24)
+            }
+            "skeleton" => {
+                scenario_flat_floor(&mut server.world, 63, 24);
+                (MobType::Skeleton, Some((10.5, 64.0, 0.5)), 63, 24)
+            }
+            "chicken" => {
+                scenario_flat_floor(&mut server.world, 63, 24);
+                (MobType::Chicken, None, 63, 24)
+            }
+            "cow" => {
+                scenario_flat_floor(&mut server.world, 63, 24);
+                (MobType::Cow, None, 63, 24)
+            }
+            "sheep" => {
+                scenario_flat_floor(&mut server.world, 63, 24);
+                (MobType::Sheep, None, 63, 24)
+            }
+            "wolf" => {
+                scenario_flat_floor(&mut server.world, 63, 24);
+                (MobType::Wolf, Some((10.5, 64.0, 0.5)), 63, 24)
+            }
+            "pigzombie" => {
+                scenario_flat_floor(&mut server.world, 63, 24);
+                (MobType::PigZombie, Some((10.5, 64.0, 0.5)), 63, 24)
+            }
+            "giant" => {
+                scenario_flat_floor(&mut server.world, 63, 24);
+                (MobType::Giant, Some((10.5, 64.0, 0.5)), 63, 24)
+            }
             other => panic!("unknown mob scenario {other}"),
         };
 
@@ -11228,7 +11295,20 @@ mod tests {
         let golden = golden_mob_traces();
         let mut failures = Vec::new();
         for name in [
-            "flat", "chase", "water", "wall", "lava", "slime", "squid", "ghast",
+            "flat",
+            "chase",
+            "water",
+            "wall",
+            "lava",
+            "slime",
+            "squid",
+            "ghast",
+            "chicken",
+            "cow",
+            "sheep",
+            "wolf",
+            "pigzombie",
+            "giant",
         ] {
             let Some(expected) = golden.iter().find(|(scenario, _)| *scenario == name) else {
                 failures.push(format!("{name}: the golden trace is missing"));

@@ -395,6 +395,38 @@ public class PoseidonMobTrace {
         // A ghast that flies over a flat floor.
         SCENARIOS.put("ghast", new Scenario("ghast", "EntityGhast", 0.5, 70.0, 0.5, null, 63, 24,
                 world -> flatFloor(world, 63, 24)));
+
+        // A creeper that walks towards a player.
+        SCENARIOS.put("creeper", new Scenario("creeper", "EntityCreeper", 0.5, 64.0, 0.5,
+                new double[]{10.5, 64.0, 0.5}, 63, 24, world -> flatFloor(world, 63, 24)));
+
+        // A skeleton that shoots at a player.
+        SCENARIOS.put("skeleton", new Scenario("skeleton", "EntitySkeleton", 0.5, 64.0, 0.5,
+                new double[]{10.5, 64.0, 0.5}, 63, 24, world -> flatFloor(world, 63, 24)));
+
+        // A chicken that wanders on a flat floor.
+        SCENARIOS.put("chicken", new Scenario("chicken", "EntityChicken", 0.5, 64.0, 0.5, null, 63, 24,
+                world -> flatFloor(world, 63, 24)));
+
+        // A cow that wanders on a flat floor.
+        SCENARIOS.put("cow", new Scenario("cow", "EntityCow", 0.5, 64.0, 0.5, null, 63, 24,
+                world -> flatFloor(world, 63, 24)));
+
+        // A sheep that wanders on a flat floor.
+        SCENARIOS.put("sheep", new Scenario("sheep", "EntitySheep", 0.5, 64.0, 0.5, null, 63, 24,
+                world -> flatFloor(world, 63, 24)));
+
+        // A wolf that walks towards a player.
+        SCENARIOS.put("wolf", new Scenario("wolf", "EntityWolf", 0.5, 64.0, 0.5,
+                new double[]{10.5, 64.0, 0.5}, 63, 24, world -> flatFloor(world, 63, 24)));
+
+        // A pig zombie that walks towards a player.
+        SCENARIOS.put("pigzombie", new Scenario("pigzombie", "EntityPigZombie", 0.5, 64.0, 0.5,
+                new double[]{10.5, 64.0, 0.5}, 63, 24, world -> flatFloor(world, 63, 24)));
+
+        // A giant zombie that walks towards a player.
+        SCENARIOS.put("giant", new Scenario("giant", "EntityGiantZombie", 0.5, 64.0, 0.5,
+                new double[]{10.5, 64.0, 0.5}, 63, 24, world -> flatFloor(world, 63, 24)));
     }
 
     /**

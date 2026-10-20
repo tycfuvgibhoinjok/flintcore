@@ -202,9 +202,21 @@ impl MobType {
         }
     }
 
-    pub fn move_speed(self) -> f32 {
+    /// Java `EntityLiving.aE`: the speed of the movement of the mob.
+    ///
+    /// The default of the reference is 0.7, the zombie, the pig zombie and the
+    /// giant have 0.5, the spider 0.8 and the wolf 1.1. The pig zombie is
+    /// faster when it has a target (`EntityPigZombie.m_()`).
+    pub fn move_speed(self, has_target: bool) -> f32 {
         match self {
-            Self::Zombie | Self::Skeleton | Self::Creeper | Self::Giant | Self::PigZombie => 0.5,
+            Self::Zombie | Self::Giant => 0.5,
+            Self::PigZombie => {
+                if has_target {
+                    0.95
+                } else {
+                    0.5
+                }
+            }
             Self::Spider => 0.8,
             Self::Wolf => 1.1,
             _ => 0.7,
@@ -304,6 +316,12 @@ pub struct Mob {
     pub sheep_sheared: bool,
     // Chicken
     pub chicken_egg_timer: i32,
+    /// Java `EntityChicken.b`: the angle of the wing.
+    pub chicken_wing: f32,
+    /// Java `EntityChicken.c`: the angle of the tip of the wing.
+    pub chicken_wing_tip: f32,
+    /// Java `EntityChicken.h`: the factor of the flap of the wings.
+    pub chicken_flap: f32,
     // Wolf
     pub wolf_sitting: bool,
     pub wolf_angry: bool,
@@ -370,11 +388,10 @@ impl Mob {
             1
         };
         let health = mob_type.default_health(slime_size);
-        let sheep_color = if mob_type == MobType::Sheep {
-            Self::natural_sheep_color(rng)
-        } else {
-            0
-        };
+        // The colour of the sheep is drawn by the spawner of the reference
+        // (`SpawnerCreature`), with the random of the world and not with the
+        // one of the entities, so the constructor does not draw it.
+        let sheep_color = 0u8;
         // The egg timer of the chicken and the split timer of the slime are
         // drawn in the constructor of the reference.
         let chicken_egg_timer = if mob_type == MobType::Chicken {
@@ -436,6 +453,9 @@ impl Mob {
             sheep_color,
             sheep_sheared: false,
             chicken_egg_timer,
+            chicken_wing: 0.0,
+            chicken_wing_tip: 0.0,
+            chicken_flap: 1.0,
             wolf_sitting: false,
             wolf_angry: false,
             wolf_tamed: false,

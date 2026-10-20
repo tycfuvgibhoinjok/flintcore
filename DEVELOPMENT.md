@@ -205,20 +205,33 @@ Mob movement parity harness:
 - The state of the port (the divergence of the trace against the reference,
   the comparison lives in `the_mob_movement_matches_the_poseidon_reference`
   (it is `#[ignore]`d, it is slow) and in
-  `the_mob_scenarios_of_the_reference_match` (the eight scenarios, they must
-  not diverge), the golden traces live in
+  `the_mob_scenarios_of_the_reference_match` (the scenarios that must not
+  diverge), the golden traces live in
   `tests/golden/poseidon_mob_traces.txt`):
 
-  | scenario | the trace matches for | the difference |
-  |----------|-----------------------|----------------|
-  | `slime`  | **300 ticks (all)**   | - |
-  | `flat`   | **300 ticks (all)**   | - |
-  | `ghast`  | **300 ticks (all)**   | - |
-  | `chase`  | **300 ticks (all)**   | - |
-  | `wall`   | **300 ticks (all)**   | - |
-  | `squid`  | **300 ticks (all)**   | - |
-  | `water`  | **300 ticks (all)**   | - |
-  | `lava`   | **300 ticks (all)**   | - |
+  | scenario  | the trace matches for | the difference |
+  |-----------|-----------------------|----------------|
+  | `slime`   | **300 ticks (all)**   | - |
+  | `flat`    | **300 ticks (all)**   | - |
+  | `ghast`   | **300 ticks (all)**   | - |
+  | `chase`   | **300 ticks (all)**   | - |
+  | `wall`    | **300 ticks (all)**   | - |
+  | `squid`   | **300 ticks (all)**   | - |
+  | `water`   | **300 ticks (all)**   | - |
+  | `lava`    | **300 ticks (all)**   | - |
+  | `chicken` | **300 ticks (all)**   | - |
+  | `cow`     | **300 ticks (all)**   | - |
+  | `sheep`   | **300 ticks (all)**   | - |
+  | `wolf`    | **300 ticks (all)**   | - |
+  | `pigzombie` | **300 ticks (all)** | - |
+  | `giant`   | **300 ticks (all)**   | - |
+  | `creeper` | 50 ticks              | the acceleration of the creeper |
+  | `skeleton`| 1 tick                | the bow of the skeleton |
+
+  The harness has the scenarios of every mob of the reference: the pig, the
+  zombie, the spider, the slime, the squid, the ghast, the creeper, the
+  skeleton, the chicken, the cow, the sheep, the wolf, the pig zombie and the
+  giant zombie.
 
   - The random stream of the entities is identical to the reference: the
     numbers are drawn in the same order and with the same values (the

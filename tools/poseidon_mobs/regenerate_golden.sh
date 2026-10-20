@@ -16,7 +16,8 @@ OUT="${TMPDIR:-/tmp}/mob_traces"
 javac -nowarn -cp "$CLASSES:$LIBS" -d "$CLASSES" tools/poseidon_mobs/PoseidonMobTrace.java
 
 mkdir -p "$OUT"
-for s in flat chase water wall lava slime squid ghast; do
+for s in flat chase water wall lava slime squid ghast \
+         creeper skeleton chicken cow sheep wolf pigzombie giant; do
   java -cp "$CLASSES:$LIBS" flintcore.test.PoseidonMobTrace "$s" 12345 "$OUT/$s.txt" 300 \
     > /dev/null
 done
@@ -24,7 +25,8 @@ done
 # The header of the golden file.
 head -n 27 tests/golden/poseidon_mob_traces.txt > "$OUT/golden.txt"
 
-for s in flat chase water wall lava slime squid ghast; do
+for s in flat chase water wall lava slime squid ghast \
+         creeper skeleton chicken cow sheep wolf pigzombie giant; do
   echo "=== scenario $s ===" >> "$OUT/golden.txt"
   cat "$OUT/$s.txt" >> "$OUT/golden.txt"
 done
