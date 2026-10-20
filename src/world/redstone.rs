@@ -849,46 +849,6 @@ impl World {
             || self.is_block_face_indirectly_powered(x + 1, y + 1, z, 5)
     }
 
-    /// Java `Block.e()` piston mobility reaction:
-    /// `0` = normal push/pull, `1` = breaks and drops item when pushed, `2` = immovable.
-    fn block_piston_mobility(id: u8) -> u8 {
-        if id == blocks::AIR {
-            return 0;
-        }
-        if id == blocks::OBSIDIAN
-            || id == blocks::BEDROCK
-            || id == blocks::PORTAL
-            || id == blocks::PISTON_HEAD
-            || id == blocks::PISTON_MOVING
-        {
-            return 2;
-        }
-        let mat = blocks::material(id);
-        match mat {
-            blocks::Material::Plant
-            | blocks::Material::Orientable
-            | blocks::Material::Water
-            | blocks::Material::Lava
-            | blocks::Material::Fire
-            | blocks::Material::SnowLayer
-            | blocks::Material::Cactus
-            | blocks::Material::Cake
-            | blocks::Material::Web => 1,
-            _ => {
-                if id == blocks::WOODEN_DOOR
-                    || id == blocks::IRON_DOOR
-                    || id == blocks::STONE_PLATE
-                    || id == blocks::WOOD_PLATE
-                    || id == blocks::BED
-                {
-                    1
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
     fn piston_can_push_block(&self, id: u8, x: i32, y: i32, z: i32, allow_fragile: bool) -> bool {
         if id == blocks::AIR {
             return true;
@@ -917,7 +877,7 @@ impl World {
         if blocks::hardness(id) < 0.0 {
             return false;
         }
-        let mob = Self::block_piston_mobility(id);
+        let mob = blocks::piston_mobility(id);
         if mob == 2 {
             return false;
         }
@@ -1039,7 +999,7 @@ impl World {
             if !self.piston_can_push_block(id, cx, cy, cz, true) {
                 return false;
             }
-            if Self::block_piston_mobility(id) == 1 {
+            if blocks::piston_mobility(id) == 1 {
                 // Fragile block breaks and drops item, terminating the push chain
                 let meta = self.get_data(cx, cy, cz);
                 let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
@@ -1127,7 +1087,7 @@ impl World {
                 let pull_meta = self.get_data(px, py, pz);
                 if pull_id != blocks::AIR
                     && self.piston_can_push_block(pull_id, px, py, pz, false)
-                    && (Self::block_piston_mobility(pull_id) == 0
+                    && (blocks::piston_mobility(pull_id) == 0
                         || pull_id == blocks::PISTON
                         || pull_id == blocks::STICKY_PISTON)
                 {
@@ -3038,7 +2998,7 @@ impl World {
                     blocks::SAPLING => {
                         if y < 127
                             && self.light_at(wx, y + 1, wz) >= 9
-                            && rng.next_i32_bound(7) == 0
+                            && rng.next_i32_bound(30) == 0
                         {
                             let meta = self.get_data(wx, y, wz);
                             if (meta & 8) == 0 {

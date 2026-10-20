@@ -373,20 +373,19 @@ pub fn friction_factor(id: u8) -> f32 {
 
 pub fn light_opacity(id: u8) -> u8 {
     match id {
-        AIR => 0,
+        STONE | GRASS | DIRT | COBBLESTONE | WOOD_PLANKS | BEDROCK | LAVA | STATIONARY_LAVA
+        | SAND | GRAVEL | GOLD_ORE | IRON_ORE | COAL_ORE | LOG | SPONGE | LAPIS_ORE
+        | LAPIS_BLOCK | DISPENSER | SANDSTONE | NOTE_BLOCK | WOOL | GOLD_BLOCK | IRON_BLOCK
+        | DOUBLE_STEP | STEP | BRICK | TNT | BOOKSHELF | MOSSY_COBBLESTONE | OBSIDIAN
+        | WOOD_STAIRS | CHEST | DIAMOND_ORE | DIAMOND_BLOCK | WORKBENCH | FARMLAND | FURNACE
+        | LIT_FURNACE | COBBLESTONE_STAIRS | REDSTONE_ORE | LIT_REDSTONE_ORE | SNOW_BLOCK
+        | CLAY | JUKEBOX | PUMPKIN | NETHERRACK | SOUL_SAND | GLOWSTONE | JACK_O_LANTERN
+        | LOCKED_CHEST => 255,
         WATER | STATIONARY_WATER | ICE => 3,
         LEAVES | WEB => 1,
-        SAPLING | GLASS | BED | POWERED_RAIL | DETECTOR_RAIL | STICKY_PISTON | TALL_GRASS
-        | DEAD_BUSH | PISTON | PISTON_HEAD | PISTON_MOVING | YELLOW_FLOWER | RED_ROSE
-        | BROWN_MUSHROOM | RED_MUSHROOM | STEP | TORCH | FIRE | MOB_SPAWNER | WOOD_STAIRS
-        | REDSTONE_WIRE | CROPS | FARMLAND | SIGN | WOODEN_DOOR | LADDER | RAIL
-        | COBBLESTONE_STAIRS | WALL_SIGN | LEVER | STONE_PLATE | IRON_DOOR | WOOD_PLATE
-        | STONE_BUTTON | SNOW | CACTUS | REED | FENCE | PORTAL | CAKE | REPEATER_OFF
-        | REPEATER_ON | TRAPDOOR => 0,
-        _ => 255,
+        _ => 0,
     }
 }
-
 pub fn light_emission(id: u8) -> u8 {
     match id {
         LAVA | STATIONARY_LAVA | FIRE | GLOWSTONE | JACK_O_LANTERN | LOCKED_CHEST => 15,
@@ -402,46 +401,11 @@ pub fn light_emission(id: u8) -> u8 {
 
 /// Java `Block.o[id]` — `Block.a()` (default `true`, overridden `false` for
 /// non-full-cube/technical blocks). Used by `WorldProviderHell.canSpawn`.
+/// Java `WorldProviderHell.canSpawn`: the block is an opaque cube
+/// (`Block.o[]`).
 pub fn is_spawnable(id: u8) -> bool {
-    !matches!(
-        id,
-        SAPLING
-            | WATER
-            | STATIONARY_WATER
-            | LAVA
-            | STATIONARY_LAVA
-            | GLASS
-            | BED
-            | POWERED_RAIL
-            | DETECTOR_RAIL
-            | STICKY_PISTON
-            | PISTON
-            | PISTON_HEAD
-            | TALL_GRASS
-            | DEAD_BUSH
-            | YELLOW_FLOWER
-            | RED_ROSE
-            | BROWN_MUSHROOM
-            | RED_MUSHROOM
-            | FIRE
-            | MOB_SPAWNER
-            | CROPS
-            | WOODEN_DOOR
-            | LADDER
-            | RAIL
-            | LEVER
-            | IRON_DOOR
-            | STONE_BUTTON
-            | ICE
-            | CACTUS
-            | FENCE
-            | PORTAL
-            | CAKE
-            | REPEATER_OFF
-            | REPEATER_ON
-    )
+    is_opaque_cube(id)
 }
-
 pub fn is_opaque(id: u8) -> bool {
     light_opacity(id) > 0
 }
@@ -498,15 +462,64 @@ pub fn is_opaque_cube(id: u8) -> bool {
             | LOCKED_CHEST
     )
 }
-
 /// Java `Block.b()` (`renderAsNormalBlock`).
 pub fn is_normal_cube(id: u8) -> bool {
     is_opaque_cube(id) && !matches!(id, LEAVES | CHEST)
 }
 
-/// Java `World.e(x, y, z)`: `block.isOpaqueCube() && block.b()`.
+/// Java `World.e(x, y, z)`: the material of the block is solid and the
+/// block itself is one (`block.material.h() && block.b()`).
+///
+/// The table is the one of the reference (`tools/poseidon_mobs/BlockTable.java`
+/// prints it).
 pub fn is_solid_normal_block(id: u8) -> bool {
-    is_opaque_cube(id) && !matches!(id, LEAVES | CHEST)
+    matches!(
+        id,
+        STONE
+            | GRASS
+            | DIRT
+            | COBBLESTONE
+            | WOOD_PLANKS
+            | BEDROCK
+            | SAND
+            | GRAVEL
+            | GOLD_ORE
+            | IRON_ORE
+            | COAL_ORE
+            | LOG
+            | SPONGE
+            | LAPIS_ORE
+            | LAPIS_BLOCK
+            | DISPENSER
+            | SANDSTONE
+            | NOTE_BLOCK
+            | WOOL
+            | GOLD_BLOCK
+            | IRON_BLOCK
+            | DOUBLE_STEP
+            | BRICK
+            | BOOKSHELF
+            | MOSSY_COBBLESTONE
+            | OBSIDIAN
+            | MOB_SPAWNER
+            | CHEST
+            | DIAMOND_ORE
+            | DIAMOND_BLOCK
+            | WORKBENCH
+            | FURNACE
+            | LIT_FURNACE
+            | REDSTONE_ORE
+            | LIT_REDSTONE_ORE
+            | SNOW_BLOCK
+            | CLAY
+            | JUKEBOX
+            | PUMPKIN
+            | NETHERRACK
+            | SOUL_SAND
+            | GLOWSTONE
+            | JACK_O_LANTERN
+            | LOCKED_CHEST
+    )
 }
 
 /// Java `Block.leafDecayBlacklist` (configured ids 54, 63, 68): tree
@@ -647,9 +660,9 @@ pub fn drop_damage(block_id: u8, metadata: u8) -> i16 {
 /// Java `Block.a(Random)` — base drop count before per-item roll.
 pub fn drop_count(block_id: u8, rng: &mut JavaRandom) -> usize {
     match block_id {
-        AIR | BEDROCK | WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA | GLASS | BOOKSHELF
-        | FIRE | MOB_SPAWNER | SNOW | ICE | PORTAL | CAKE | PISTON_HEAD | PISTON_MOVING
-        | DEAD_BUSH | LOCKED_CHEST | TNT => 0,
+        AIR | WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA | GLASS | BOOKSHELF | FIRE
+        | MOB_SPAWNER | SNOW | ICE | PORTAL | CAKE | PISTON_HEAD | PISTON_MOVING | DEAD_BUSH
+        | TNT => 0,
         LEAVES => {
             if rng.next_i32_bound(20) == 0 {
                 1
@@ -669,9 +682,15 @@ pub fn drop_count(block_id: u8, rng: &mut JavaRandom) -> usize {
 /// Java `Block.a(int metadata, Random)` — dropped item ID (`<= 0` means nothing).
 pub fn drop_item_id(block_id: u8, metadata: u8, rng: &mut JavaRandom) -> i16 {
     match block_id {
-        AIR | BEDROCK | WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA | GLASS | BOOKSHELF
-        | FIRE | MOB_SPAWNER | ICE | PORTAL | CAKE | PISTON_HEAD | PISTON_MOVING | DEAD_BUSH
-        | LOCKED_CHEST | TNT => -1,
+        AIR | WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA | GLASS | BOOKSHELF | FIRE
+        | MOB_SPAWNER | ICE | PORTAL | CAKE | PISTON_HEAD | PISTON_MOVING | DEAD_BUSH | TNT => -1,
+        // The bedrock and the locked chest drop themselves
+        // (`Block.a(int, Random)`).
+        BEDROCK => BEDROCK as i16,
+        LOCKED_CHEST => LOCKED_CHEST as i16,
+        // The stairs drop the block they are made of (`BlockStairs`).
+        WOOD_STAIRS => WOOD_PLANKS as i16,
+        COBBLESTONE_STAIRS => COBBLESTONE as i16,
         STONE => COBBLESTONE as i16,
         GRASS | FARMLAND => DIRT as i16,
         GRAVEL => {
@@ -806,9 +825,99 @@ pub fn step_sound(block_id: u8) -> StepSound {
     }
 }
 
+/// Java `Block.e()`: the mobility of the block for the pistons.
+///
+/// `0` is a normal block, `1` is a block that breaks and drops an item and
+/// `2` is a block that cannot be moved.  The table is the one of the
+/// reference (`tools/poseidon_mobs/BlockTable.java` prints it).
+pub fn piston_mobility(id: u8) -> u8 {
+    // The table of the reference (`Block.e()`), the tool
+    // `tools/poseidon_mobs/BlockTable.java` prints it.
+    match id {
+        STONE | GRASS | DIRT | COBBLESTONE | WOOD_PLANKS | BEDROCK | SAND | GRAVEL | GOLD_ORE
+        | IRON_ORE | COAL_ORE | LOG | SPONGE | GLASS | LAPIS_ORE | LAPIS_BLOCK | DISPENSER
+        | SANDSTONE | NOTE_BLOCK | POWERED_RAIL | DETECTOR_RAIL | WOOL | GOLD_BLOCK
+        | IRON_BLOCK | DOUBLE_STEP | STEP | BRICK | TNT | BOOKSHELF | MOSSY_COBBLESTONE
+        | OBSIDIAN | MOB_SPAWNER | WOOD_STAIRS | CHEST | DIAMOND_ORE | DIAMOND_BLOCK
+        | WORKBENCH | FARMLAND | FURNACE | LIT_FURNACE | SIGN | RAIL | COBBLESTONE_STAIRS
+        | WALL_SIGN | REDSTONE_ORE | LIT_REDSTONE_ORE | ICE | SNOW_BLOCK | CLAY | JUKEBOX
+        | FENCE | NETHERRACK | SOUL_SAND | GLOWSTONE | LOCKED_CHEST | TRAPDOOR => 0,
+        SAPLING | WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA | LEAVES | BED | WEB
+        | TALL_GRASS | DEAD_BUSH | YELLOW_FLOWER | RED_ROSE | BROWN_MUSHROOM | RED_MUSHROOM
+        | TORCH | FIRE | REDSTONE_WIRE | CROPS | WOODEN_DOOR | LADDER | LEVER | STONE_PLATE
+        | IRON_DOOR | WOOD_PLATE | REDSTONE_TORCH_OFF | REDSTONE_TORCH_ON | STONE_BUTTON | SNOW
+        | CACTUS | REED | PUMPKIN | JACK_O_LANTERN | CAKE | REPEATER_OFF | REPEATER_ON => 1,
+        STICKY_PISTON | PISTON | PISTON_HEAD | PISTON_MOVING | PORTAL => 2,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tables of the blocks are the tables of the reference.
+    ///
+    /// The tool `tools/poseidon_mobs/BlockTable.java` prints the tables of
+    /// the reference, they are saved in `tests/golden/block_tables.txt`.
+    #[test]
+    fn the_tables_of_the_blocks_are_the_tables_of_the_reference() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/block_tables.txt");
+        let table = std::fs::read_to_string(&path).expect("the table of the reference");
+        let mut checked = 0;
+        for line in table.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(id) = parts.next().and_then(|v| v.parse::<u8>().ok()) else {
+                continue;
+            };
+            // The format of the line: the id, the name of the class of the
+            // block and the values of the tables.
+            let values: Vec<&str> = parts.collect();
+            let flag = |name: &str| -> bool {
+                values
+                    .iter()
+                    .find(|v| v.starts_with(name))
+                    .and_then(|v| v.split('=').nth(1))
+                    .map(|v| v == "true")
+                    .unwrap_or(false)
+            };
+            let number = |name: &str| -> i32 {
+                values
+                    .iter()
+                    .find(|v| v.starts_with(name))
+                    .and_then(|v| v.split('=').nth(1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+            assert_eq!(
+                is_opaque_cube(id),
+                flag("opaque"),
+                "the opaque cube of the block {}",
+                id
+            );
+            assert_eq!(
+                light_opacity(id),
+                u8::try_from(number("light")).unwrap_or(255),
+                "the opacity of the light of the block {}",
+                id
+            );
+            assert_eq!(
+                is_solid_normal_block(id),
+                flag("solid"),
+                "the solid block {}",
+                id
+            );
+            assert_eq!(
+                piston_mobility(id),
+                u8::try_from(number("mobility")).unwrap_or(0),
+                "the mobility of the block {}",
+                id
+            );
+            checked += 1;
+        }
+        assert!(checked > 90, "the table of the reference is complete");
+    }
 
     /// The table of the random ticks is the table of the reference.
     ///
