@@ -290,65 +290,70 @@ impl Command for HelpCommand {
 
     fn execute(&self, _sender: &str, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         let mut result = CommandResult::handled();
-        result.sender_messages.push("--- Help ---".to_string());
         result
             .sender_messages
-            .push("help  or  ?               shows this message".to_string());
+            .push("To run the server without a gui, start it like this:".to_string());
         result
             .sender_messages
-            .push("kick <player>             removes a player from the server".to_string());
+            .push("   java -Xmx1024M -Xms1024M -jar minecraft_server.jar nogui".to_string());
+        result.sender_messages.push("Console commands:".to_string());
         result
             .sender_messages
-            .push("ban <player>              bans a player from the server".to_string());
+            .push("   help  or  ?               shows this message".to_string());
+        result
+            .sender_messages
+            .push("   kick <player>             removes a player from the server".to_string());
+        result
+            .sender_messages
+            .push("   ban <player>              bans a player from the server".to_string());
         result.sender_messages.push(
-            "pardon <player>           pardons a banned player so that they can connect again"
+            "   pardon <player>           pardons a banned player so that they can connect again"
                 .to_string(),
         );
         result
             .sender_messages
-            .push("ban-ip <ip>               bans an IP address from the server".to_string());
+            .push("   ban-ip <ip>               bans an IP address from the server".to_string());
         result.sender_messages.push(
-            "pardon-ip <ip>            pardons a banned IP address so that they can connect again"
+            "   pardon-ip <ip>            pardons a banned IP address so that they can connect again".to_string(),
+        );
+        result
+            .sender_messages
+            .push("   op <player>               turns a player into an op".to_string());
+        result
+            .sender_messages
+            .push("   deop <player>             removes op status from a player".to_string());
+        result.sender_messages.push(
+            "   tp <player1> <player2>    moves one player to the same location as another player"
                 .to_string(),
         );
         result
             .sender_messages
-            .push("op <player>               turns a player into an op".to_string());
+            .push("   give <player> <id> [num]  gives a player a resource".to_string());
         result
             .sender_messages
-            .push("deop <player>             removes op status from a player".to_string());
+            .push("   tell <player> <message>   sends a private message to a player".to_string());
+        result
+            .sender_messages
+            .push("   stop                      gracefully stops the server".to_string());
+        result
+            .sender_messages
+            .push("   save-all                  forces a server-wide level save".to_string());
         result.sender_messages.push(
-            "tp <player1> <player2>    moves one player to the same location as another player"
+            "   save-off                  disables terrain saving (useful for backup scripts)"
                 .to_string(),
         );
         result
             .sender_messages
-            .push("give <player> <id> [num]  gives a player a resource".to_string());
+            .push("   save-on                   re-enables terrain saving".to_string());
         result
             .sender_messages
-            .push("tell <player> <message>   sends a private message to a player".to_string());
+            .push("   list                      lists all currently connected players".to_string());
         result
             .sender_messages
-            .push("stop                      gracefully stops the server".to_string());
-        result
-            .sender_messages
-            .push("save-all                  forces a server-wide level save".to_string());
+            .push("   say <message>             broadcasts a message to all players".to_string());
         result.sender_messages.push(
-            "save-off                  disables terrain saving (useful for backup scripts)"
-                .to_string(),
+            "   time <add|set> <amount>   adds to or sets the world time (0-24000)".to_string(),
         );
-        result
-            .sender_messages
-            .push("save-on                   re-enables terrain saving".to_string());
-        result
-            .sender_messages
-            .push("list                      lists all currently connected players".to_string());
-        result
-            .sender_messages
-            .push("say <message>             broadcasts a message to all players".to_string());
-        result
-            .sender_messages
-            .push("time <add|set> <amount>   adds to or sets the world time (0-24000)".to_string());
         result
     }
 }
@@ -778,9 +783,9 @@ impl Command for GiveCommand {
     }
 
     fn execute(&self, _sender: &str, args: &[&str], ctx: &CommandContext) -> CommandResult {
-        if args.len() < 2 || args.len() > 4 {
-            return CommandResult::handled()
-                .with_sender_message("\u{00A7}cUsage: /give <player> <item> [amount]".to_string());
+        // The reference ignores the wrong number of the arguments silently.
+        if args.len() < 2 || args.len() > 3 {
+            return CommandResult::handled();
         }
         let target = args[0];
         if !ctx.online_players.is_empty()
@@ -793,32 +798,29 @@ impl Command for GiveCommand {
                 .with_sender_message(format!("Can't find user {target}"));
         }
 
-        let (item_str, inline_damage) = match args[1].split_once(':') {
-            Some((a, b)) => (a, b.parse::<i16>().ok()),
-            None => (args[1], None),
-        };
-
-        let Some((item_id, mat_name)) = match_material(item_str) else {
+        // The item is given by its number only.
+        let Ok(item_id) = args[1].parse::<i16>() else {
             return CommandResult::handled()
-                .with_sender_message(format!("There's no item called {}", args[1]));
+                .with_sender_message(format!("There's no item with id {}", args[1]));
         };
+        if material_name_by_id(item_id).is_none() {
+            return CommandResult::handled()
+                .with_sender_message(format!("There's no item with id {item_id}"));
+        }
 
         let amount = args
             .get(2)
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(1)
             .clamp(1, 64) as u8;
-        let damage = inline_damage
-            .or_else(|| args.get(3).and_then(|s| s.parse::<i16>().ok()))
-            .unwrap_or(0);
 
         CommandResult::handled()
-            .with_broadcast(format!("Giving {target} some {item_id}({mat_name})"))
+            .with_broadcast(format!("Giving {target} some {item_id}"))
             .with_action(CommandAction::Give {
                 target: target.to_string(),
                 item_id,
                 amount,
-                damage,
+                damage: 0,
             })
     }
 }
@@ -1498,6 +1500,46 @@ mod tests {
         assert!(!res_alias.sender_messages.is_empty());
     }
 
+    /// The text of the help is the text of the reference.
+    ///
+    /// Java `ConsoleCommandHandler.a(ICommandListener)`: three header lines
+    /// and eighteen lines of the commands, every line of the commands starts
+    /// with three spaces.
+    #[test]
+    fn the_text_of_the_help_is_the_text_of_the_reference() {
+        let map = CommandMap::new();
+        let result = map.dispatch("Player", "help");
+        assert!(result.handled);
+        let expected = [
+            "To run the server without a gui, start it like this:",
+            "   java -Xmx1024M -Xms1024M -jar minecraft_server.jar nogui",
+            "Console commands:",
+            "   help  or  ?               shows this message",
+            "   kick <player>             removes a player from the server",
+            "   ban <player>              bans a player from the server",
+            "   pardon <player>           pardons a banned player so that they can connect again",
+            "   ban-ip <ip>               bans an IP address from the server",
+            "   pardon-ip <ip>            pardons a banned IP address so that they can connect again",
+            "   op <player>               turns a player into an op",
+            "   deop <player>             removes op status from a player",
+            "   tp <player1> <player2>    moves one player to the same location as another player",
+            "   give <player> <id> [num]  gives a player a resource",
+            "   tell <player> <message>   sends a private message to a player",
+            "   stop                      gracefully stops the server",
+            "   save-all                  forces a server-wide level save",
+            "   save-off                  disables terrain saving (useful for backup scripts)",
+            "   save-on                   re-enables terrain saving",
+            "   list                      lists all currently connected players",
+            "   say <message>             broadcasts a message to all players",
+            "   time <add|set> <amount>   adds to or sets the world time (0-24000)",
+        ];
+        assert_eq!(
+            result.sender_messages,
+            expected.to_vec(),
+            "the text of the help"
+        );
+    }
+
     #[test]
     fn dispatch_say() {
         let map = CommandMap::new();
@@ -1532,13 +1574,20 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_give_by_id_and_by_name() {
+    /// The command `give` of the reference.
+    ///
+    /// Java `ConsoleCommandHandler`: the item is given by its number only,
+    /// the name of the item is not accepted, the wrong number of the
+    /// arguments is ignored silently, the message of the success is
+    /// `Giving <player> some <id>` and the message of the error is
+    /// `There's no item with id <id>`.
+    fn dispatch_give_of_the_reference() {
         let map = CommandMap::new();
         let ctx = CommandContext {
             online_players: vec!["Hero".to_string()],
             ..Default::default()
         };
-        let r1 = map.dispatch_with_context("Hero", "give Hero boat 1", &ctx);
+        let r1 = map.dispatch_with_context("Hero", "give Hero 333 1", &ctx);
         assert_eq!(
             r1.actions,
             vec![CommandAction::Give {
@@ -1548,17 +1597,22 @@ mod tests {
                 damage: 0,
             }]
         );
+        assert_eq!(r1.broadcast_messages, vec!["Giving Hero some 333"]);
 
-        let r2 = map.dispatch_with_context("Hero", "give Hero 35:14 16", &ctx);
-        assert_eq!(
-            r2.actions,
-            vec![CommandAction::Give {
-                target: "Hero".to_string(),
-                item_id: blocks::WOOL as i16,
-                amount: 16,
-                damage: 14,
-            }]
-        );
+        // The name of the item is not accepted.
+        let r2 = map.dispatch_with_context("Hero", "give Hero boat 1", &ctx);
+        assert!(r2.actions.is_empty(), "the item is not given");
+        assert_eq!(r2.sender_messages, vec!["There's no item with id boat"]);
+
+        // The number of the item that does not exist.
+        let r3 = map.dispatch_with_context("Hero", "give Hero 9999", &ctx);
+        assert!(r3.actions.is_empty(), "the item is not given");
+        assert_eq!(r3.sender_messages, vec!["There's no item with id 9999"]);
+
+        // The wrong number of the arguments is ignored silently.
+        let r4 = map.dispatch_with_context("Hero", "give Hero", &ctx);
+        assert!(r4.actions.is_empty(), "the item is not given");
+        assert!(r4.sender_messages.is_empty(), "the command is silent");
     }
 
     #[test]
