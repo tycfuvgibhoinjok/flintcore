@@ -5570,7 +5570,7 @@ impl Server {
             // The damage of the fall and of the cactus, they are applied
             // after the movement of the mob.
             let mut fall_hit: i16 = 0;
-            let mut cactus_hit = false;
+            let mut cactus_hits = 0u32;
             if let Some(mob) = self.entities.get_mob_mut(mob_id) {
                 pre_y = mob.y;
                 pre_mot_y = mob.mot_y;
@@ -6101,14 +6101,11 @@ impl Server {
                     fall_hit = ((fall_damage - 3.0).ceil() as i32).max(0) as i16;
                 }
                 // The cactus (`BlockCactus.a`): the mob inside a cactus takes
-                // one point of damage. The reference applies it in the
-                // collision of the movement, after the fall damage.
-                let bx = mob.x.floor() as i32;
-                let by = mob.y.floor() as i32;
-                let bz = mob.z.floor() as i32;
-                if self.world.get_block(bx, by, bz) == blocks::CACTUS {
-                    cactus_hit = true;
-                }
+                // one point of damage **for every cactus** of its box. The
+                // reference visits every block of the box shrunk by 0.001
+                // (`Entity.move()`).
+                let box_ = mob.aabb();
+                cactus_hits = self.count_cactuses(&box_);
             }
 
             // The fall damage and the cactus of the mob (`Entity.move()`):
@@ -6116,7 +6113,7 @@ impl Server {
             if fall_hit > 0 {
                 let _ = self.damage_mob(mob_id, fall_hit, None, false);
             }
-            if cactus_hit {
+            for _ in 0..cactus_hits {
                 let _ = self.damage_mob(mob_id, 1, None, false);
             }
 
@@ -6262,6 +6259,30 @@ impl Server {
                 let _ = self.entity_random.next_f32();
             }
         }
+    }
+
+    /// The number of the cactuses in the box of the mob.
+    ///
+    /// Java `Entity.move()`: every block of the box shrunk by 0.001 is
+    /// visited and the cactus damages the entity once each.
+    fn count_cactuses(&self, box_: &Aabb) -> u32 {
+        let min_x = (box_.min_x + 0.001).floor() as i32;
+        let min_y = (box_.min_y + 0.001).floor() as i32;
+        let min_z = (box_.min_z + 0.001).floor() as i32;
+        let max_x = (box_.max_x - 0.001).floor() as i32;
+        let max_y = (box_.max_y - 0.001).floor() as i32;
+        let max_z = (box_.max_z - 0.001).floor() as i32;
+        let mut count = 0;
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                for z in min_z..=max_z {
+                    if self.world.get_block(x, y, z) == blocks::CACTUS {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
     }
 
     /// Java `Entity.collide(Entity)`: the two entities push each other
@@ -12186,6 +12207,40 @@ mod tests {
             mob.mot_y != 0.300_000_011_920_928_96,
             "the mob does not swim up when the box holds a liquid (mot_y = {})",
             mob.mot_y
+        );
+    }
+
+    /// The mob takes one point of damage for every cactus of its box.
+    ///
+    /// Java `Entity.move()`: every block of the box shrunk by 0.001 is
+    /// visited and the cactus damages the entity once each
+    /// (`BlockCactus.a`).
+    #[test]
+    fn the_mob_takes_damage_of_every_cactus_of_its_box() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        // The mob stands in two cactuses.
+        server.world.set_block(0, 64, 0, blocks::CACTUS);
+        server.world.set_block(1, 64, 0, blocks::CACTUS);
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.x = 0.5;
+            mob.y = 64.0;
+            mob.z = 0.5;
+        }
+        let before = server
+            .entities
+            .get_mob(mob_id)
+            .expect("the mob is alive")
+            .health;
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        // The reference visits every cactus of the box, but the second hit
+        // falls into the window of the invulnerability of the mob
+        // (`EntityLiving.damageEntity`: `i <= this.lastDamage`), so the mob
+        // loses one point of health.
+        assert_eq!(
+            mob.health,
+            before - 1,
+            "the mob takes the damage of the cactus of its box"
         );
     }
 
