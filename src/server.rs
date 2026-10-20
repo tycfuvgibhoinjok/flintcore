@@ -4696,6 +4696,7 @@ impl Server {
                 } else if mob.mob_type == MobType::PigZombie {
                     mob.target_id = Some(att_id);
                     mob.pigzombie_anger = 400 + self.entity_random.next_i32_bound(400);
+                    mob.pigzombie_sound_delay = self.entity_random.next_i32_bound(40);
                     pigzombie_alert = Some((mob.x, mob.y, mob.z, att_id));
                 } else if mob.mob_type.is_monster() {
                     mob.target_id = Some(att_id);
@@ -4760,6 +4761,7 @@ impl Server {
                 {
                     pz_mob.target_id = Some(att_id);
                     pz_mob.pigzombie_anger = 400 + self.entity_random.next_i32_bound(400);
+                    pz_mob.pigzombie_sound_delay = self.entity_random.next_i32_bound(40);
                 }
             }
         }
@@ -4908,6 +4910,28 @@ impl Server {
                 }
             }
 
+            // The sound of the angry pig zombie (`EntityPigZombie.m_()`):
+            // the reference plays it before the update of the mob.
+            {
+                let sound = self.entities.get_mob_mut(mob_id).and_then(|mob| {
+                    if mob.mob_type == MobType::PigZombie && mob.pigzombie_sound_delay > 0 {
+                        mob.pigzombie_sound_delay -= 1;
+                        if mob.pigzombie_sound_delay == 0 {
+                            Some(())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if sound.is_some() {
+                    // The pitch and the volume of the sound are two numbers.
+                    let _ = self.entity_random.next_f32();
+                    let _ = self.entity_random.next_f32();
+                }
+            }
+
             // The update of the mob before the AI (`Entity.R()` and
             // `EntityLiving.R()`): the splash in the water, the damage of the
             // fire and the lava and the idle sound of the mob draw from the
@@ -5001,17 +5025,37 @@ impl Server {
             // Acquire new target if none
             if target_pos.is_none() && !corpse {
                 match mtype {
-                    MobType::Zombie | MobType::Skeleton | MobType::Creeper | MobType::Giant => {
+                    MobType::Zombie
+                    | MobType::Skeleton
+                    | MobType::Creeper
+                    | MobType::Giant
+                    | MobType::Ghast => {
+                        // The target of the monster (`EntityMonster.findTarget()`):
+                        // the closest player in sixteen blocks the mob can
+                        // see.
                         if let Some((pid, px, py, pz, dsq)) = closest_player {
-                            if dsq <= 16.0 * 16.0 {
+                            if dsq < 16.0 * 16.0
+                                && self.mob_sees(mob_id, px, py, pz, PLAYER_EYE_HEIGHT)
+                            {
                                 target_pos = Some((pid, true, px, py, pz));
                             }
                         }
                     }
-                    MobType::Ghast => {
-                        if let Some((pid, px, py, pz, dsq)) = closest_player {
-                            if dsq <= 100.0 * 100.0 {
-                                target_pos = Some((pid, true, px, py, pz));
+                    MobType::Spider => {
+                        // The target of the spider (`EntitySpider.findTarget()`):
+                        // the closest player in sixteen blocks, but only when
+                        // the light of the block of the spider is below 0.5.
+                        // The reference draws no number.
+                        let light = self
+                            .entities
+                            .get_mob(mob_id)
+                            .map(|mob| crate::entity::mob::mob_light_at(&self.world, mob, sky_sub))
+                            .unwrap_or(0.0);
+                        if light < 0.5 {
+                            if let Some((pid, px, py, pz, dsq)) = closest_player {
+                                if dsq < 16.0 * 16.0 {
+                                    target_pos = Some((pid, true, px, py, pz));
+                                }
                             }
                         }
                     }
@@ -5022,7 +5066,7 @@ impl Server {
                             .is_some_and(|m| m.pigzombie_anger > 0);
                         if angry {
                             if let Some((pid, px, py, pz, dsq)) = closest_player {
-                                if dsq <= 16.0 * 16.0 {
+                                if dsq < 16.0 * 16.0 {
                                     target_pos = Some((pid, true, px, py, pz));
                                 }
                             }
@@ -5036,7 +5080,7 @@ impl Server {
                             .unwrap_or((false, false));
                         if angry {
                             if let Some((pid, px, py, pz, dsq)) = closest_player {
-                                if dsq <= 16.0 * 16.0 {
+                                if dsq < 16.0 * 16.0 {
                                     target_pos = Some((pid, true, px, py, pz));
                                 }
                             }
@@ -5108,11 +5152,10 @@ impl Server {
                 None
             };
 
-            let has_los = target_pos.is_some_and(|(_, _, tx, ty, tz)| {
-                self.world
-                    .ray_trace((mx, my + 1.0, mz), (tx, ty + 1.0, tz), false)
-                    .is_none()
-            });
+            let has_los = match target_pos {
+                Some((_, _, tx, ty, tz)) => self.mob_sees(mob_id, tx, ty, tz, target_eye_height),
+                None => false,
+            };
 
             // The attack of the mob (`EntityCreature.c_()`): the melee, the
             // fuse of the creeper and the bow of the skeleton. The reference
@@ -6143,6 +6186,21 @@ impl Server {
         }
     }
 
+    /// The line of sight of the mob (`EntityLiving.e(Entity)`): the ray from
+    /// the eyes of the mob to the eyes of the target has to be clear.
+    fn mob_sees(&self, mob_id: i32, tx: f64, ty: f64, tz: f64, target_eye_height: f64) -> bool {
+        let Some(mob) = self.entities.get_mob(mob_id) else {
+            return false;
+        };
+        self.world
+            .ray_trace(
+                (mob.x, mob.y + mob.eye_height(), mob.z),
+                (tx, ty + target_eye_height, tz),
+                false,
+            )
+            .is_none()
+    }
+
     /// Java `Entity.R()` and `EntityLiving.R()`: the update of the mob before
     /// the AI of the mob.
     ///
@@ -6435,9 +6493,6 @@ impl Server {
             }
             if mob.attack_ticks > 0 {
                 mob.attack_ticks -= 1;
-            }
-            if mob.pigzombie_anger > 0 {
-                mob.pigzombie_anger -= 1;
             }
             mob.just_created = false;
         }
@@ -11540,6 +11595,72 @@ mod tests {
         let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
         // The pig has ten points of health, one of them is gone.
         assert_eq!(mob.health, 9);
+    }
+
+    /// The giant has two hundred points of health.
+    ///
+    /// Java `EntityGiantZombie`: the health of the monster is ten times
+    /// higher.
+    #[test]
+    fn the_giant_has_two_hundred_points_of_health() {
+        let (server, mob_id) = mob_scenario_server("giant");
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.health, 200);
+        assert_eq!(mob.max_health, 200);
+    }
+
+    /// The target of a monster has to be visible.
+    ///
+    /// Java `EntityMonster.findTarget()`: the closest player in sixteen
+    /// blocks the mob can see (`EntityLiving.e(Entity)`).
+    #[test]
+    fn the_target_of_a_mob_has_to_be_visible() {
+        let (mut server, mob_id) = mob_scenario_server("chase");
+        // A wall between the mob and the player.
+        for y in 64..=68 {
+            server.world.set_block(5, y, 0, blocks::STONE);
+        }
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(mob.target_id.is_none());
+        // The wall is gone, the mob sees the player.
+        for y in 64..=68 {
+            server.world.set_block(5, y, 0, blocks::AIR);
+        }
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(mob.target_id.is_some());
+    }
+
+    /// The spider looks for a player only in the dark.
+    ///
+    /// Java `EntitySpider.findTarget()`: the light of the block of the spider
+    /// has to be below 0.5.
+    #[test]
+    fn the_spider_looks_for_a_player_only_in_the_dark() {
+        let (mut server, mob_id) = mob_scenario_server("wall");
+        // The light of the floor is the light of the sky, the spider does not
+        // look for a player.
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(mob.target_id.is_none());
+    }
+
+    /// The anger of a pig zombie does not run out.
+    ///
+    /// Java `EntityPigZombie`: the anger is set when the pig zombie is hurt
+    /// and it lasts until the pig zombie forgets its target.
+    #[test]
+    fn the_anger_of_a_pig_zombie_does_not_run_out() {
+        let (mut server, mob_id) = mob_scenario_server("pigzombie");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.pigzombie_anger = 500;
+        }
+        for _ in 0..100 {
+            server.tick_mobs();
+        }
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.pigzombie_anger, 500);
     }
 
     /// The traces of the port have to be the traces of the reference, tick by

@@ -191,7 +191,9 @@ impl MobType {
     pub fn default_health(self, slime_size: i32) -> i16 {
         match self {
             Self::Creeper | Self::Skeleton | Self::Spider | Self::Zombie | Self::PigZombie => 20,
-            Self::Giant => 100,
+            // `EntityGiantZombie`: the health of the monster is ten times
+            // higher.
+            Self::Giant => 200,
             Self::Slime => {
                 let s = slime_size.max(1) as i16;
                 s * s
@@ -351,6 +353,9 @@ pub struct Mob {
     pub ghast_charge: i32,
     // PigZombie
     pub pigzombie_anger: i32,
+    /// Java `EntityPigZombie.soundDelay`: the counter of the sound of the
+    /// angry pig zombie.
+    pub pigzombie_sound_delay: i32,
     // Squid
     pub squid_swim_vec: (f32, f32, f32),
     pub squid_tentacle_angle: f32,
@@ -483,6 +488,7 @@ impl Mob {
             ghast_course_cooldown: 0,
             ghast_charge: 0,
             pigzombie_anger: 0,
+            pigzombie_sound_delay: 0,
             squid_swim_vec: (0.0, 0.0, 0.0),
             squid_tentacle_angle: 0.0,
             squid_speed: 0.0,
