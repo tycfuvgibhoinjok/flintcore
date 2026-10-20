@@ -7,6 +7,7 @@ description = "A high-performance Minecraft Beta 1.7.3 server core written in Ru
 license = "GPL-3.0-or-later"
 
 [dependencies]
+indexmap = "2"
 libdeflater = "1"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

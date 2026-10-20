@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 use crate::util::compress::{
     deflate_gzip, deflate_zlib, inflate_gzip, inflate_zlib, CHUNK_DEFLATE_LEVEL,
@@ -29,7 +29,7 @@ pub enum NbtTag {
     ByteArray(Vec<u8>),
     String(String),
     List(Vec<NbtTag>),
-    Compound(HashMap<String, NbtTag>),
+    Compound(IndexMap<String, NbtTag>),
     IntArray(Vec<i32>),
 }
 
@@ -51,7 +51,7 @@ impl NbtTag {
     }
 
     pub fn compound() -> Self {
-        Self::Compound(HashMap::new())
+        Self::Compound(IndexMap::new())
     }
 
     pub fn insert(&mut self, key: impl Into<String>, value: NbtTag) {
@@ -127,7 +127,7 @@ impl NbtTag {
         }
     }
 
-    pub fn get_compound(&self, key: &str) -> Option<&HashMap<String, NbtTag>> {
+    pub fn get_compound(&self, key: &str) -> Option<&IndexMap<String, NbtTag>> {
         match self.get(key) {
             Some(Self::Compound(map)) => Some(map),
             _ => None,
@@ -162,7 +162,7 @@ impl NbtTag {
         }
         let tag_id = read_u8(&mut data)?;
         if tag_id == TAG_END {
-            return Ok((String::new(), Self::Compound(HashMap::new())));
+            return Ok((String::new(), Self::Compound(IndexMap::new())));
         }
         let name = read_string(&mut data)?;
         let tag = Self::read_payload(tag_id, &mut data)?;
@@ -265,7 +265,7 @@ impl NbtTag {
                 Ok(Self::List(items))
             }
             TAG_COMPOUND => {
-                let mut map = HashMap::new();
+                let mut map = IndexMap::new();
                 loop {
                     let sub_id = read_u8(data)?;
                     if sub_id == TAG_END {
@@ -369,6 +369,33 @@ fn write_string(s: &str, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tags of a compound keep the order of their insertion.
+    ///
+    /// Java `NBTTagCompound` keeps the tags in a `HashMap`, the port keeps
+    /// them in the order of their insertion: the bytes of the files of the
+    /// world are the same on every run.
+    #[test]
+    fn the_tags_of_the_nbt_keep_the_order_of_the_insertion() {
+        let mut tag = NbtTag::compound();
+        tag.insert("zebra", NbtTag::Int(1));
+        tag.insert("apple", NbtTag::Int(2));
+        tag.insert("mango", NbtTag::Int(3));
+        let bytes = tag.to_bytes("");
+        let zebra = bytes
+            .windows(5)
+            .position(|window| window == b"zebra")
+            .expect("the name of the tag");
+        let apple = bytes
+            .windows(5)
+            .position(|window| window == b"apple")
+            .expect("the name of the tag");
+        let mango = bytes
+            .windows(5)
+            .position(|window| window == b"mango")
+            .expect("the name of the tag");
+        assert!(zebra < apple && apple < mango, "the order of the tags");
+    }
 
     #[test]
     fn nbt_round_trip_primitives() {
