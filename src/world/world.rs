@@ -2020,6 +2020,19 @@ impl World {
             .unwrap_or(false)
     }
 
+    /// Java `World.isChunkLoaded(int, int, int)` (line 472).
+    ///
+    /// The reference asks the chunk if the block is at or above the terrain
+    /// (`Chunk.c(x, y, z)` compares the height with the height map of the
+    /// chunk), the mob under a roof is not in the ground.
+    pub(crate) fn java_is_chunk_loaded_at(&self, x: i32, y: i32, z: i32) -> bool {
+        let pos = ChunkPos::new(x >> 4, z >> 4);
+        match self.chunks.get(&pos) {
+            Some(chunk) => y >= (chunk.height_map[(((z & 15) << 4) | (x & 15)) as usize] as i32),
+            None => false,
+        }
+    }
+
     /// Java `World.a(EnumSkyBlock, int i, int j, int k)` (lines 598-621).
     pub(crate) fn java_get_saved_light(&self, kind: LightType, x: i32, mut y: i32, z: i32) -> i32 {
         if y < 0 {
