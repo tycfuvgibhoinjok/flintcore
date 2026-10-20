@@ -4987,6 +4987,55 @@ impl Server {
                 // below).
             }
 
+            // The daylight combustion of the undead (`EntityZombie.v()`,
+            // `EntitySkeleton.v()`): the reference draws a number every tick
+            // the mob is in the light of the day and above the terrain. The
+            // pig zombie is an undead too (`EntityPigZombie.v()` calls
+            // `EntityZombie.v()`), the fire is put out later by `fireProof`.
+            //
+            // The reference does it at the beginning of the update of the
+            // mob (`EntityZombie.v()` is called before `EntityMonster.v()`),
+            // so the draw of the combustion comes before the draws of the
+            // artificial intelligence and of the movement.
+            if is_daytime
+                && matches!(
+                    mtype,
+                    MobType::Zombie | MobType::Skeleton | MobType::PigZombie
+                )
+            {
+                let mob = self.entities.get_mob(mob_id);
+                if let Some(mob) = mob {
+                    // The light of the mob (`Entity.c(float)`): the curve of
+                    // the light at the feet of the mob.
+                    let (width, _) = mob.size();
+                    let light_y = (mob.y + (width as f64) * 0.66).floor() as i32;
+                    let light = light_curve(chunk_light_at(
+                        &self.world,
+                        mob.x.floor() as i32,
+                        light_y,
+                        mob.z.floor() as i32,
+                        sky_sub,
+                    ));
+                    // The reference checks that the block of the mob is at or
+                    // above the terrain (`World.isChunkLoaded`), only then it
+                    // draws the number of the combustion. The mob under a
+                    // roof burns as well.
+                    let above_terrain = self.world.java_is_chunk_loaded_at(
+                        mob.x.floor() as i32,
+                        mob.y.floor() as i32,
+                        mob.z.floor() as i32,
+                    );
+                    if light > 0.5 && above_terrain {
+                        let burn = self.entity_random.next_f32() * 30.0 < (light - 0.4) * 2.0;
+                        if burn {
+                            if let Some(m) = self.entities.get_mob_mut(mob_id) {
+                                m.fire_ticks = 300;
+                            }
+                        }
+                    }
+                }
+            }
+
             // The counter of the ticks without a target grows faster in the
             // light (`EntityMonster.v()`).
             if !corpse && mtype.is_monster() {
@@ -5901,55 +5950,6 @@ impl Server {
             // reference does it inside the movement of the entity, so it is
             // between the movement of the mob and the rest of its update.
             self.mob_fire_phase(mob_id);
-
-            // Daylight combustion for Zombie and Skeleton (`EntityZombie.v()`,
-            // `EntitySkeleton.v()`): the reference draws a number every tick
-            // the mob is in the light of the day and above the terrain. The
-            // pig zombie is an undead too (`EntityPigZombie.v()` calls
-            // `EntityZombie.v()`), the fire is put out later by `fireProof`.
-            //
-            // The reference does it after the movement and the artificial
-            // intelligence of the mob (`EntityZombie.v()` is called at the
-            // end of `EntityLiving.v()`), so the draw of the combustion comes
-            // after the draws of the movement.
-            if is_daytime
-                && matches!(
-                    mtype,
-                    MobType::Zombie | MobType::Skeleton | MobType::PigZombie
-                )
-            {
-                let mob = self.entities.get_mob(mob_id);
-                if let Some(mob) = mob {
-                    // The light of the mob (`Entity.c(float)`): the curve of
-                    // the light at the feet of the mob.
-                    let (width, _) = mob.size();
-                    let light_y = (mob.y + (width as f64) * 0.66).floor() as i32;
-                    let light = light_curve(chunk_light_at(
-                        &self.world,
-                        mob.x.floor() as i32,
-                        light_y,
-                        mob.z.floor() as i32,
-                        sky_sub,
-                    ));
-                    // The reference checks that the block of the mob is at or
-                    // above the terrain (`World.isChunkLoaded`), only then it
-                    // draws the number of the combustion. The mob under a
-                    // roof burns as well.
-                    let above_terrain = self.world.java_is_chunk_loaded_at(
-                        mob.x.floor() as i32,
-                        mob.y.floor() as i32,
-                        mob.z.floor() as i32,
-                    );
-                    if light > 0.5 && above_terrain {
-                        let burn = self.entity_random.next_f32() * 30.0 < (light - 0.4) * 2.0;
-                        if burn {
-                            if let Some(m) = self.entities.get_mob_mut(mob_id) {
-                                m.fire_ticks = 300;
-                            }
-                        }
-                    }
-                }
-            }
 
             if let Some(mob) = self.entities.get_mob_mut(mob_id) {
                 // The swim of the squid (`EntitySquid.v()`): the phase of the
@@ -11963,18 +11963,18 @@ mod tests {
             }
         }
         scenario_sky_light(&mut server.world, 63, 24);
-        let mut burned = false;
-        for _ in 0..500 {
+        // The counter of the draws: the pig zombie draws a number every
+        // tick it is in the light of the day.
+        let before = server.entity_random.draws;
+        for _ in 0..20 {
             server.tick_mobs();
-            let Some(mob) = server.entities.get_mob(mob_id) else {
-                break;
-            };
-            if mob.fire_ticks > 0 {
-                burned = true;
-                break;
-            }
         }
-        assert!(burned, "the pig zombie burns in the daylight");
+        let drawn = server.entity_random.draws - before;
+        assert!(
+            drawn > 20,
+            "the pig zombie draws a number every tick in the daylight ({} draws)",
+            drawn
+        );
     }
 
     /// The block of the mob is at or above the terrain.
