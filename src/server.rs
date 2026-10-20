@@ -3977,22 +3977,6 @@ impl Server {
         let mob_id = self
             .entities
             .spawn_mob(mob_type, x, y, z, &mut self.entity_random);
-        if mob_type == MobType::Sheep
-            && (!self.config.spawning.spawn_sheep_shades_of_black
-                || !self.config.spawning.spawn_brown_and_pink_sheep)
-        {
-            if let Some(m) = self.entities.get_mob_mut(mob_id) {
-                // The colour of the sheep is drawn with the random of the
-                // world (`SpawnerCreature`), not with the one of the entities.
-                let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
-                m.sheep_color = crate::entity::mob::Mob::natural_sheep_color_ex(
-                    &mut rng,
-                    self.config.spawning.spawn_sheep_shades_of_black,
-                    self.config.spawning.spawn_brown_and_pink_sheep,
-                );
-                self.world.world_random = rng;
-            }
-        }
         let active_dimension = self.active_dimension;
         let players: Vec<_> = self
             .entities
@@ -4034,21 +4018,76 @@ impl Server {
         self.world.tick_random = rng;
 
         for spec in specs {
-            let id = self.spawn_mob_at(spec.mob_type, spec.x, spec.y, spec.z);
-            if spec.spider_jockey {
-                let skel_id = self.spawn_mob_at(MobType::Skeleton, spec.x, spec.y, spec.z);
+            self.spawn_mob_at_natural(spec.mob_type, spec.x, spec.y, spec.z, spec.jockey_chance);
+        }
+    }
+
+    /// The natural spawn of a mob (`SpawnerCreature`).
+    ///
+    /// The yaw of the mob is drawn from the random of the world, then the
+    /// extras of the spawn are drawn: the colour of a sheep or the skeleton
+    /// rider of a spider (`SpawnerCreature.applyPostSpawnExtras`).
+    pub fn spawn_mob_at_natural(
+        &mut self,
+        mob_type: MobType,
+        x: f64,
+        y: f64,
+        z: f64,
+        jockey_chance: i32,
+    ) -> i32 {
+        // The yaw of the mob (`SpawnerCreature`).
+        let yaw = {
+            let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
+            let yaw = rng.next_f32() * 360.0;
+            self.world.world_random = rng;
+            yaw
+        };
+        let mob_id = self.spawn_mob_at(mob_type, x, y, z);
+        if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+            mob.yaw = yaw;
+        }
+        // The extras of the spawn (`SpawnerCreature.applyPostSpawnExtras`).
+        if mob_type == MobType::Spider {
+            let rider = {
+                let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
+                let roll = if jockey_chance > 0 {
+                    rng.next_i32_bound(jockey_chance)
+                } else {
+                    1
+                };
+                self.world.world_random = rng;
+                roll == 0
+            };
+            if rider {
+                // The skeleton rides the spider with the yaw of the spider.
+                let skel_id = self.spawn_mob_at(MobType::Skeleton, x, y, z);
                 if let Some(skel) = self.entities.get_mob_mut(skel_id) {
-                    skel.vehicle_id = Some(id);
+                    skel.yaw = yaw;
+                    skel.vehicle_id = Some(mob_id);
                 }
-                if let Some(spider) = self.entities.get_mob_mut(id) {
+                if let Some(spider) = self.entities.get_mob_mut(mob_id) {
                     spider.passenger_id = Some(skel_id);
                 }
                 self.broadcast(Clientbound::AttachEntity(AttachEntity {
                     entity_id: skel_id,
-                    vehicle_id: id,
+                    vehicle_id: mob_id,
                 }));
             }
+        } else if mob_type == MobType::Sheep {
+            // The colour of the sheep is drawn with the random of the world
+            // (`SpawnerCreature`), not with the one of the entities.
+            let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
+            let color = crate::entity::mob::Mob::natural_sheep_color_ex(
+                &mut rng,
+                self.config.spawning.spawn_sheep_shades_of_black,
+                self.config.spawning.spawn_brown_and_pink_sheep,
+            );
+            self.world.world_random = rng;
+            if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                mob.sheep_color = color;
+            }
         }
+        mob_id
     }
 
     /// Java `Entity.m_()` / `EntityLiving.m_()` — environmental damage (void, suffocation, drowning, cactus, fire, lava) for players.
@@ -12357,6 +12396,73 @@ mod tests {
             .entities
             .insert_player(1, "Tester".to_string(), 0.0, 64.0, 0.0);
         server
+    }
+
+    /// The natural spawn of a mob draws the yaw of the mob from the random
+    /// of the world.
+    ///
+    /// Java `SpawnerCreature`: `mob.setPositionRotation(fx, fy, fz,
+    /// world.random.nextFloat() * 360.0F, 0.0F)`.
+    #[test]
+    fn the_natural_spawn_draws_the_yaw_from_the_random_of_the_world() {
+        let mut spawning = crate::config::SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        for name in [
+            "zombie", "skeleton", "creeper", "slime", "sheep", "chicken", "cow", "wolf", "squid",
+            "spider",
+        ] {
+            spawning.mobs.get_mut(name).unwrap().enabled = false;
+        }
+        let mut server = spawn_test_server(spawning);
+        let mut shadow = server.world.world_random.clone();
+        for _ in 0..50 {
+            server.tick_mob_spawner();
+            if server.entities.iter_mobs().next().is_some() {
+                break;
+            }
+        }
+        let mob = server.entities.iter_mobs().next().expect("a mob spawned");
+        assert_eq!(mob.mob_type, MobType::Pig);
+        // The yaw of the mob is the first draw of the random of the world.
+        let expected = shadow.next_f32() * 360.0;
+        assert_eq!(mob.yaw, expected);
+    }
+
+    /// The natural spawn of a sheep draws the colour of the sheep from the
+    /// random of the world.
+    ///
+    /// Java `SpawnerCreature.applyPostSpawnExtras`: the colour of the sheep
+    /// is drawn after the yaw of the mob.
+    #[test]
+    fn the_natural_spawn_of_a_sheep_draws_its_colour_from_the_world() {
+        let mut spawning = crate::config::SpawningConfig {
+            chunk_sample_divisor: 1,
+            ..Default::default()
+        };
+        for name in [
+            "zombie", "skeleton", "creeper", "slime", "pig", "chicken", "cow", "wolf", "squid",
+            "spider",
+        ] {
+            spawning.mobs.get_mut(name).unwrap().enabled = false;
+        }
+        let mut server = spawn_test_server(spawning);
+        let mut shadow = server.world.world_random.clone();
+        for _ in 0..50 {
+            server.tick_mob_spawner();
+            if server.entities.iter_mobs().next().is_some() {
+                break;
+            }
+        }
+        let mob = server.entities.iter_mobs().next().expect("a mob spawned");
+        assert_eq!(mob.mob_type, MobType::Sheep);
+        // The yaw of the mob and then the colour of the sheep.
+        let expected_yaw = shadow.next_f32() * 360.0;
+        let expected_color =
+            crate::entity::mob::Mob::natural_sheep_color_ex(&mut shadow, true, true);
+        assert_eq!(mob.yaw, expected_yaw);
+        assert_eq!(mob.sheep_color, expected_color);
     }
 
     #[test]

@@ -1695,7 +1695,9 @@ pub struct SpawnedMobSpec {
     pub x: f64,
     pub y: f64,
     pub z: f64,
-    pub spider_jockey: bool,
+    /// The chance of the skeleton rider of a spider (`SpawnerCreature`
+    /// uses `world.random.nextInt(100) == 0`).
+    pub jockey_chance: i32,
 }
 
 /// Java `SpawnerCreature.spawnEntities`: evaluate natural spawns around online players.
@@ -1876,22 +1878,26 @@ pub fn evaluate_natural_spawns(
                     }
 
                     // The spawn conditions of the mob (`Entity.d()`).
-                    // The block light is rolled before the sky light, like the
-                    // vanilla 1.7.3 `SpawnerCreature` does.
-                    if settings.light_roll > 0 {
-                        let light = chunk_light_at(world, x, y, z, sky_sub);
-                        if light > rng.next_i32_bound(settings.light_roll) {
-                            continue;
-                        }
-                    }
+                    // The sky light is rolled before the light of the block
+                    // (`EntityMonster.d()`), the sky light is the raw one and
+                    // the light of the block has the shift of the sky.
                     if settings.sky_light_roll > 0 {
                         let sky_l = chunk_sky_light_at(world, x, y, z);
                         if sky_l > rng.next_i32_bound(settings.sky_light_roll) {
                             continue;
                         }
                     }
-                    if settings.min_light > 0 {
+                    if settings.light_roll > 0 {
                         let light = chunk_light_at(world, x, y, z, sky_sub);
+                        if light > rng.next_i32_bound(settings.light_roll) {
+                            continue;
+                        }
+                    }
+                    if settings.min_light > 0 {
+                        // The animals are checked against the light of the
+                        // day (`EntityAnimal.d()`: `world.k(i, j, k) > 8`,
+                        // the light without the shift of the sky).
+                        let light = chunk_light_at(world, x, y, z, 0);
                         if light < settings.min_light {
                             continue;
                         }
@@ -1909,14 +1915,12 @@ pub fn evaluate_natural_spawns(
                         continue;
                     }
 
-                    let spider_jockey = settings.jockey_chance > 0
-                        && rng.next_i32_bound(settings.jockey_chance) == 0;
                     spawned.push(SpawnedMobSpec {
                         mob_type,
                         x: fx,
                         y: fy,
                         z: fz,
-                        spider_jockey,
+                        jockey_chance: settings.jockey_chance,
                     });
                     group_spawned += 1;
                     if group_spawned >= settings.max_group {
