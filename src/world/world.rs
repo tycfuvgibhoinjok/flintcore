@@ -1908,19 +1908,6 @@ impl World {
         }
     }
 
-    /// `world.isChunkLoaded(i, j, k)` as used by `BlockFlower.f` — it is really
-    /// `Chunk.c(i, j, k)`: the block is at or above the height map.
-    fn can_see_sky(&self, x: i32, y: i32, z: i32) -> bool {
-        let pos = ChunkPos::new(x >> 4, z >> 4);
-        if self.live.active && self.live_resolve_read(pos) {
-            return false;
-        }
-        match self.chunks.get(&pos) {
-            Some(chunk) => y >= chunk.get_height((x & 15) as usize, (z & 15) as usize) as i32,
-            None => !self.live.active,
-        }
-    }
-
     /// Java `Chunk.g(i, j, k)`: recompute one height-map column and write the
     /// new sky-light values directly into the light array.
     fn chunk_height_update(&mut self, cx: i32, cz: i32, lx: usize, j: i32, lz: usize) {
