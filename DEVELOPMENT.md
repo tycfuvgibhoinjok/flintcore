@@ -305,6 +305,19 @@ Mob movement parity harness:
     damaged by it (`World.b(Entity, AxisAlignedBB)` skips the source) and
     the creeper dies without a corpse: the world removes it at the beginning
     of its next tick (`World.tickEntities`).
+  - The target of a mob is searched only when the mob has no target
+    (`EntityCreature.c_()`): a target that was found in this tick is not
+    attacked yet, and a target that died is cleared without searching a new
+    one. The line of sight of the reference is the ray from the eyes of the
+    mob to the eyes of the target (`EntityLiving.e(Entity)`).
+  - The pig zombie is angry until it forgets its target, the anger does not
+    run out, and the angry pig zombie has a sound of its own
+    (`EntityPigZombie.m_()`), the counter of the sound is set when the pig
+    zombie is hurt.
+  - The sheep has ten points of health (`EntityLiving`), the wolf has eight
+    (`EntityWolf`), and the giant has two hundred (`EntityGiantZombie`). The
+    chicken and the ghast do not take the damage of a fall
+    (`EntityChicken.a(float)` and `EntityFlying.a(float)`).
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.
