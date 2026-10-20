@@ -4942,6 +4942,9 @@ impl Server {
         let mut despawn_list = Vec::new();
         let mut eggs_to_drop = Vec::new();
         let mut melee_hits_player = Vec::new();
+        // The attacks of the slime (`EntitySlime.b`): the sound of the
+        // attack is played when the damage is applied.
+        let mut slime_attacks: Vec<(i32, i16, f64, f64)> = Vec::new();
         let mut melee_hits_mob = Vec::new();
         let mut arrows_to_shoot = Vec::new();
         let mut fireballs_to_shoot = Vec::new();
@@ -5372,16 +5375,19 @@ impl Server {
                                     let spread: Vec<f64> = (0..6)
                                         .map(|_| self.entity_random.next_gaussian())
                                         .collect();
-                                    arrows_to_shoot.push((
-                                        mob_id,
-                                        mob.x,
-                                        mob.y + 1.0,
-                                        mob.z,
-                                        dx,
-                                        (ty + 1.4) - (mob.y + 1.2),
-                                        dz,
-                                        spread,
-                                    ));
+                                    // The arrow starts one block above the
+                                    // mob (`++entityarrow.locY`).
+                                    let arrow_y = mob.y + 1.0;
+                                    // The aim of the reference: the height
+                                    // of the eyes of the mob minus 0.2
+                                    // (`entityarrow.locY + this.t() - 0.2
+                                    // - entityarrow.locY`). The correction
+                                    // of the ballistics `horizDist * 0.2` is
+                                    // added when the direction of the arrow
+                                    // is computed.
+                                    let aim = mob.eye_height() - 0.2;
+                                    arrows_to_shoot
+                                        .push((mob_id, mob.x, arrow_y, mob.z, dx, aim, dz, spread));
                                     mob.attack_ticks = 30;
                                 }
                                 // The yaw of the mob is the direction of the
@@ -5757,7 +5763,13 @@ impl Server {
                                         && dsq < reach * reach
                                         && (py - mob.y).abs() < 2.0
                                     {
-                                        melee_hits_player.push((
+                                        // The attack of the slime
+                                        // (`EntitySlime.b`): the sound of
+                                        // the attack is played when the
+                                        // damage is applied, and it draws
+                                        // two numbers for the pitch and
+                                        // the volume.
+                                        slime_attacks.push((
                                             pid,
                                             mob.slime_size as i16,
                                             mob.x,
@@ -6285,6 +6297,24 @@ impl Server {
                 entity_id,
                 status,
             }));
+        }
+
+        for (pid, dmg, ax, az) in slime_attacks {
+            // The sound of the attack of the slime (`EntitySlime.b`): the two
+            // numbers of the pitch and of the volume are drawn when the
+            // damage is applied.
+            if self.damage_player_from_mob(pid, dmg, ax, az) {
+                let pitch =
+                    (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.2 + 1.0;
+                self.broadcast(Clientbound::NamedSound(NamedSound {
+                    name: "mob.slimeattack".to_string(),
+                    x: ax,
+                    y: self.entities.get_player(pid).map(|p| p.y).unwrap_or(0.0),
+                    z: az,
+                    volume: 1.0,
+                    pitch: f64::from(pitch),
+                }));
+            }
         }
 
         for (pid, dmg, ax, az) in melee_hits_player {
@@ -6948,23 +6978,28 @@ impl Server {
         false
     }
 
+    /// The damage of a mob to a player.
+    ///
+    /// The method returns true when the damage is applied, like the
+    /// `damageEntity` of the reference (`EntityHuman.damageEntity`).
     fn damage_player_from_mob(
         &mut self,
         player_id: i32,
         damage: i16,
         attacker_x: f64,
         attacker_z: f64,
-    ) {
+    ) -> bool {
         let mut hit = None;
         let mut woke_player = false;
         let mut armor_sync = None;
+        let mut applied = false;
         if let Some(p) = self.entities.get_player_mut(player_id) {
             if p.dead || damage < 0 {
-                return;
+                return false;
             }
             let (dealt, died) = if damage == 0 {
                 if p.no_damage_ticks > 10 {
-                    return;
+                    return false;
                 }
                 p.no_damage_ticks = 20;
                 p.last_damage = 0;
@@ -6972,8 +7007,9 @@ impl Server {
             } else {
                 let (d, died_flag) = p.take_damage(damage);
                 if d <= 0 && p.no_damage_ticks > 10 && damage <= p.last_damage {
-                    return;
+                    return false;
                 }
+                applied = true;
                 (d, died_flag)
             };
             let _ = dealt;
@@ -7096,6 +7132,7 @@ impl Server {
                 }));
             }
         }
+        applied
     }
 
     // ---------------------------------------------------------------------
@@ -12522,6 +12559,62 @@ mod tests {
             .get_player(player_id)
             .expect("the player is alive");
         assert!(player.health < health, "the wolf attacks from close by");
+    }
+
+    /// The arrow of the skeleton flies at the height of the eyes of the
+    /// mob.
+    ///
+    /// Java `EntitySkeleton.a`: the direction of the arrow is the height of
+    /// the eyes of the mob minus 0.2, the correction of the ballistics
+    /// `horizDist * 0.2` is added to it.
+    #[test]
+    fn the_arrow_of_the_skeleton_flies_at_the_height_of_the_eyes_of_the_mob() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.mob_type = MobType::Skeleton;
+        }
+        // The player is in front of the mob: the skeleton shoots it.
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.x = 5.0;
+            player.y = 64.0;
+            player.z = 0.5;
+        }
+        // The first tick gives the skeleton its target.
+        server.tick_mobs();
+        server.tick_mobs();
+        // The skeleton shoots the arrow.
+        let arrows = server.entities.iter_projectiles().count();
+        assert!(arrows > 0, "the skeleton shoots an arrow");
+    }
+
+    /// The attack of the slime plays its sound.
+    ///
+    /// Java `EntitySlime.b`: the sound of the attack is played when the
+    /// damage is applied, and it draws two numbers for the pitch and the
+    /// volume of the sound.
+    #[test]
+    fn the_attack_of_the_slime_draws_the_numbers_of_the_sound() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.mob_type = MobType::Slime;
+            mob.set_slime_size(4);
+        }
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.x = 0.5;
+            player.y = 64.0;
+            player.z = 0.5;
+        }
+        // The first tick gives the slime its target.
+        server.tick_mobs();
+        let before = server.entity_random.draws;
+        server.tick_mobs();
+        // The sound of the attack draws two numbers.
+        assert!(
+            server.entity_random.draws - before >= 2,
+            "the sound of the attack of the slime draws two numbers"
+        );
     }
 
     /// The mobs push each other away.
