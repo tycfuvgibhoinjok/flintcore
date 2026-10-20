@@ -6361,7 +6361,7 @@ impl Server {
             // The sound of the attack of the slime (`EntitySlime.b`): the two
             // numbers of the pitch and of the volume are drawn when the
             // damage is applied.
-            if self.damage_player_from_mob(pid, dmg, ax, az) {
+            if self.damage_player_from_mob(pid, dmg, ax, az, true) {
                 let pitch =
                     (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.2 + 1.0;
                 self.broadcast(Clientbound::NamedSound(NamedSound {
@@ -6376,7 +6376,7 @@ impl Server {
         }
 
         for (pid, dmg, ax, az) in melee_hits_player {
-            self.damage_player_from_mob(pid, dmg, ax, az);
+            self.damage_player_from_mob(pid, dmg, ax, az, true);
         }
 
         for (target_mob_id, dmg, att_id, ax, az) in melee_hits_mob {
@@ -7089,6 +7089,7 @@ impl Server {
         damage: i16,
         attacker_x: f64,
         attacker_z: f64,
+        knockback: bool,
     ) -> bool {
         let mut hit = None;
         let mut woke_player = false;
@@ -7131,7 +7132,9 @@ impl Server {
                     ],
                 ));
             }
-            p.apply_knockback(attacker_x, attacker_z);
+            if knockback {
+                p.apply_knockback(attacker_x, attacker_z);
+            }
             let keep_inv = self.config.mechanics.keep_inventory_on_death;
             let drops = if died && !keep_inv {
                 let px = p.x;
@@ -7658,7 +7661,7 @@ impl Server {
         }
 
         for (player_id, dmg, sx, sz) in player_hits {
-            self.damage_player_from_mob(player_id, dmg, sx, sz);
+            self.damage_player_from_mob(player_id, dmg, sx, sz, true);
         }
 
         for (ex, ey, ez) in egg_hatches {
@@ -8776,65 +8779,21 @@ impl Server {
         allow_block_damage: bool,
         source_mob: Option<i32>,
     ) {
-        let mut destroyed_blocks = HashSet::new();
+        // The blocks of the explosion (`Explosion.blocks`): the reference
+        // keeps them in a `HashSet<ChunkPosition>`, the helper
+        // `java_hash_set_order` reproduces the order of its iteration.
+        let mut ray_positions: Vec<(i32, i32, i32)> = Vec::new();
         // The explosion draws from the random of the world (`Explosion.a()`
         // uses `world.random`).
         let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
-        let step_size = if self.config.mechanics.optimized_explosions {
-            2
-        } else {
-            1
-        };
 
         if allow_block_damage {
-            for i in (0..16).step_by(step_size) {
-                for j in (0..16).step_by(step_size) {
-                    for k in (0..16).step_by(step_size) {
-                        if i == 0
-                            || i >= 16 - step_size
-                            || j == 0
-                            || j >= 16 - step_size
-                            || k == 0
-                            || k >= 16 - step_size
-                        {
-                            let mut dx = (i as f64) / 15.0 * 2.0 - 1.0;
-                            let mut dy = (j as f64) / 15.0 * 2.0 - 1.0;
-                            let mut dz = (k as f64) / 15.0 * 2.0 - 1.0;
-                            let len = (dx * dx + dy * dy + dz * dz).sqrt();
-                            dx /= len;
-                            dy /= len;
-                            dz /= len;
-
-                            let mut power = radius * (0.7 + rng.next_f32() * 0.6);
-                            let mut rx = ex;
-                            let mut ry = ey;
-                            let mut rz = ez;
-
-                            while power > 0.0 {
-                                let bx = rx.floor() as i32;
-                                let by = ry.floor() as i32;
-                                let bz = rz.floor() as i32;
-                                if !(0..128).contains(&by) {
-                                    break;
-                                }
-                                let id = self.world.get_block(bx, by, bz);
-                                if id != blocks::AIR {
-                                    let res = blocks::explosion_resistance(id);
-                                    power -= (res + 0.3) * 0.3;
-                                }
-                                if power > 0.0 && id != blocks::BEDROCK {
-                                    destroyed_blocks.insert((bx, by, bz));
-                                }
-                                rx += dx * 0.3;
-                                ry += dy * 0.3;
-                                rz += dz * 0.3;
-                                power -= 0.225;
-                            }
-                        }
-                    }
-                }
-            }
+            ray_positions =
+                Self::explosion_ray_positions(&self.world, ex, ey, ez, radius, &mut rng);
         }
+        // The set of the blocks of the reference and the order of its
+        // iteration.
+        let destroyed_blocks = Self::java_hash_set_order(&ray_positions);
 
         // Entity damage within `radius * 2.0` with block exposure raycasting (`Explosion.java:127-150`)
         let blast_size = (radius * 2.0) as f64;
@@ -8852,33 +8811,39 @@ impl Server {
                 let dx = p.x - ex;
                 let dy = p.y - ey;
                 let dz = p.z - ez;
-                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                // The distance is a single precision square root
+                // (`Entity.f(double, double, double)`).
+                let d = f64::from(crate::util::math::math_helper_a(
+                    dx * dx + dy * dy + dz * dz,
+                ));
                 if d <= blast_size {
-                    Some((d, p.x, p.y, p.z))
+                    Some((d, dx, dy, dz, p.bounding_box()))
                 } else {
                     None
                 }
             });
-            if let Some((d, px, py, pz)) = dist_info {
-                let r1 = self
-                    .world
-                    .ray_trace((ex, ey, ez), (px, py + 0.2, pz), false)
-                    .is_none();
-                let r2 = self
-                    .world
-                    .ray_trace((ex, ey, ez), (px, py + 1.5, pz), false)
-                    .is_none();
-                let exposure = (i32::from(r1) + i32::from(r2)) as f64 / 2.0;
-                if exposure > 0.0 {
-                    let d7 = d / blast_size;
-                    let impact = (1.0 - d7) * exposure;
-                    let dmg =
-                        (((impact * impact + impact) / 2.0 * 8.0 * blast_size + 1.0) as i16).max(1);
-                    let prev_kb = self.config.mechanics.player_knockback_fix;
-                    self.config.mechanics.player_knockback_fix =
-                        self.config.mechanics.send_explosion_velocity;
-                    self.damage_player_from_mob(pid, dmg, ex, ez);
-                    self.config.mechanics.player_knockback_fix = prev_kb;
+            if let Some((d, dx, dy, dz, box_)) = dist_info {
+                let d7 = d / blast_size;
+                if d7 <= 1.0 {
+                    // The exposure of the entity (`World.a(Vec3D, AxisAlignedBB)`).
+                    let exposure = f64::from(self.world.explosion_exposure((ex, ey, ez), &box_));
+                    let d10 = (1.0 - d7) * exposure;
+                    let dmg = ((d10 * d10 + d10) / 2.0 * 8.0 * blast_size + 1.0) as i16;
+                    // The damage of the explosion does not throw the player
+                    // away: the impulse of the explosion is added below.
+                    self.damage_player_from_mob(pid, dmg, ex, ez, false);
+                    // The impulse of the explosion (`Explosion.java:144-150`).
+                    let len = f64::from(crate::util::math::math_helper_a(
+                        dx * dx + dy * dy + dz * dz,
+                    ));
+                    if len > 0.0 {
+                        if let Some(p) = self.entities.get_player_mut(pid) {
+                            p.mot_x += dx / len * d10;
+                            p.mot_y += dy / len * d10;
+                            p.mot_z += dz / len * d10;
+                            p.velocity_changed = true;
+                        }
+                    }
                 }
             }
         }
@@ -8895,28 +8860,36 @@ impl Server {
                 let dx = m.x - ex;
                 let dy = m.y - ey;
                 let dz = m.z - ez;
-                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                // The distance is a single precision square root
+                // (`Entity.f(double, double, double)`).
+                let d = f64::from(crate::util::math::math_helper_a(
+                    dx * dx + dy * dy + dz * dz,
+                ));
                 if d <= blast_size {
-                    Some((d, m.x, m.y, m.z, m.eye_height()))
+                    Some((d, dx, dy, dz, m.aabb()))
                 } else {
                     None
                 }
             });
-            if let Some((d, mx, my, mz, eye_h)) = dist_info {
-                let r1 = self
-                    .world
-                    .ray_trace((ex, ey, ez), (mx, my + 0.2, mz), false)
-                    .is_none();
-                let r2 = self
-                    .world
-                    .ray_trace((ex, ey, ez), (mx, my + eye_h, mz), false)
-                    .is_none();
-                let exposure = (i32::from(r1) + i32::from(r2)) as f64 / 2.0;
-                if exposure > 0.0 {
-                    let impact = (1.0 - (d / blast_size)) * exposure;
-                    let dmg =
-                        (((impact * impact + impact) / 2.0 * 8.0 * blast_size + 1.0) as i16).max(1);
+            if let Some((d, dx, dy, dz, box_)) = dist_info {
+                let d7 = d / blast_size;
+                if d7 <= 1.0 {
+                    // The exposure of the entity (`World.a(Vec3D, AxisAlignedBB)`).
+                    let exposure = f64::from(self.world.explosion_exposure((ex, ey, ez), &box_));
+                    let d10 = (1.0 - d7) * exposure;
+                    let dmg = ((d10 * d10 + d10) / 2.0 * 8.0 * blast_size + 1.0) as i16;
                     let _ = self.damage_mob(mid, dmg, Some((0, ex, ez)), false);
+                    // The impulse of the explosion (`Explosion.java:144-150`).
+                    let len = f64::from(crate::util::math::math_helper_a(
+                        dx * dx + dy * dy + dz * dz,
+                    ));
+                    if len > 0.0 {
+                        if let Some(mob) = self.entities.get_mob_mut(mid) {
+                            mob.mot_x += dx / len * d10;
+                            mob.mot_y += dy / len * d10;
+                            mob.mot_z += dz / len * d10;
+                        }
+                    }
                 }
             }
         }
@@ -8927,12 +8900,11 @@ impl Server {
         // world.
         if set_fire {
             let mut fire_rng = JavaRandom::new(Self::explosion_fire_seed(&self.world, ex, ey, ez));
-            let block_list: Vec<(i32, i32, i32)> = destroyed_blocks.iter().copied().collect();
-            for &(bx, by, bz) in block_list.iter().rev() {
-                // The block has to be air and the block below it has to be
-                // flammable (`Block.o[]`).
+            for &(bx, by, bz) in destroyed_blocks.iter().rev() {
+                // The block has to be air and the block below it has to be an
+                // opaque cube (`Block.o[]`).
                 if self.world.get_block(bx, by, bz) == blocks::AIR
-                    && self.world.get_block(bx, by - 1, bz) != blocks::AIR
+                    && blocks::is_opaque_cube(self.world.get_block(bx, by - 1, bz))
                     && fire_rng.next_i32_bound(3) == 0
                 {
                     self.world.java_set_type_id(bx, by, bz, blocks::FIRE);
@@ -8951,7 +8923,7 @@ impl Server {
         let mut drops_to_spawn = Vec::new();
         let mut chain_tnts = Vec::new();
 
-        for &(bx, by, bz) in &destroyed_blocks {
+        for &(bx, by, bz) in destroyed_blocks.iter().rev() {
             // The particles of the explosion: the position of the particle
             // and the spread of its speed are five numbers of the random of
             // the world.
@@ -9011,6 +8983,107 @@ impl Server {
             records,
         }));
         self.flush_dirty_chunks();
+    }
+
+    /// The blocks of the explosion (`Explosion.java:50-89`).
+    ///
+    /// The walk of the rays is always the full one: the option of the
+    /// optimised explosions of the reference only caches the density of the
+    /// damage.  The ray is not interrupted at the borders of the world: the
+    /// blocks outside of it are the air (`World.getTypeId`) and the
+    /// positions are filtered when the blocks are destroyed.
+    fn explosion_ray_positions(
+        world: &World,
+        ex: f64,
+        ey: f64,
+        ez: f64,
+        radius: f32,
+        rng: &mut JavaRandom,
+    ) -> Vec<(i32, i32, i32)> {
+        let mut positions = Vec::new();
+        for i in 0..16 {
+            for j in 0..16 {
+                for k in 0..16 {
+                    if i == 0 || i == 15 || j == 0 || j == 15 || k == 0 || k == 15 {
+                        // The direction of the ray is a single precision
+                        // value (`Explosion.java:50-53`).
+                        let mut dx = (i as f32 / 15.0f32 * 2.0f32 - 1.0f32) as f64;
+                        let mut dy = (j as f32 / 15.0f32 * 2.0f32 - 1.0f32) as f64;
+                        let mut dz = (k as f32 / 15.0f32 * 2.0f32 - 1.0f32) as f64;
+                        let len = (dx * dx + dy * dy + dz * dz).sqrt();
+                        dx /= len;
+                        dy /= len;
+                        dz /= len;
+
+                        let mut power = radius * (0.7 + rng.next_f32() * 0.6);
+                        let mut rx = ex;
+                        let mut ry = ey;
+                        let mut rz = ez;
+
+                        while power > 0.0 {
+                            let bx = rx.floor() as i32;
+                            let by = ry.floor() as i32;
+                            let bz = rz.floor() as i32;
+                            // The block outside the world is the air
+                            // (`World.getTypeId`) and the ray is not
+                            // interrupted (`Explosion.java:68-88`).
+                            let id = if (0..128).contains(&by) {
+                                world.get_block(bx, by, bz)
+                            } else {
+                                blocks::AIR
+                            };
+                            if id != blocks::AIR {
+                                let res = blocks::explosion_resistance(id);
+                                power -= (res + 0.3) * 0.3;
+                            }
+                            if power > 0.0 {
+                                positions.push((bx, by, bz));
+                            }
+                            rx += dx * 0.3;
+                            ry += dy * 0.3;
+                            rz += dz * 0.3;
+                            power -= 0.225;
+                        }
+                    }
+                }
+            }
+        }
+        positions
+    }
+
+    /// The order of the iteration of a Java `HashSet<ChunkPosition>`.
+    ///
+    /// Java `ChunkPosition.hashCode()` is `x * 8976890 + y * 981131 + z`, the
+    /// hash is spread with `h ^ (h >>> 16)` and the bucket of the element is
+    /// `hash & (capacity - 1)`.  The capacity of the set starts at sixteen
+    /// and is doubled when the number of the elements is greater than three
+    /// quarters of it.  The elements of one bucket keep the order of their
+    /// insertion.
+    fn java_hash_set_order(positions: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
+        // The unique positions in the order of the insertion.
+        let mut unique: Vec<(i32, i32, i32)> = Vec::new();
+        for position in positions {
+            if !unique.contains(position) {
+                unique.push(*position);
+            }
+        }
+        // The capacity of the set.
+        let mut capacity = 16usize;
+        while unique.len() * 4 > capacity * 3 {
+            capacity *= 2;
+        }
+        // The buckets of the set.
+        let mut buckets: Vec<Vec<(i32, i32, i32)>> = vec![Vec::new(); capacity];
+        for position in &unique {
+            let hash = position
+                .0
+                .wrapping_mul(8_976_890)
+                .wrapping_add(position.1.wrapping_mul(981_131))
+                .wrapping_add(position.2);
+            let spread = (hash ^ ((hash as u32) >> 16) as i32) as u32 as usize;
+            buckets[spread & (capacity - 1)].push(*position);
+        }
+        buckets.into_iter().flatten().collect()
     }
 
     /// The seed of the random of an explosion.
@@ -12902,6 +12975,59 @@ mod tests {
             }
         }
         assert_eq!(times, 1, "the time is sent on the twentieth tick");
+    }
+
+    /// The explosion throws the mob away.
+    ///
+    /// Java `Explosion.java:144-150`: the entity is thrown away from the
+    /// centre of the explosion, the impulse is the direction of the entity
+    /// multiplied by the share of the damage.
+    #[test]
+    fn the_explosion_throws_the_mob_away() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        // The mob is far enough from the explosion to survive it.
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.x = 6.0;
+            mob.y = 64.0;
+            mob.z = 0.5;
+            mob.mot_x = 0.0;
+            mob.mot_y = 0.0;
+            mob.mot_z = 0.0;
+        }
+        server.create_explosion_ex(0.5, 64.0, 0.5, 3.0, false, false, None);
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(
+            mob.mot_x > 0.0,
+            "the mob is thrown away from the explosion ({})",
+            mob.mot_x
+        );
+    }
+
+    /// The ray of the explosion is not interrupted at the borders of the
+    /// world.
+    ///
+    /// Java `Explosion.java:68-88`: the block outside the world is the air
+    /// (`World.getTypeId`) and the ray goes on; the positions outside of the
+    /// world are filtered when the blocks are destroyed (`:218-221`).
+    #[test]
+    fn the_ray_of_the_explosion_goes_out_of_the_world() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        // The column of the explosion is empty: the ray goes through it and
+        // leaves the world below.
+        for y in 0..63 {
+            server.world.set_block(0, y, 0, blocks::AIR);
+        }
+        let mut rng = JavaRandom::new(12345);
+        let positions =
+            Server::explosion_ray_positions(&server.world, 0.5, 3.0, 0.5, 4.0, &mut rng);
+        assert!(
+            positions.iter().any(|p| p.1 < 0),
+            "the ray leaves the world below"
+        );
+        assert!(
+            positions.iter().any(|p| p.1 > 3),
+            "the ray leaves the world above"
+        );
     }
 
     /// The mobs push each other away.

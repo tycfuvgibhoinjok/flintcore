@@ -2048,6 +2048,43 @@ impl World {
         }
     }
 
+    /// Java `World.a(Vec3D, AxisAlignedBB)`: the share of the points of the
+    /// box of the entity from which the centre of the explosion is visible.
+    ///
+    /// The box is sampled on a grid: the step of the grid is the inverse of
+    /// the doubled size of the box plus one.
+    pub(crate) fn explosion_exposure(
+        &self,
+        center: (f64, f64, f64),
+        box_: &crate::entity::physics::Aabb,
+    ) -> f32 {
+        let step_x = 1.0 / ((box_.max_x - box_.min_x) * 2.0 + 1.0);
+        let step_y = 1.0 / ((box_.max_y - box_.min_y) * 2.0 + 1.0);
+        let step_z = 1.0 / ((box_.max_z - box_.min_z) * 2.0 + 1.0);
+        let mut visible = 0;
+        let mut total = 0;
+        let mut f = 0.0f32;
+        while f <= 1.0 {
+            let mut f1 = 0.0f32;
+            while f1 <= 1.0 {
+                let mut f2 = 0.0f32;
+                while f2 <= 1.0 {
+                    let x = box_.min_x + (box_.max_x - box_.min_x) * f as f64;
+                    let y = box_.min_y + (box_.max_y - box_.min_y) * f1 as f64;
+                    let z = box_.min_z + (box_.max_z - box_.min_z) * f2 as f64;
+                    if self.ray_trace((x, y, z), center, false).is_none() {
+                        visible += 1;
+                    }
+                    total += 1;
+                    f2 = (f2 as f64 + step_z) as f32;
+                }
+                f1 = (f1 as f64 + step_y) as f32;
+            }
+            f = (f as f64 + step_x) as f32;
+        }
+        visible as f32 / total as f32
+    }
+
     /// Java `World.a(EnumSkyBlock, int i, int j, int k)` (lines 598-621).
     pub(crate) fn java_get_saved_light(&self, kind: LightType, x: i32, mut y: i32, z: i32) -> i32 {
         if y < 0 {
