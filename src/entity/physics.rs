@@ -637,8 +637,18 @@ pub fn move_entity(
     aabb.offset(0.0, 0.0, moved_z);
 
     // The step up (`Entity.bs`).
+    //
+    // The reference climbs a step only when the offset of the step is
+    // nearly zero (`Entity.move()`: `br < 0.05F`), the offset of the step is
+    // damped at the beginning of the movement (`br *= 0.4F`). A mob that
+    // sneaks climbs a step with any offset, the mobs of the port never
+    // sneak.
     let grounded = on_ground || (original_y != moved_y && original_y < 0.0);
-    if step_height > 0.0 && grounded && (original_x != moved_x || original_z != moved_z) {
+    if step_height > 0.0
+        && grounded
+        && step_offset < 0.05
+        && (original_x != moved_x || original_z != moved_z)
+    {
         let fallback_x = moved_x;
         let fallback_y = moved_y;
         let fallback_z = moved_z;
@@ -766,6 +776,37 @@ mod tests {
             assert_eq!(result.y, 64.0, "the mob must not climb the block");
             assert!(result.on_ground);
         }
+    }
+
+    /// A mob does not climb a step with a big offset.
+    ///
+    /// Java `Entity.move()`: the mob climbs a step only when the offset of
+    /// the step is nearly zero (`br < 0.05F`).
+    #[test]
+    fn a_mob_does_not_climb_a_step_with_a_big_offset() {
+        let mut world = test_world();
+        // A slab (0.5 high) in front of the mob.
+        world.set_block(2, 63, 0, blocks::STEP);
+
+        // The offset of the step of the mob is 0.5, the reference does not
+        // climb the slab with such an offset.
+        let mut aabb = Aabb::for_entity(1.9, 64.0, 0.5, 0.6, 1.8, 0.0, 0.0);
+        let mut scratch = Vec::new();
+        move_entity(
+            &world,
+            &mut aabb,
+            0.2,
+            -0.08,
+            0.0,
+            0.5,
+            0.5,
+            true,
+            0.0,
+            &[],
+            &mut scratch,
+        );
+        // The bottom of the box of the mob is still the floor.
+        assert_eq!(aabb.min_y, 64.0, "the mob must not climb the slab");
     }
 
     #[test]
