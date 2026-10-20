@@ -328,6 +328,183 @@ pub fn squid_in_water(world: &World, aabb: &Aabb) -> bool {
     intersects_fluid(world, &shrunk, true)
 }
 
+/// The level of the fluid of a block (`BlockFluids.b`).
+///
+/// The method returns −1 when the block is not a fluid of the wanted
+/// material, the level of a falling fluid (the data is 8 or more) is zero.
+fn fluid_level(world: &World, x: i32, y: i32, z: i32, water: bool) -> i32 {
+    let id = world.get_block(x, y, z);
+    let fluid = if water {
+        blocks::is_water(id)
+    } else {
+        blocks::is_lava(id)
+    };
+    if !fluid {
+        return -1;
+    }
+    let data = world.get_data(x, y, z);
+    if data >= 8 {
+        0
+    } else {
+        i32::from(data)
+    }
+}
+
+/// Java `BlockFluids.b(IBlockAccess, int, int, int, int)`: can the fluid
+/// flow into the block?
+fn can_flow_into(world: &World, x: i32, y: i32, z: i32, side: i32, water: bool) -> bool {
+    let id = world.get_block(x, y, z);
+    let fluid = if water {
+        blocks::is_water(id)
+    } else {
+        blocks::is_lava(id)
+    };
+    if fluid {
+        return false;
+    }
+    let material = blocks::material(id);
+    if material == blocks::Material::Ice {
+        return false;
+    }
+    if side == 1 {
+        return true;
+    }
+    material.is_buildable()
+}
+
+/// Java `BlockFluids.c(IBlockAccess, int, int, int)`: the flow vector of a
+/// block of a fluid.
+fn fluid_flow_block(world: &World, x: i32, y: i32, z: i32, water: bool) -> (f64, f64, f64) {
+    let mut flow = (0.0f64, 0.0f64, 0.0f64);
+    let level = fluid_level(world, x, y, z, water);
+
+    // The four neighbours of the block (`BlockFluids.c`).
+    for i in 0..4 {
+        let (nx, nz) = match i {
+            0 => (x - 1, z),
+            1 => (x, z - 1),
+            2 => (x + 1, z),
+            _ => (x, z + 1),
+        };
+        let mut neighbour = fluid_level(world, nx, y, nz, water);
+        if neighbour < 0 {
+            // The neighbour is not a fluid: when its material is not solid,
+            // the level of the block below it counts.
+            let id = world.get_block(nx, y, nz);
+            if blocks::material(id).is_solid() {
+                continue;
+            }
+            neighbour = fluid_level(world, nx, y - 1, nz, water);
+            if neighbour >= 0 {
+                let delta = (neighbour - (level - 8)) as f64;
+                flow.0 += (nx - x) as f64 * delta;
+                flow.2 += (nz - z) as f64 * delta;
+            }
+        } else {
+            let delta = (neighbour - level) as f64;
+            flow.0 += (nx - x) as f64 * delta;
+            flow.2 += (nz - z) as f64 * delta;
+        }
+    }
+
+    // The fluid that falls (`BlockFluids.c`): the vector is normalised and
+    // the flow points down.
+    if world.get_data(x, y, z) >= 8 {
+        let mut flag = false;
+        flag |= can_flow_into(world, x, y, z - 1, 2, water);
+        flag |= can_flow_into(world, x, y, z + 1, 3, water);
+        flag |= can_flow_into(world, x - 1, y, z, 4, water);
+        flag |= can_flow_into(world, x + 1, y, z, 5, water);
+        flag |= can_flow_into(world, x, y + 1, z - 1, 2, water);
+        flag |= can_flow_into(world, x, y + 1, z + 1, 3, water);
+        flag |= can_flow_into(world, x - 1, y + 1, z, 4, water);
+        flag |= can_flow_into(world, x + 1, y + 1, z, 5, water);
+        if flag {
+            if let Some(v) = normalised(flow) {
+                flow = (v.0, v.1 - 6.0, v.2);
+            }
+        }
+    }
+
+    normalised(flow).unwrap_or((0.0, 0.0, 0.0))
+}
+
+/// Java `Vec3D.b()`: the normalisation of the vector.
+///
+/// The length of the vector is a single precision square root, a vector
+/// shorter than `1.0E-4` is the zero vector.
+fn normalised(flow: (f64, f64, f64)) -> Option<(f64, f64, f64)> {
+    let length = f64::from(crate::util::math::math_helper_a(
+        flow.0 * flow.0 + flow.1 * flow.1 + flow.2 * flow.2,
+    ));
+    if length < 1.0E-4 {
+        return None;
+    }
+    Some((flow.0 / length, flow.1 / length, flow.2 / length))
+}
+
+/// Java `World.a(AxisAlignedBB, Material, Entity)`: the push of the flow of
+/// the liquid.
+///
+/// The method returns the vector of the push: the flow of every block of
+/// the liquid in the box is summed, the sum is normalised and the entity
+/// is pushed by `0.014` of it.
+pub fn fluid_flow(world: &World, aabb: &Aabb, water: bool) -> (f64, f64, f64) {
+    // The box of the check of the water (`Entity.f_()`): the box of the
+    // entity, moved down by 0.4 and shrunk by 0.001.
+    let box_ = aabb.grown(0.0, -0.4, 0.0).shrunk(0.001, 0.001, 0.001);
+    let min_x = box_.min_x.floor() as i32;
+    let max_x = (box_.max_x + 1.0).floor() as i32;
+    let min_y = box_.min_y.floor() as i32;
+    let max_y = (box_.max_y + 1.0).floor() as i32;
+    let min_z = box_.min_z.floor() as i32;
+    let max_z = (box_.max_z + 1.0).floor() as i32;
+    // The top of the box (`l` of the reference): the entity is in the
+    // liquid when the top of its box is at or above the surface of the
+    // liquid.
+    let top = (box_.max_y + 1.0).floor() as i32;
+
+    let mut flow = (0.0f64, 0.0f64, 0.0f64);
+    for x in min_x..max_x {
+        for y in min_y..max_y {
+            for z in min_z..max_z {
+                let id = world.get_block(x, y, z);
+                let fluid = if water {
+                    blocks::is_water(id)
+                } else {
+                    blocks::is_lava(id)
+                };
+                if !fluid {
+                    continue;
+                }
+                // The surface of the fluid (`BlockFluids.c(data)`).
+                let data = world.get_data(x, y, z);
+                let level = if data >= 8 { 0 } else { data };
+                let surface = (y as f32 + 1.0) - (level as f32 + 1.0) / 9.0;
+                if (top as f64) < f64::from(surface) {
+                    continue;
+                }
+                let block_flow = fluid_flow_block(world, x, y, z, water);
+                flow.0 += block_flow.0;
+                flow.1 += block_flow.1;
+                flow.2 += block_flow.2;
+            }
+        }
+    }
+
+    // The length of the vector (`Vec3D.c()`).
+    let length = (flow.0 * flow.0 + flow.1 * flow.1 + flow.2 * flow.2).sqrt();
+    if length <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let factor = 0.014;
+    (
+        flow.0 / length * factor,
+        flow.1 / length * factor,
+        flow.2 / length * factor,
+    )
+}
+
 /// Java `Entity.ae()`: is the body of the entity in the lava?
 ///
 /// The reference uses the two-argument variant of the check of the world: any
@@ -781,6 +958,32 @@ mod tests {
             }
         }
         world
+    }
+
+    /// The flow of the water pushes the entity.
+    ///
+    /// Java `World.a(AxisAlignedBB, Material, Entity)`: the flow of every
+    /// block of the liquid in the box is summed, the sum is normalised and
+    /// the entity is pushed by `0.014` of it.
+    #[test]
+    fn the_flow_of_the_water_pushes_the_entity() {
+        let mut world = test_world();
+        // The source of the water and a neighbour of another level: the
+        // flow of the source points to the neighbour.
+        world.set_block(0, 64, 0, blocks::STATIONARY_WATER);
+        world.java_set_data(0, 64, 0, 0);
+        world.set_block(1, 64, 0, blocks::STATIONARY_WATER);
+        world.java_set_data(1, 64, 0, 7);
+        // The box of the entity is in the water.
+        let aabb = Aabb::new(0.05, 64.0, 0.05, 0.95, 64.9, 0.95);
+        let (fx, fy, fz) = fluid_flow(&world, &aabb, true);
+        assert!(
+            (fx - 0.014).abs() < 1.0E-9 && fy == 0.0 && fz == 0.0,
+            "the flow of the water pushes the entity to the X ({}, {}, {})",
+            fx,
+            fy,
+            fz
+        );
     }
 
     #[test]

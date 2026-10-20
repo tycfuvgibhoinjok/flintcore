@@ -6732,6 +6732,18 @@ impl Server {
         let in_lava = crate::entity::physics::in_lava(&self.world, &aabb);
         let size = mob.size();
 
+        // The push of the flow of the water (`Entity.f_()`): the reference
+        // asks the world for the water of the box of the mob, the world
+        // pushes the mob by the flow of the liquid.
+        if in_water {
+            let (fx, fy, fz) = crate::entity::physics::fluid_flow(&self.world, &aabb, true);
+            if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                mob.mot_x += fx;
+                mob.mot_y += fy;
+                mob.mot_z += fz;
+            }
+        }
+
         // The last position of the mob (`Entity.m_()`), the reference uses it
         // for the rotation of the head.
         if let Some(mob) = self.entities.get_mob_mut(mob_id) {
@@ -12738,6 +12750,36 @@ mod tests {
             "the spider draws a number every tick in the light of the day ({} - {})",
             bright,
             dim
+        );
+    }
+
+    /// The flow of the water pushes the mob.
+    ///
+    /// Java `Entity.f_()`: the check of the water of the world pushes the
+    /// mob by the flow of the liquid (`0.014` of the normalised vector).
+    #[test]
+    fn the_flow_of_the_water_pushes_the_mob() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.x = 0.5;
+            mob.y = 64.0;
+            mob.z = 0.5;
+            mob.mot_x = 0.0;
+            mob.mot_y = 0.0;
+            mob.mot_z = 0.0;
+        }
+        // The source of the water and a neighbour of another level: the
+        // flow of the source points to the neighbour.
+        server.world.set_block(0, 64, 0, blocks::STATIONARY_WATER);
+        server.world.java_set_data(0, 64, 0, 0);
+        server.world.set_block(1, 64, 0, blocks::STATIONARY_WATER);
+        server.world.java_set_data(1, 64, 0, 7);
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(
+            mob.mot_x > 0.0,
+            "the flow of the water pushes the mob to the X ({})",
+            mob.mot_x
         );
     }
 
