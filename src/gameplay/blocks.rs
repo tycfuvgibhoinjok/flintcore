@@ -928,21 +928,6 @@ impl StepSound {
     }
 }
 
-/// The sound of the step of a block (`Block.stepSound`).
-///
-/// The reference sets the sound of the step only for the pistons (the
-/// sound of the stone with the pitch 1.5) and for the stairs (the sound
-/// of the block they are made of), every other block has the sound of
-/// the stone.
-pub fn step_sound(block_id: u8) -> StepSound {
-    match block_id {
-        STICKY_PISTON | PISTON | PISTON_HEAD | PISTON_MOVING => {
-            StepSound::new("step.stone", 1.0, 1.5)
-        }
-        _ => StepSound::new("step.stone", 1.0, 1.0),
-    }
-}
-
 /// Java `Block.e()`: the mobility of the block for the pistons.
 ///
 /// `0` is a normal block, `1` is a block that breaks and drops an item and

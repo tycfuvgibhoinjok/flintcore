@@ -362,17 +362,21 @@ Mob movement parity harness:
     the pitch and the volume of the sound of the hit or of the death.
   - The arrow of the skeleton starts one block above the mob and flies at
     the height of the eyes of the mob minus 0.2 (`EntitySkeleton.a`).
-  - The sound of the attack of the slime is played when the damage is
-    applied, and it draws two numbers for the pitch and the volume
-    (`EntitySlime.b`).
-  - The sounds of the entities are sent to the client with the packet of
-    a named sound (the packet 41 of the protocol of 1.7.3): the idle
-    sound, the sound of the hit and of the death, the splash, the fizz
-    and the sound of the step.
-  - The sound of the step is played when the distance the mob walked
-    passes the counter of the steps (`Entity.move()`); in the reference
-    every block has the sound of the stone and the pistons have it with
-    the pitch 1.5.
+  - The attack of the slime is only made when the player is visible and
+    it draws two numbers for the tone of its sound (`EntitySlime.b`); the
+    sound itself is not sent to the client (see above).
+  - The named sounds of the entities never reach the client: the method
+    of the world that sends them in the reference has an empty body
+    (`WorldManager.a(String, double, double, double, float, float)`) and
+    the packet 41 is not even registered in `Packet.java`. The port
+    follows the reference: the sounds are not sent, but the draws of the
+    random of the reference (the tone and the volume) are made all the
+    same, because they are a part of the stream of the world. The only
+    sound that reaches the client is the Play Sound by its number
+    (`Packet61`).
+  - The counter of the steps of the mob is raised when the distance the
+    mob walked passes it (`Entity.move()`); the sound of the step itself
+    is not sent to the client (see above).
   - The flow of the water pushes the mob: the flows of the blocks of the
     liquid in the box of the mob are summed, the sum is normalised and
     the mob is pushed by 0.014 of it (`World.a`).

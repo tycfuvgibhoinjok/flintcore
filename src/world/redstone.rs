@@ -61,15 +61,6 @@ pub enum WorldEvent {
         y: i32,
         z: i32,
     },
-    /// The sound with its name (the packet 41 of the protocol of 1.7.3).
-    NamedSound {
-        name: String,
-        x: f64,
-        y: f64,
-        z: f64,
-        volume: f32,
-        pitch: f32,
-    },
 }
 
 /// Java `RedstoneUpdateInfo`: tracks redstone torch toggle timestamps for burnout (>= 8 toggles in 100 ticks).

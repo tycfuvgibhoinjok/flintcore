@@ -40,7 +40,6 @@ pub enum PacketId {
     EntityStatus = 38,
     AttachEntity = 39,
     EntityMetadata = 40,
-    NamedSound = 41,
     PreChunk = 50,
     MapChunk = 51,
     MultiBlockChange = 52,

@@ -32,8 +32,7 @@ pub use window::{
     WindowItems,
 };
 pub use world::{
-    Bed, Explosion, LevelSound, MapData, MultiBlockChange, NamedSound, PlayNoteBlock, Sleep,
-    Statistic, Weather,
+    Bed, Explosion, LevelSound, MapData, MultiBlockChange, PlayNoteBlock, Sleep, Statistic, Weather,
 };
 
 use crate::net::protocol::PacketId;
@@ -155,7 +154,6 @@ pub enum Clientbound {
     PlayNoteBlock(PlayNoteBlock),
     Explosion(Explosion),
     LevelSound(LevelSound),
-    NamedSound(NamedSound),
     Bed(Bed),
     Weather(Weather),
     OpenWindow(OpenWindow),
@@ -208,7 +206,6 @@ impl Clientbound {
             Self::PlayNoteBlock(_) => PacketId::PlayNoteBlock,
             Self::Explosion(_) => PacketId::Explosion,
             Self::LevelSound(_) => PacketId::Packet61,
-            Self::NamedSound(_) => PacketId::NamedSound,
             Self::Bed(_) => PacketId::Bed,
             Self::Weather(_) => PacketId::Weather,
             Self::OpenWindow(_) => PacketId::OpenWindow,
@@ -262,7 +259,6 @@ impl Clientbound {
             Self::PlayNoteBlock(p) => p.encode(writer),
             Self::Explosion(p) => p.encode(writer),
             Self::LevelSound(p) => p.encode(writer),
-            Self::NamedSound(p) => p.encode(writer),
             Self::Bed(p) => p.encode(writer),
             Self::Weather(p) => p.encode(writer),
             Self::OpenWindow(p) => p.encode(writer),

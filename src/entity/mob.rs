@@ -301,9 +301,6 @@ pub struct Mob {
     pub walk_accum: f32,
     /// Java `Entity.b`: the counter of the steps of the mob.
     pub step_counter: i32,
-    /// The sound of the step of the last movement: the name, the volume and
-    /// the pitch. The server sends it to the clients.
-    pub step_sound: Option<(&'static str, f32, f32)>,
     /// Java `Entity.positionChanged`: the last movement changed the position.
     pub position_changed: bool,
     /// Java `Entity.br`: the offset between the box of the mob and its
@@ -476,7 +473,6 @@ impl Mob {
             web: false,
             walk_accum: 0.0,
             step_counter: 0,
-            step_sound: None,
             position_changed: false,
             step_offset: 0.0,
             move_strafe: 0.0,
@@ -754,15 +750,11 @@ impl Mob {
             below = blocks::FENCE;
         }
         if self.walk_accum > self.step_counter as f32 && below > 0 {
+            // The reference does not send the sound of the step to the
+            // client (`WorldManager.a(String, double, double, double, float,
+            // float)` has an empty body), the counter of the steps is
+            // raised all the same.
             self.step_counter += 1;
-            let sound = blocks::step_sound(below);
-            // The snow above the mob has its own sound (the sound of the
-            // stone in this reference) and the sound is played even when
-            // the block under the mob is a liquid.
-            let snow_above = world.get_block(below_x, below_y + 1, below_z) == blocks::SNOW;
-            if snow_above || !blocks::material(below).is_liquid() {
-                self.step_sound = Some((sound.name, sound.volume1 * 0.15, sound.volume2));
-            }
         }
 
         // The fall distance (`Entity.a(double, boolean)`).

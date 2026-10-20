@@ -2769,20 +2769,12 @@ impl World {
         let target = self.get_block(x, y, z);
         if target > 0 {
             if lava {
-                // `BlockFluids.h`: the sound of the fizz. The tone is the
-                // difference of two numbers of the random of the world, the
-                // eight smoke particles of the reference use the random of
-                // the system and are not sent.
-                let pitch =
+                // `BlockFluids.h`: the sound of the fizz. The reference does
+                // not send it to the client, the tone is the difference of
+                // two numbers of the random of the world and the eight smoke
+                // particles use the random of the system.
+                let _pitch =
                     2.6f32 + (self.world_random.next_f32() - self.world_random.next_f32()) * 0.8f32;
-                self.world_events.push(WorldEvent::NamedSound {
-                    name: "random.fizz".to_string(),
-                    x: x as f64 + 0.5,
-                    y: y as f64 + 0.5,
-                    z: z as f64 + 0.5,
-                    volume: 0.5,
-                    pitch,
-                });
             } else {
                 // `Block.g` -> `dropNaturally`: the block that is displaced
                 // by the water drops its item. The number of the drops and

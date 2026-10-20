@@ -24,9 +24,9 @@ use crate::net::packets::chat::{is_allowed_char, wrap_text};
 use crate::net::packets::{
     ArmAnimation, AttachEntity, Bed, BlockChange, Chat, Clientbound, CloseWindow, Collect,
     CraftProgressBar, EntityMetadata, EntityStatus, EntityVelocity, Explosion, Handshake,
-    KeepAlive, KickDisconnect, LevelSound, Login, MapData, MultiBlockChange, NamedSound,
-    OpenWindow, PlayNoteBlock, PlayerLookMove, PreChunk, Respawn, Serverbound, SetSlot, Sleep,
-    SpawnPosition, Transaction, UpdateHealth, UpdateSign, UpdateTime, Weather, WindowItems,
+    KeepAlive, KickDisconnect, LevelSound, Login, MapData, MultiBlockChange, OpenWindow,
+    PlayNoteBlock, PlayerLookMove, PreChunk, Respawn, Serverbound, SetSlot, Sleep, SpawnPosition,
+    Transaction, UpdateHealth, UpdateSign, UpdateTime, Weather, WindowItems,
 };
 use crate::net::protocol::PROTOCOL_VERSION;
 use crate::net::{ConnId, NetEvent, Outbound};
@@ -4711,7 +4711,6 @@ impl Server {
         // not in the window of the invulnerability.
         let hit_applied;
         // The pitch of the sound of the hit or of the death.
-        let mut sound_pitch: Option<f32> = None;
         let mut death_info = None;
         let mut wolf_pack_alert = None;
         let mut pigzombie_alert = None;
@@ -4749,10 +4748,10 @@ impl Server {
                 // (`EntityLiving.hurtTicks = this.ae = 10`).
                 mob.hurt_ticks = 10;
                 // The sound of the hit (`EntityLiving.damageEntity`): the
-                // reference draws two numbers for the pitch and the volume.
-                let pitch =
+                // reference draws two numbers for the pitch and the volume
+                // and does not send the sound to the client.
+                let _pitch =
                     (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.2 + 1.0;
-                sound_pitch = Some(pitch);
                 (adj_dmg, true)
             };
             mob.health -= eff_dmg;
@@ -4846,31 +4845,6 @@ impl Server {
                 entity_id: mob_id,
                 status: 2,
             }));
-        }
-
-        // The sound of the hit or of the death (`EntityLiving.damageEntity`):
-        // the sound of the death is played when the mob dies, the sound of
-        // the hit otherwise.
-        if let Some(pitch) = sound_pitch {
-            let sound = self
-                .entities
-                .get_mob(mob_id)
-                .map(|mob| (mob.death_sound(), mob.hurt_sound(), mob.x, mob.y, mob.z));
-            if let Some((death, hurt, x, y, z)) = sound {
-                let name = if died { death } else { hurt };
-                if !name.is_empty() {
-                    // The volume of the sound of the reference: `k()` is
-                    // one for every mob.
-                    self.broadcast(Clientbound::NamedSound(NamedSound {
-                        name: name.to_string(),
-                        x,
-                        y,
-                        z,
-                        volume: 1.0,
-                        pitch: f64::from(pitch),
-                    }));
-                }
-            }
         }
 
         if died {
@@ -6099,27 +6073,8 @@ impl Server {
             // between the movement of the mob and the rest of its update.
             self.mob_fire_phase(mob_id);
 
-            // The sound of the step of the mob (`Entity.move()`).
-            if let Some((name, volume, pitch)) =
-                self.entities.get_mob(mob_id).and_then(|mob| mob.step_sound)
-            {
-                let (x, y, z) = self
-                    .entities
-                    .get_mob(mob_id)
-                    .map(|mob| (mob.x, mob.y, mob.z))
-                    .unwrap_or((0.0, 0.0, 0.0));
-                self.broadcast(Clientbound::NamedSound(NamedSound {
-                    name: name.to_string(),
-                    x,
-                    y,
-                    z,
-                    volume: f64::from(volume),
-                    pitch: f64::from(pitch),
-                }));
-                if let Some(mob) = self.entities.get_mob_mut(mob_id) {
-                    mob.step_sound = None;
-                }
-            }
+            // The sound of the step of the mob (`Entity.move()`): the
+            // reference does not send it to the client.
 
             // The pushing of the entities (`EntityLiving.v()`): it is the
             // last thing the reference does with the mob.
@@ -6362,16 +6317,11 @@ impl Server {
             // numbers of the pitch and of the volume are drawn when the
             // damage is applied.
             if self.damage_player_from_mob(pid, dmg, ax, az, true) {
-                let pitch =
+                // The sound of the attack of the slime (`EntitySlime.b`): the
+                // reference does not send it to the client, the two numbers
+                // of the pitch are drawn all the same.
+                let _pitch =
                     (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.2 + 1.0;
-                self.broadcast(Clientbound::NamedSound(NamedSound {
-                    name: "mob.slimeattack".to_string(),
-                    x: ax,
-                    y: self.entities.get_player(pid).map(|p| p.y).unwrap_or(0.0),
-                    z: az,
-                    volume: 1.0,
-                    pitch: f64::from(pitch),
-                }));
             }
         }
 
@@ -6737,22 +6687,11 @@ impl Server {
             self.damage_mob(mob_id, 1, None, false);
         }
         if fizz {
-            // The sound of the fizz (`Entity.move()`): the pitch and the
-            // volume are two numbers.
-            let pitch = (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.4 + 1.6;
-            let (x, y, z) = self
-                .entities
-                .get_mob(mob_id)
-                .map(|mob| (mob.x, mob.y, mob.z))
-                .unwrap_or((0.0, 0.0, 0.0));
-            self.broadcast(Clientbound::NamedSound(NamedSound {
-                name: "random.fizz".to_string(),
-                x,
-                y,
-                z,
-                volume: 0.7,
-                pitch: f64::from(pitch),
-            }));
+            // The sound of the fizz (`Entity.move()`): the reference does
+            // not send it to the client, the two numbers of the pitch are
+            // drawn all the same.
+            let _pitch =
+                (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.4 + 1.6;
         }
     }
 
@@ -6808,27 +6747,10 @@ impl Server {
             if splash {
                 // The sound of the splash (`Entity.R()`): the volume is the
                 // speed of the mob and the pitch is the difference of the two
-                // numbers of the stream.
-                let (mx, my, mz, vx, vy, vz) = self
-                    .entities
-                    .get_mob(mob_id)
-                    .map(|mob| (mob.x, mob.y, mob.z, mob.mot_x, mob.mot_y, mob.mot_z))
-                    .unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
-                let mut volume =
-                    crate::util::math::math_helper_a(vx * vx * 0.2 + vy * vy + vz * vz * 0.2) * 0.2;
-                if volume > 1.0 {
-                    volume = 1.0;
-                }
-                let pitch =
+                // numbers of the stream. The reference does not send the
+                // sound to the client.
+                let _pitch =
                     (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.4 + 1.0;
-                self.broadcast(Clientbound::NamedSound(NamedSound {
-                    name: "random.splash".to_string(),
-                    x: mx,
-                    y: my,
-                    z: mz,
-                    volume: f64::from(volume),
-                    pitch: f64::from(pitch),
-                }));
                 // The bubbles of the splash: three numbers each.
                 let particles = 1.0f32 + size.0 * 20.0f32;
                 let mut index = 0;
@@ -6913,31 +6835,18 @@ impl Server {
                     // mob (`EntityLiving.R()`).
                     mob.idle_sound_ticks = -mob.idle_sound_interval();
                 }
-                // The sound of the mob (`EntityLiving.Q()`): the pitch and the
-                // volume are two numbers.
+                // The sound of the mob (`EntityLiving.Q()`): the reference
+                // does not send it to the client. The name of the sound is
+                // asked all the same (the wolf draws a number for it) and the
+                // two numbers of the pitch are drawn too.
                 let name = self
                     .entities
                     .get_mob(mob_id)
                     .map(|mob| mob.idle_sound_name(&mut self.entity_random))
                     .unwrap_or(None);
-                if let Some(name) = name {
-                    // The pitch of the sound (`EntityLiving.Q()`): the
-                    // difference of the two numbers of the stream.
-                    let pitch =
+                if name.is_some() {
+                    let _pitch =
                         (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.2 + 1.0;
-                    let (volume, x, y, z) = self
-                        .entities
-                        .get_mob(mob_id)
-                        .map(|mob| (mob.sound_volume(), mob.x, mob.y, mob.z))
-                        .unwrap_or((1.0, 0.0, 0.0, 0.0));
-                    self.broadcast(Clientbound::NamedSound(NamedSound {
-                        name: name.to_string(),
-                        x,
-                        y,
-                        z,
-                        volume: f64::from(volume),
-                        pitch: f64::from(pitch),
-                    }));
                 }
             }
         }
@@ -8753,23 +8662,6 @@ impl Server {
                 }
                 WorldEvent::LightningStrike { x, y, z } => {
                     self.handle_lightning_strike(x, y, z);
-                }
-                WorldEvent::NamedSound {
-                    name,
-                    x,
-                    y,
-                    z,
-                    volume,
-                    pitch,
-                } => {
-                    self.broadcast(Clientbound::NamedSound(NamedSound {
-                        name,
-                        x,
-                        y,
-                        z,
-                        volume: f64::from(volume),
-                        pitch: f64::from(pitch),
-                    }));
                 }
             }
         }
@@ -13078,24 +12970,73 @@ mod tests {
         );
     }
 
-    /// The lava makes the sound of the fizz when it spreads.
+    /// The lava draws the tone of the sound of the fizz when it spreads.
     ///
     /// Java `BlockFlowing.flow` and `BlockFluids.h`: the lava that spreads
     /// into a block makes the sound of the fizz, the tone is the difference
-    /// of two numbers of the random of the world.
+    /// of two numbers of the random of the world. The reference does not
+    /// send the sound to the client.
     #[test]
-    fn the_lava_makes_the_sound_of_the_fizz_when_it_spreads() {
+    fn the_lava_draws_the_tone_of_the_sound_of_the_fizz_when_it_spreads() {
         let (mut server, _mob_id) = mob_scenario_server("flat");
         // The lava flows into the water (`BlockFlowing.l`): the water is not
         // the material of the lava and it is not solid.
         server.world.set_block(0, 64, 0, blocks::STATIONARY_LAVA);
         server.world.set_block(1, 64, 0, blocks::STATIONARY_WATER);
+        let before = server.world.world_random.draws;
         let mut rng = JavaRandom::new(12345);
         server.world.java_fluid_tick(0, 64, 0, &mut rng, true);
-        let fizz = server.world.world_events.iter().any(
-            |event| matches!(event, WorldEvent::NamedSound { name, .. } if name == "random.fizz"),
+        assert!(
+            server.world.world_random.draws - before >= 2,
+            "the tone of the sound of the fizz is drawn from the random of the world"
         );
-        assert!(fizz, "the lava makes the sound of the fizz");
+        // The sound itself does not reach the client.
+        assert!(
+            server.world.world_events.is_empty(),
+            "the reference does not send the sound of the fizz"
+        );
+    }
+
+    /// The server does not send the named sounds to the client.
+    ///
+    /// Java `WorldManager.a(String, double, double, double, float, float)`
+    /// has an empty body: the reference never sends the named sounds (the
+    /// packet 41 is not even registered in `Packet.java`). The draws of the
+    /// random of the reference stay where they are.
+    #[test]
+    fn the_server_does_not_send_the_named_sounds() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        // The connection of the player.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.connections.insert(
+            7,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().expect("the address"),
+                state: ConnectionState::Playing,
+                username: Some("Player".to_string()),
+                entity_id: 1,
+            },
+        );
+        let _player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        // The mob walks (the sound of the step), is hit (the sound of the
+        // hit) and dies (the sound of the death): every one of them plays
+        // a named sound in the reference.
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.mot_x = 0.1;
+        }
+        server.tick_mobs();
+        server.damage_mob(mob_id, 5, None, false);
+        server.damage_mob(mob_id, 100, None, false);
+        server.tick_mobs();
+        // Not one packet of a named sound.
+        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            assert_ne!(
+                packet.id() as u8,
+                41,
+                "the packet of a named sound is not sent to the client"
+            );
+        }
     }
 
     /// The water drops the block it displaces.
