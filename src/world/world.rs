@@ -1883,6 +1883,9 @@ impl World {
     }
 
     /// `world.k(i, j, k)` — max(sky, block) light with y clamped to [0, 127].
+    ///
+    /// The light of the sky is reduced by the factor of the time of the day
+    /// (`World.f`), the light of the blocks is not.
     pub(crate) fn light_at(&self, x: i32, y: i32, z: i32) -> i32 {
         if y < 0 {
             return 0;
@@ -1892,10 +1895,14 @@ impl World {
         if self.live.active && self.live_resolve_read(pos) {
             return 0;
         }
+        let sky_sub = crate::entity::mob::world_sky_subtracted(self.world_time());
         match self.chunks.get(&pos) {
-            Some(chunk) => {
-                chunk.get_block_light_value((x & 15) as usize, y as usize, (z & 15) as usize, 0)
-            }
+            Some(chunk) => chunk.get_block_light_value(
+                (x & 15) as usize,
+                y as usize,
+                (z & 15) as usize,
+                sky_sub,
+            ),
             // EmptyChunk light reads are 0; offline the code never reaches an
             // absent chunk, so the historical 15 stays for the offline path.
             None => {
@@ -3718,6 +3725,27 @@ impl LightingWorld for World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The light of the sky is reduced by the time of the day.
+    ///
+    /// Java `World.a(i, j, k, true)`: the light of the sky is reduced by the
+    /// factor of the time of the day (`World.f`), the light of the blocks is
+    /// not.
+    #[test]
+    fn the_light_of_the_sky_is_reduced_by_the_time_of_the_day() {
+        let config = WorldConfig {
+            seed: 12345,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        world.populate_chunk(ChunkPos::new(0, 0));
+        // The middle of the day: the factor of the sky is zero.
+        world.level_data.borrow_mut().time = 0;
+        assert_eq!(world.light_at(0, 100, 0), 15, "the light of the noon");
+        // The middle of the night: the factor of the sky is eleven.
+        world.level_data.borrow_mut().time = 18000;
+        assert_eq!(world.light_at(0, 100, 0), 4, "the light of the midnight");
+    }
 
     #[test]
     fn world_creates_and_populates_chunk() {
