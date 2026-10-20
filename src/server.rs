@@ -5951,6 +5951,10 @@ impl Server {
             // between the movement of the mob and the rest of its update.
             self.mob_fire_phase(mob_id);
 
+            // The pushing of the entities (`EntityLiving.v()`): it is the
+            // last thing the reference does with the mob.
+            self.push_mobs(mob_id);
+
             if let Some(mob) = self.entities.get_mob_mut(mob_id) {
                 // The swim of the squid (`EntitySquid.v()`): the phase of the
                 // swim and the velocity of the squid, they are set after the
@@ -6257,6 +6261,170 @@ impl Server {
             for _ in 0..3 {
                 let _ = self.entity_random.next_f32();
             }
+        }
+    }
+
+    /// Java `Entity.collide(Entity)`: the two entities push each other
+    /// away.
+    ///
+    /// The distance between them is divided by the distance between them
+    /// (so the direction is kept), the result is capped at one and scaled
+    /// by `0.05000000074505806` and by the resistance of the pushed entity
+    /// (`1 - bu`).
+    ///
+    /// The mob is the `this` of the reference and the other entity is the
+    /// argument: the mob is pushed away from the other one and the other
+    /// one is pushed away from the mob.
+    fn collide_mobs(&mut self, other_id: i32, mob_id: i32) {
+        // The vehicle of an entity is not pushed by its passenger and the
+        // other way round (`entity.passenger != this && entity.vehicle != this`).
+        let (x, z, passenger_id, vehicle_id) = match self.entities.get_mob(mob_id) {
+            Some(mob) => (mob.x, mob.z, mob.passenger_id, mob.vehicle_id),
+            None => return,
+        };
+        let (ox, oz) = match self.entities.get_mob(other_id) {
+            Some(other) => (other.x, other.z),
+            None => return,
+        };
+        if passenger_id == Some(other_id) || vehicle_id == Some(other_id) {
+            return;
+        }
+
+        // The distance of the mob from the other one (`d0` and `d1` of the
+        // reference).
+        let mut dx = x - ox;
+        let mut dz = z - oz;
+        // `MathHelper.a(d0, d1)`: the biggest of the absolute values, not
+        // the Euclidean distance.
+        let mut distance = dx.abs().max(dz.abs());
+        if distance < 0.009_999_999_776_482_582 {
+            return;
+        }
+        // `MathHelper.a(d2)`: the square root rounded to a single
+        // precision value.
+        distance = crate::util::math::math_helper_a(distance) as f64;
+        dx /= distance;
+        dz /= distance;
+        let mut scale = 1.0 / distance;
+        if scale > 1.0 {
+            scale = 1.0;
+        }
+        dx *= scale;
+        dz *= scale;
+        dx *= 0.050_000_000_745_058_06;
+        dz *= 0.050_000_000_745_058_06;
+        // The resistance of the pushed entity (`Entity.bu`), the mobs have
+        // none of it.
+        dx *= 1.0 - 0.0;
+        dz *= 1.0 - 0.0;
+
+        // `Entity.b(double, double, double)`: the velocity of the entity
+        // grows and the entity leaves the ground. The two entities push
+        // each other away.
+        if let Some(other) = self.entities.get_mob_mut(other_id) {
+            other.mot_x -= dx;
+            other.mot_z -= dz;
+            other.on_ground = false;
+        }
+        if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+            mob.mot_x += dx;
+            mob.mot_z += dz;
+            mob.on_ground = false;
+        }
+    }
+
+    /// Java `Entity.collide(Entity)` between a mob and a player.
+    fn collide_mob_and_player(&mut self, mob_id: i32, player_id: i32) {
+        let (x, z, passenger_id, vehicle_id) = match self.entities.get_mob(mob_id) {
+            Some(mob) => (mob.x, mob.z, mob.passenger_id, mob.vehicle_id),
+            None => return,
+        };
+        let (px, pz) = match self.entities.get_player(player_id) {
+            Some(player) => (player.x, player.z),
+            None => return,
+        };
+        // The vehicle of an entity is not pushed by its passenger and the
+        // other way round (`entity.passenger != this && entity.vehicle != this`).
+        if passenger_id == Some(player_id) || vehicle_id == Some(player_id) {
+            return;
+        }
+
+        // The distance of the mob from the player (`d0` and `d1` of the
+        // reference).
+        let mut dx = x - px;
+        let mut dz = z - pz;
+        // `MathHelper.a(d0, d1)`: the biggest of the absolute values, not
+        // the Euclidean distance.
+        let mut distance = dx.abs().max(dz.abs());
+        if distance < 0.009_999_999_776_482_582 {
+            return;
+        }
+        // `MathHelper.a(d2)`: the square root rounded to a single
+        // precision value.
+        distance = crate::util::math::math_helper_a(distance) as f64;
+        dx /= distance;
+        dz /= distance;
+        let mut scale = 1.0 / distance;
+        if scale > 1.0 {
+            scale = 1.0;
+        }
+        dx *= scale;
+        dz *= scale;
+        dx *= 0.050_000_000_745_058_06;
+        dz *= 0.050_000_000_745_058_06;
+        // The resistance of the pushed entity (`Entity.bu`), the mobs and
+        // the players have none of it.
+        dx *= 1.0 - 0.0;
+        dz *= 1.0 - 0.0;
+
+        // `Entity.b(double, double, double)`: the velocity of the entity
+        // grows and the entity leaves the ground. The two entities push
+        // each other away.
+        if let Some(player) = self.entities.get_player_mut(player_id) {
+            player.mot_x -= dx;
+            player.mot_z -= dz;
+            player.on_ground = false;
+        }
+        if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+            mob.mot_x += dx;
+            mob.mot_z += dz;
+            mob.on_ground = false;
+        }
+    }
+
+    /// Java `EntityLiving.v()`: the mobs push each other away.
+    ///
+    /// The entities of the box of the mob grown by 0.2 on the X and the Z
+    /// axes (`AxisAlignedBB.b(0.2, 0, 0.2)`) that are alive
+    /// (`Entity.d_()`) are pushed.
+    fn push_mobs(&mut self, mob_id: i32) {
+        let (box_, others, players) = {
+            let Some(mob) = self.entities.get_mob(mob_id) else {
+                return;
+            };
+            let box_ = mob.aabb().grown(0.2, 0.0, 0.2);
+            let others: Vec<i32> = self
+                .entities
+                .iter_mobs()
+                .filter(|other| other.entity_id != mob_id && !other.dead)
+                .filter(|other| other.aabb().intersects(&box_))
+                .map(|other| other.entity_id)
+                .collect();
+            let players: Vec<i32> = self
+                .entities
+                .iter_players()
+                .filter(|player| !player.dead)
+                .filter(|player| player.bounding_box().intersects(&box_))
+                .map(|player| player.entity_id)
+                .collect();
+            (box_, others, players)
+        };
+        let _ = box_;
+        for other_id in others {
+            self.collide_mobs(other_id, mob_id);
+        }
+        for player_id in players {
+            self.collide_mob_and_player(mob_id, player_id);
         }
     }
 
@@ -11975,6 +12143,44 @@ mod tests {
             "the pig zombie draws a number every tick in the daylight ({} draws)",
             drawn
         );
+    }
+
+    /// The mobs push each other away.
+    ///
+    /// Java `Entity.collide(Entity)`: the two entities push each other
+    /// away, the distance is scaled by `0.05000000074505806`.
+    #[test]
+    fn the_mobs_push_each_other_away() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        // A second mob next to the first one.
+        let other_id = server.spawn_mob_at(MobType::Pig, 1.5, 64.0, 0.5);
+        let (x, z) = {
+            let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+            (mob.x, mob.z)
+        };
+        let (ox, oz) = {
+            let mob = server.entities.get_mob(other_id).expect("the mob is alive");
+            (mob.x, mob.z)
+        };
+        // The mobs are a block apart: they push each other.
+        server.push_mobs(mob_id);
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        let other = server.entities.get_mob(other_id).expect("the mob is alive");
+        // The two mobs are pushed away from each other: the first one goes
+        // to the negative X and the second one to the positive X.
+        assert!(mob.mot_x < 0.0, "the mob is pushed away from the other one");
+        assert!(
+            other.mot_x > 0.0,
+            "the other mob is pushed away from the first one"
+        );
+        // The two mobs are pushed in the opposite directions, so they are
+        // further apart after the movement of the next tick.
+        let before = ((ox - x).powi(2) + (oz - z).powi(2)).sqrt();
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        let other = server.entities.get_mob(other_id).expect("the mob is alive");
+        let after = ((other.x - mob.x).powi(2) + (other.z - mob.z).powi(2)).sqrt();
+        assert!(after > before, "the mobs are further apart");
     }
 
     /// The block of the mob is at or above the terrain.
