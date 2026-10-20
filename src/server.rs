@@ -6261,6 +6261,27 @@ impl Server {
         }
     }
 
+    /// Java `Entity.K()`: the mob suffocates when one of the eight probes
+    /// around its head is a solid block.
+    ///
+    /// The horizontal offsets of the probes are
+    /// `((i >> 0) % 2 - 0.5) * length * 0.9` and the vertical one is
+    /// `((i >> 1) % 2 - 0.5) * 0.1`.
+    fn mob_suffocates(&self, x: f64, y: f64, z: f64, length: f32) -> bool {
+        for i in 0..8 {
+            let fx = ((i & 1) as f32 - 0.5) * length * 0.9;
+            let fy = (((i >> 1) & 1) as f32 - 0.5) * 0.1;
+            let fz = (((i >> 2) & 1) as f32 - 0.5) * length * 0.9;
+            let bx = (x + fx as f64).floor() as i32;
+            let by = (y + fy as f64).floor() as i32;
+            let bz = (z + fz as f64).floor() as i32;
+            if self.world.is_solid_at(bx, by, bz) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The number of the cactuses in the box of the mob.
     ///
     /// Java `Entity.move()`: every block of the box shrunk by 0.001 is
@@ -6690,22 +6711,17 @@ impl Server {
             }
         }
 
-        // The suffocation of the mob (`EntityLiving.R()`): the head of the
-        // mob is inside a block, the mob takes one point of damage.
+        // The suffocation of the mob (`EntityLiving.R()`): eight probes
+        // around the head of the mob, the mob takes one point of damage when
+        // one of them is a solid block (`Entity.K()`).
         {
-            let head = self.entities.get_mob(mob_id).map(|m| {
-                (
-                    m.x.floor() as i32,
-                    (m.y + m.eye_height()).floor() as i32,
-                    m.z.floor() as i32,
-                )
-            });
-            if let Some((hx, hy, hz)) = head {
-                if (0..128).contains(&hy) {
-                    let head_block = self.world.get_block(hx, hy, hz);
-                    if blocks::is_opaque_cube(head_block) {
-                        self.damage_mob(mob_id, 1, None, false);
-                    }
+            let head = self
+                .entities
+                .get_mob(mob_id)
+                .map(|m| (m.x, m.y + m.eye_height(), m.z, m.size().0));
+            if let Some((hx, hy, hz, length)) = head {
+                if self.mob_suffocates(hx, hy, hz, length) {
+                    self.damage_mob(mob_id, 1, None, false);
                 }
             }
         }
@@ -12241,6 +12257,64 @@ mod tests {
             mob.health,
             before - 1,
             "the mob takes the damage of the cactus of its box"
+        );
+    }
+
+    /// The mob suffocates when one of the eight probes around its head is
+    /// a solid block.
+    ///
+    /// Java `Entity.K()`: the probes are around the head of the mob, and
+    /// the test of the block is the one of `World.e()`.
+    #[test]
+    fn the_mob_suffocates_next_to_a_solid_block() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.x = 0.5;
+            mob.y = 64.0;
+            mob.z = 0.5;
+        }
+        // The mob is inside a solid block: the probes of the mob are in it.
+        server.world.set_block(0, 64, 0, blocks::STONE);
+        let before = server
+            .entities
+            .get_mob(mob_id)
+            .expect("the mob is alive")
+            .health;
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(
+            mob.health,
+            before - 1,
+            "the mob suffocates next to a solid block"
+        );
+    }
+
+    /// The mob does not suffocate when the block next to its head is not
+    /// solid.
+    ///
+    /// Java `Entity.K()`: the test of the block is the one of
+    /// `World.e()` — a material that is not solid does not suffocate the
+    /// mob, even when the block hides the sky.
+    #[test]
+    fn the_mob_does_not_suffocate_in_a_leaves() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.x = 0.5;
+            mob.y = 64.0;
+            mob.z = 0.5;
+        }
+        // The leaves are not a solid material (`World.e`).
+        server.world.set_block(0, 64, 0, blocks::LEAVES);
+        let before = server
+            .entities
+            .get_mob(mob_id)
+            .expect("the mob is alive")
+            .health;
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(
+            mob.health, before,
+            "the mob does not suffocate in a block that is not solid"
         );
     }
 

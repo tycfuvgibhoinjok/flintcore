@@ -150,6 +150,18 @@ impl Material {
         )
     }
 
+    /// Java `Material.h()`: the material is solid and it is not the one of
+    /// the leaves, of the ice, of the cactus, of the layer of the snow, of
+    /// the TNT and of the shatterable blocks (the flag `F` of the
+    /// reference).
+    pub fn is_solid_for_collision(self) -> bool {
+        self.is_solid()
+            && !matches!(
+                self,
+                Self::Leaves | Self::Ice | Self::Cactus | Self::SnowLayer | Self::Tnt
+            )
+    }
+
     pub fn is_buildable(self) -> bool {
         self.is_solid()
     }

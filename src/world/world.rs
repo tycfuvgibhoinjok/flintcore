@@ -1012,6 +1012,15 @@ impl World {
         false
     }
 
+    /// Java `World.e(int, int, int)`: the block is solid.
+    ///
+    /// The reference checks the material of the block (`material.h()`) and
+    /// the block itself (`block.b()`).
+    pub fn is_solid_at(&self, x: i32, y: i32, z: i32) -> bool {
+        let id = self.get_block(x, y, z);
+        blocks::material(id).is_solid_for_collision() && blocks::is_opaque_cube(id)
+    }
+
     pub fn get_data(&self, x: i32, y: i32, z: i32) -> u8 {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return 0;
