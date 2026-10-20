@@ -629,42 +629,83 @@ pub fn is_liquid(id: u8) -> bool {
     matches!(id, WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA)
 }
 
+/// Java `Material.isSolid()`: the material of the block is solid.
+///
+/// The table is the one of the reference (the tool
+/// `tools/poseidon_mobs/BlockMaterial.java` prints it).
 pub fn is_solid(id: u8) -> bool {
-    !matches!(
+    matches!(
         id,
-        AIR | WATER
-            | STATIONARY_WATER
-            | LAVA
-            | STATIONARY_LAVA
-            | SAPLING
-            | POWERED_RAIL
-            | DETECTOR_RAIL
+        STONE
+            | GRASS
+            | DIRT
+            | COBBLESTONE
+            | WOOD_PLANKS
+            | BEDROCK
+            | SAND
+            | GRAVEL
+            | GOLD_ORE
+            | IRON_ORE
+            | COAL_ORE
+            | LOG
+            | LEAVES
+            | SPONGE
+            | GLASS
+            | LAPIS_ORE
+            | LAPIS_BLOCK
+            | DISPENSER
+            | SANDSTONE
+            | NOTE_BLOCK
+            | BED
+            | STICKY_PISTON
             | WEB
-            | TALL_GRASS
-            | DEAD_BUSH
-            | YELLOW_FLOWER
-            | RED_ROSE
-            | BROWN_MUSHROOM
-            | RED_MUSHROOM
-            | TORCH
-            | FIRE
-            | REDSTONE_WIRE
-            | CROPS
+            | PISTON
+            | PISTON_HEAD
+            | WOOL
+            | PISTON_MOVING
+            | GOLD_BLOCK
+            | IRON_BLOCK
+            | DOUBLE_STEP
+            | STEP
+            | BRICK
+            | TNT
+            | BOOKSHELF
+            | MOSSY_COBBLESTONE
+            | OBSIDIAN
+            | MOB_SPAWNER
+            | WOOD_STAIRS
+            | CHEST
+            | DIAMOND_ORE
+            | DIAMOND_BLOCK
+            | WORKBENCH
+            | FARMLAND
+            | FURNACE
+            | LIT_FURNACE
             | SIGN
-            | RAIL
+            | WOODEN_DOOR
+            | COBBLESTONE_STAIRS
             | WALL_SIGN
-            | LEVER
             | STONE_PLATE
+            | IRON_DOOR
             | WOOD_PLATE
-            | REDSTONE_TORCH_OFF
-            | REDSTONE_TORCH_ON
-            | STONE_BUTTON
-            | SNOW
-            | REED
-            | PORTAL
+            | REDSTONE_ORE
+            | LIT_REDSTONE_ORE
+            | ICE
+            | SNOW_BLOCK
+            | CACTUS
+            | CLAY
+            | JUKEBOX
+            | FENCE
+            | PUMPKIN
+            | NETHERRACK
+            | SOUL_SAND
+            | GLOWSTONE
+            | JACK_O_LANTERN
+            | CAKE
+            | LOCKED_CHEST
+            | TRAPDOOR
     )
 }
-
 pub fn is_water(id: u8) -> bool {
     matches!(id, WATER | STATIONARY_WATER)
 }
@@ -1020,6 +1061,27 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 90, "the table of the reference is complete");
+
+        // The table of the solid material of the blocks.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/block_material.txt");
+        let table = std::fs::read_to_string(&path).expect("the table of the material");
+        let mut checked = 0;
+        for line in table.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(id) = parts.next().and_then(|v| v.parse::<u8>().ok()) else {
+                continue;
+            };
+            let solid = parts.nth(1).map(|v| v == "true").unwrap_or(false);
+            assert_eq!(
+                is_solid(id),
+                solid,
+                "the solid material of the block {}",
+                id
+            );
+            checked += 1;
+        }
+        assert!(checked > 90, "the table of the material is complete");
 
         // The table of the resistance to the explosion.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
