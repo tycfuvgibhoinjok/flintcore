@@ -319,7 +319,6 @@ pub struct Mob {
     pub target_id: Option<i32>,
     pub path: Vec<(i32, i32, i32)>,
     pub path_index: usize,
-    pub jumping: bool,
     // Pig
     pub pig_saddled: bool,
     pub passenger_id: Option<i32>,
@@ -464,7 +463,6 @@ impl Mob {
             target_id: None,
             path: Vec::new(),
             path_index: 0,
-            jumping: false,
             pig_saddled: false,
             passenger_id: None,
             vehicle_id: None,
@@ -1007,8 +1005,11 @@ impl Mob {
                 }
             }
             MobType::Slime => {
+                // The base `q()` of the reference always draws the number of
+                // the items, the slime of a size bigger than one drops
+                // nothing (`EntitySlime.j()`).
+                let count = rng.next_i32_bound(3) as u8;
                 if self.slime_size == 1 {
-                    let count = rng.next_i32_bound(3) as u8;
                     for _ in 0..count {
                         drops.push(ItemStack::new(items::SLIME_BALL, 1, 0));
                     }
@@ -1020,7 +1021,20 @@ impl Mob {
                     drops.push(ItemStack::new(items::GRILLED_PORK, 1, 0));
                 }
             }
-            MobType::Wolf | MobType::Giant => {}
+            MobType::Wolf => {
+                // The wolf drops nothing (`EntityWolf.j()` returns -1), but
+                // the base `q()` of the reference always draws the number of
+                // the items.
+                let _ = rng.next_i32_bound(3);
+            }
+            MobType::Giant => {
+                // The giant is a zombie (`EntityZombie.j()` returns the
+                // feathers).
+                let count = rng.next_i32_bound(3) as u8;
+                for _ in 0..count {
+                    drops.push(ItemStack::new(items::FEATHER, 1, 0));
+                }
+            }
         }
         drops
     }

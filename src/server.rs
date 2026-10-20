@@ -4424,6 +4424,14 @@ impl Server {
                                 ItemStack::new(blocks::WOOL as i16, 1, color as i16),
                                 10,
                             );
+                            // The spread of the velocity of the fleece
+                            // (`EntitySheep.a(EntityHuman)`): the height and
+                            // the two horizontal directions, five numbers.
+                            let _ = self.entity_random.next_f32();
+                            let _ = self.entity_random.next_f32();
+                            let _ = self.entity_random.next_f32();
+                            let _ = self.entity_random.next_f32();
+                            let _ = self.entity_random.next_f32();
                         }
                         let broken = stack.damage_item(1);
                         updated_hand = Some(if broken { None } else { Some(stack) });
@@ -4471,6 +4479,9 @@ impl Server {
                                 None
                             });
                             let success = self.entity_random.next_i32_bound(3) == 0;
+                            // The particles of the hearts or of the smoke
+                            // (`EntityWolf.a(boolean)`).
+                            self.wolf_tame_particles(success);
                             if success {
                                 if let Some(w) = self.entities.get_mob_mut(mob_id) {
                                     w.wolf_tamed = true;
@@ -4499,7 +4510,11 @@ impl Server {
                         if (stack.id == items::PORK || stack.id == items::GRILLED_PORK)
                             && health < 20
                         {
-                            let heal = stack.food_heal_amount();
+                            // The reference heals the wolf with the value of
+                            // the raw pork (`EntityWolf.a(EntityHuman)`:
+                            // `Item.PORK.k()`), not with the value of the
+                            // meat of the hand.
+                            let heal = 3;
                             if let Some(w) = self.entities.get_mob_mut(mob_id) {
                                 w.health = (w.health + heal).min(20);
                             }
@@ -4514,7 +4529,7 @@ impl Server {
                     if !ate_meat && owner.eq_ignore_ascii_case(player_name) {
                         if let Some(w) = self.entities.get_mob_mut(mob_id) {
                             w.wolf_sitting = !w.wolf_sitting;
-                            w.jumping = false;
+                            w.jump_flag = false;
                             w.path.clear();
                             w.target_id = None;
                         }
@@ -4723,15 +4738,7 @@ impl Server {
                         }
                     }
                 }
-                death_info = Some((
-                    mob.mob_type,
-                    mob.x,
-                    mob.y,
-                    mob.z,
-                    mob.slime_size,
-                    mob.passenger_id,
-                    drops,
-                ));
+                death_info = Some((mob.mob_type, mob.x, mob.y, mob.z, mob.passenger_id, drops));
             }
         } else {
             return false;
@@ -4776,7 +4783,7 @@ impl Server {
                 entity_id: mob_id,
                 status: 3,
             }));
-            if let Some((mtype, mx, my, mz, slime_size, passenger_id, drops)) = death_info {
+            if let Some((_mtype, mx, my, mz, passenger_id, drops)) = death_info {
                 if let Some(pid) = passenger_id {
                     if self.entities.get_player(pid).is_some() {
                         self.dismount_player(pid);
@@ -4790,19 +4797,6 @@ impl Server {
                 // twenty.
                 for item in drops {
                     self.spawn_dropped_item_random(mx, my + 0.2, mz, item, 10);
-                }
-                // EntitySlime.die(): split into 4 slimes of size / 2 when size > 1
-                if mtype == MobType::Slime && slime_size > 1 {
-                    let half = slime_size / 2;
-                    for j in 0..4 {
-                        let ox = (((j % 2) as f64) - 0.5) * (slime_size as f64) / 4.0;
-                        let oz = (((j / 2) as f64) - 0.5) * (slime_size as f64) / 4.0;
-                        let child_id =
-                            self.spawn_mob_at(MobType::Slime, mx + ox, my + 0.5, mz + oz);
-                        if let Some(child) = self.entities.get_mob_mut(child_id) {
-                            child.set_slime_size(half);
-                        }
-                    }
                 }
             }
         }
@@ -6195,6 +6189,21 @@ impl Server {
         }
     }
 
+    /// The particles of the taming of a wolf (`EntityWolf.a(boolean)`).
+    ///
+    /// The reference draws seven particles, every particle with three normal
+    /// values (the speed of the particle) and three numbers (its position).
+    fn wolf_tame_particles(&mut self, _hearts: bool) {
+        for _ in 0..7 {
+            for _ in 0..3 {
+                let _ = self.entity_random.next_gaussian();
+            }
+            for _ in 0..3 {
+                let _ = self.entity_random.next_f32();
+            }
+        }
+    }
+
     /// The collision boxes of the other entities (`World.b(Entity,
     /// AxisAlignedBB)`).
     fn collect_entity_boxes(&mut self, mob_id: i32, out: &mut Vec<Aabb>) {
@@ -6534,12 +6543,38 @@ impl Server {
             }
         }
         if left_the_world {
+            // The children of the slime (`EntitySlime.die()`) are created
+            // before the particles of the death: every child draws the size
+            // and the delay of its constructor and the yaw of itself.
+            let split = self
+                .entities
+                .get_mob(mob_id)
+                .map(|m| (m.mob_type, m.x, m.y, m.z, m.slime_size));
+            if let Some((MobType::Slime, x, y, z, size)) = split {
+                if size > 1 {
+                    let half = size / 2;
+                    for j in 0..4 {
+                        let ox = (((j % 2) as f64) - 0.5) * (size as f64) / 4.0;
+                        let oz = (((j / 2) as f64) - 0.5) * (size as f64) / 4.0;
+                        let child_id = self.spawn_mob_at(MobType::Slime, x + ox, y + 0.5, z + oz);
+                        // The yaw of the child (`EntitySlime.die()`).
+                        let yaw = self.entity_random.next_f32() * 360.0;
+                        if let Some(child) = self.entities.get_mob_mut(child_id) {
+                            child.set_slime_size(half);
+                            child.yaw = yaw;
+                        }
+                    }
+                }
+            }
             // The particles of the death (`EntityLiving.R()`): twenty times
-            // three normal values and one number.
+            // three normal values (the speed of the particle) and three
+            // numbers (its position).
             for _ in 0..20 {
                 let _ = self.entity_random.next_gaussian();
                 let _ = self.entity_random.next_gaussian();
                 let _ = self.entity_random.next_gaussian();
+                let _ = self.entity_random.next_f32();
+                let _ = self.entity_random.next_f32();
                 let _ = self.entity_random.next_f32();
             }
             return true;
@@ -11619,6 +11654,180 @@ mod tests {
         let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
         // The pig has ten points of health, one of them is gone.
         assert_eq!(mob.health, 9);
+    }
+
+    /// A player of the tests with an item in his hand.
+    fn mob_test_player(server: &mut Server, item: ItemStack) -> i32 {
+        let entity_id = server
+            .entities
+            .insert_player(7, "Player".to_string(), 2.5, 64.0, 0.5);
+        if let Some(player) = server.entities.get_player_mut(entity_id) {
+            player.inventory.set_item_in_hand(Some(item));
+        }
+        entity_id
+    }
+
+    /// The base `q()` of the reference always draws the number of the items.
+    ///
+    /// Java `EntityLiving.q()`: the number of the items is drawn even when
+    /// the mob drops nothing (`EntityWolf.j()` returns -1).
+    #[test]
+    fn the_death_of_a_wolf_draws_the_number_of_the_items() {
+        let (mut server, mob_id) = mob_scenario_server("wolf");
+        let mut shadow = server.entity_random.clone();
+        server.damage_mob(mob_id, 100, None, false);
+        // The sound of the death (two numbers) and the number of the items.
+        let _ = shadow.next_f32();
+        let _ = shadow.next_f32();
+        let _ = shadow.next_i32_bound(3);
+        assert_eq!(server.entity_random.draws, shadow.draws);
+        // The wolf drops nothing (`EntityWolf.j()` returns -1).
+        assert_eq!(server.entities.iter_dropped_items().count(), 0);
+    }
+
+    /// The giant drops the feathers of the zombie.
+    ///
+    /// Java `EntityZombie.j()`: the giant is a zombie, it drops the feathers.
+    #[test]
+    fn the_death_of_a_giant_drops_the_feathers() {
+        let (mut server, mob_id) = mob_scenario_server("giant");
+        let mut shadow = server.entity_random.clone();
+        server.damage_mob(mob_id, 300, None, false);
+        // The sound of the death (two numbers) and the number of the items.
+        let _ = shadow.next_f32();
+        let _ = shadow.next_f32();
+        let count = shadow.next_i32_bound(3);
+        assert_eq!(server.entity_random.draws, shadow.draws);
+        let feathers = server
+            .entities
+            .iter_dropped_items()
+            .filter(|i| i.item.id == items::FEATHER)
+            .count();
+        assert_eq!(feathers, count as usize);
+    }
+
+    /// The slime splits when its corpse leaves the world.
+    ///
+    /// Java `EntitySlime.die()` is called by `EntityLiving.R()` when the
+    /// counter of the death passes twenty: the four children are created
+    /// then, every child draws the size and the delay of its constructor and
+    /// the yaw of itself.
+    #[test]
+    fn the_slime_splits_when_its_corpse_leaves_the_world() {
+        let (mut server, mob_id) = mob_scenario_server("slime");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.set_slime_size(4);
+        }
+        let mut shadow = server.entity_random.clone();
+        server.damage_mob(mob_id, 100, None, false);
+        // The sound of the death (two numbers) and the number of the items.
+        let _ = shadow.next_f32();
+        let _ = shadow.next_f32();
+        let _ = shadow.next_i32_bound(3);
+        assert_eq!(server.entity_random.draws, shadow.draws);
+        // The corpse of the slime lives twenty more ticks.
+        for _ in 0..20 {
+            server.tick_mobs();
+        }
+        assert!(
+            server.entities.get_mob(mob_id).is_some(),
+            "the corpse of the slime is still in the world"
+        );
+        // The next tick the corpse leaves the world and the slime splits.
+        let mut shadow = server.entity_random.clone();
+        server.tick_mobs();
+        // The idle sound of the corpse (`EntityLiving.R()`).
+        let _ = shadow.next_i32_bound(1000);
+        // The four children: the size and the delay of the constructor (two
+        // numbers) and the yaw of the child (one number) each.
+        let mut yaws = Vec::new();
+        for _ in 0..4 {
+            let _ = shadow.next_i32_bound(3);
+            let _ = shadow.next_i32_bound(20);
+            yaws.push(shadow.next_f32() * 360.0);
+        }
+        // The twenty particles of the death: three normal values and three
+        // numbers each.
+        for _ in 0..20 {
+            for _ in 0..3 {
+                let _ = shadow.next_gaussian();
+            }
+            for _ in 0..3 {
+                let _ = shadow.next_f32();
+            }
+        }
+        assert_eq!(server.entity_random.draws, shadow.draws);
+        // The four children are in the world with the yaw of the reference.
+        let children: Vec<_> = server
+            .entities
+            .iter_mobs()
+            .filter(|m| m.mob_type == MobType::Slime && m.entity_id != mob_id)
+            .collect();
+        assert_eq!(children.len(), 4);
+        for (child, yaw) in children.iter().zip(yaws) {
+            assert_eq!(child.slime_size, 2);
+            assert_eq!(child.yaw, yaw);
+        }
+    }
+
+    /// The shearing of a sheep draws five numbers for every fleece.
+    ///
+    /// Java `EntitySheep.a(EntityHuman)`: the number of the fleeces is drawn
+    /// and every fleece draws the spread of the velocity of the item.
+    #[test]
+    fn the_shearing_of_a_sheep_draws_five_numbers_for_every_fleece() {
+        let (mut server, mob_id) = mob_scenario_server("sheep");
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::SHEARS, 1, 0));
+        let mut shadow = server.entity_random.clone();
+        server.handle_interact_mob(7, player_id, "Player", mob_id);
+        // The number of the fleeces.
+        let count = 2 + shadow.next_i32_bound(3);
+        // Five numbers for every fleece.
+        for _ in 0..count {
+            for _ in 0..5 {
+                let _ = shadow.next_f32();
+            }
+        }
+        assert_eq!(server.entity_random.draws, shadow.draws);
+        // The sheep is sheared and the fleeces are on the ground.
+        assert!(
+            server
+                .entities
+                .get_mob(mob_id)
+                .expect("the sheep is alive")
+                .sheep_sheared
+        );
+        let fleeces = server
+            .entities
+            .iter_dropped_items()
+            .filter(|i| i.item.id == blocks::WOOL as i16)
+            .count();
+        assert_eq!(fleeces, count as usize);
+    }
+
+    /// The taming of a wolf draws the particles of the hearts.
+    ///
+    /// Java `EntityWolf.a(EntityHuman)`: the number of the taming is drawn
+    /// and the seven particles of the hearts or of the smoke draw three
+    /// normal values and three numbers each.
+    #[test]
+    fn the_taming_of_a_wolf_draws_the_particles_of_the_hearts() {
+        let (mut server, mob_id) = mob_scenario_server("wolf");
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        let mut shadow = server.entity_random.clone();
+        server.handle_interact_mob(7, player_id, "Player", mob_id);
+        // The number of the taming.
+        let _ = shadow.next_i32_bound(3);
+        // The seven particles: three normal values and three numbers each.
+        for _ in 0..7 {
+            for _ in 0..3 {
+                let _ = shadow.next_gaussian();
+            }
+            for _ in 0..3 {
+                let _ = shadow.next_f32();
+            }
+        }
+        assert_eq!(server.entity_random.draws, shadow.draws);
     }
 
     /// The giant has two hundred points of health.
