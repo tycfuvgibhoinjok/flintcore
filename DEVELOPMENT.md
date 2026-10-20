@@ -389,6 +389,28 @@ Mob movement parity harness:
     (`MinecraftServer.tick`).
   - The light of the sky is reduced by the time of the day
     (`World.a(i, j, k, true)`), the light of the blocks is not.
+  - The light of the sky is dimmed by the rain and by the thunder: the
+    factor is multiplied by `1 - intensity * 5 / 16` for each of them, the
+    intensities rise by one hundredth every tick while the weather lasts
+    (`World.a(float)` and `World.g()`).
+  - The explosion of the reference: the ray is not interrupted at the
+    borders of the world, the blocks of the explosion are destroyed in the
+    order of the iteration of the hash set of the reference, the entity is
+    thrown away from the centre of the explosion, and the exposure of the
+    entity is the share of the points of its box from which the centre is
+    visible (`World.a(Vec3D, AxisAlignedBB)`).
+  - The blocks with a tile entity create it when they are written
+    (`BlockContainer.c`), the tile entity of the old block is removed, and
+    the direction of the furnace and of the dispenser is set from the
+    neighbours (`BlockFurnace.g`).
+  - The liquid that spreads drops the block it displaces and the lava
+    makes the sound of the fizz (`BlockFlowing.flow`).
+  - The fuse of the TNT destroyed by an explosion is drawn from the random
+    of the world (`BlockTNT.d`).
+  - The tags of the NBT keep the order of their insertion: the files of
+    the world are the same byte for byte on every run.
+  - The file `level.dat` is written when the server stops and by the
+    command `save-all`, not every five seconds.
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.

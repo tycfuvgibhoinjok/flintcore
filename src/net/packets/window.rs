@@ -56,7 +56,7 @@ impl OpenWindow {
         Ok(Self {
             window_id: reader.read_u8()?,
             inventory_type: reader.read_u8()?,
-            title: reader.read_utf8(255)?,
+            title: reader.read_modified_utf8(255)?,
             slots_count: reader.read_u8()?,
         })
     }
@@ -64,7 +64,7 @@ impl OpenWindow {
     pub fn encode(&self, writer: &mut Writer) -> Result<()> {
         writer.write_u8(self.window_id);
         writer.write_u8(self.inventory_type);
-        writer.write_utf8(&self.title)?;
+        writer.write_modified_utf8(&self.title)?;
         writer.write_u8(self.slots_count);
         Ok(())
     }

@@ -837,6 +837,10 @@ impl World {
     }
 
     /// Java `ChunkProviderServer.saveChunks(false, null)` — save up to `max_chunks` dirty chunks per call.
+    ///
+    /// The file `level.dat` is not written here: the reference writes it
+    /// when the server stops and by the command `save-all`
+    /// (`MinecraftServer.saveChunks()`).
     pub fn save_chunks_incremental(&mut self, max_chunks: usize) -> Result<usize> {
         let mut saved = 0usize;
         if let Some(storage) = &self.storage {
@@ -851,9 +855,6 @@ impl World {
                         break;
                     }
                 }
-            }
-            if saved > 0 && self.dimension == 0 {
-                self.level_data.borrow_mut().save_to_dir(&self.world_dir)?;
             }
         }
         Ok(saved)
@@ -3873,6 +3874,40 @@ mod tests {
         // The middle of the night: the factor of the sky is eleven.
         world.level_data.borrow_mut().time = 18000;
         assert_eq!(world.light_at(0, 100, 0), 4, "the light of the midnight");
+    }
+
+    /// The incremental save does not write the file of the level data.
+    ///
+    /// Java `ChunkProviderServer.saveChunks` saves the chunks only; the file
+    /// `level.dat` is written when the server stops and by the command
+    /// `save-all` (`MinecraftServer.saveChunks()`).
+    #[test]
+    fn the_incremental_save_does_not_write_the_level_data() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("flintcore_level_save_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let config = WorldConfig {
+            seed: 1,
+            level_name: temp_dir.to_string_lossy().to_string(),
+            save_enabled: true,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        world.ensure_chunk_base(ChunkPos::new(0, 0));
+        world.java_set_type_id(0, 63, 0, blocks::STONE);
+        world
+            .save_chunks_incremental(24)
+            .expect("the chunks are saved");
+        assert!(
+            !temp_dir.join("level.dat").exists(),
+            "the incremental save does not write the level data"
+        );
+        world.save_all().expect("the world is saved");
+        assert!(
+            temp_dir.join("level.dat").exists(),
+            "the full save writes the level data"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

@@ -104,6 +104,49 @@ impl<'a> Reader<'a> {
             .collect())
     }
 
+    /// Java `DataInput.readUTF`: the **modified** UTF-8.
+    pub fn read_modified_utf8(&mut self, max_bytes: usize) -> Result<String> {
+        let length = self.read_u16()? as usize;
+        if length > max_bytes {
+            return Err(Error::StringTooLong {
+                max: max_bytes,
+                len: length,
+            });
+        }
+        let bytes = self.take(length)?;
+        let mut units: Vec<u16> = Vec::with_capacity(bytes.len());
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let first = bytes[index];
+            if first < 0x80 {
+                units.push(u16::from(first));
+                index += 1;
+            } else if first & 0xE0 == 0xC0 {
+                let second = *bytes
+                    .get(index + 1)
+                    .ok_or(Error::Malformed("invalid utf-8"))?;
+                units.push((u16::from(first & 0x1F) << 6) | u16::from(second & 0x3F));
+                index += 2;
+            } else if first & 0xF0 == 0xE0 {
+                let second = *bytes
+                    .get(index + 1)
+                    .ok_or(Error::Malformed("invalid utf-8"))?;
+                let third = *bytes
+                    .get(index + 2)
+                    .ok_or(Error::Malformed("invalid utf-8"))?;
+                units.push(
+                    (u16::from(first & 0x0F) << 12)
+                        | (u16::from(second & 0x3F) << 6)
+                        | u16::from(third & 0x3F),
+                );
+                index += 3;
+            } else {
+                return Err(Error::Malformed("invalid utf-8"));
+            }
+        }
+        String::from_utf16(&units).map_err(|_| Error::Malformed("invalid utf-8"))
+    }
+
     pub fn read_utf8(&mut self, max_bytes: usize) -> Result<String> {
         let length = self.read_u16()? as usize;
         if length > max_bytes {
@@ -219,6 +262,39 @@ impl Writer {
         Ok(())
     }
 
+    /// Java `DataOutput.writeUTF`: the **modified** UTF-8.
+    ///
+    /// The length is the number of the bytes, the null character is written
+    /// as two bytes (`0xC0 0x80`) and the characters outside the basic
+    /// plane are written as two sequences of three bytes (the surrogates).
+    pub fn write_modified_utf8(&mut self, value: &str) -> Result<()> {
+        let mut encoded = Vec::with_capacity(value.len());
+        for unit in value.encode_utf16() {
+            if unit == 0 {
+                encoded.push(0xC0);
+                encoded.push(0x80);
+            } else if unit < 0x80 {
+                encoded.push(unit as u8);
+            } else if unit < 0x800 {
+                encoded.push(0xC0 | (unit >> 6) as u8);
+                encoded.push(0x80 | (unit & 0x3F) as u8);
+            } else {
+                encoded.push(0xE0 | (unit >> 12) as u8);
+                encoded.push(0x80 | ((unit >> 6) & 0x3F) as u8);
+                encoded.push(0x80 | (unit & 0x3F) as u8);
+            }
+        }
+        if encoded.len() > u16::MAX as usize {
+            return Err(Error::StringTooLong {
+                max: u16::MAX as usize,
+                len: encoded.len(),
+            });
+        }
+        self.write_u16(encoded.len() as u16);
+        self.write_bytes(&encoded);
+        Ok(())
+    }
+
     pub fn write_utf8(&mut self, value: &str) -> Result<()> {
         let bytes = value.as_bytes();
         if bytes.len() > u16::MAX as usize {
@@ -236,6 +312,52 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The modified UTF-8 of the reference (`DataOutput.writeUTF`).
+    ///
+    /// The null character is written as two bytes and the characters outside
+    /// the basic plane are written as two sequences of three bytes; the
+    /// length is the number of the bytes.
+    #[test]
+    fn the_modified_utf8_of_the_reference_is_used() {
+        let mut writer = Writer::new();
+        writer
+            .write_modified_utf8("a\0b")
+            .expect("the string is written");
+        let bytes = writer.into_inner();
+        assert_eq!(&bytes[..2], &[0x00, 0x04], "the length is in bytes");
+        assert_eq!(
+            &bytes[2..],
+            &[b'a', 0xC0, 0x80, b'b'],
+            "the null character is two bytes"
+        );
+
+        // A character outside the basic plane is two sequences of three
+        // bytes.
+        let mut writer = Writer::new();
+        writer
+            .write_modified_utf8("\u{1F600}")
+            .expect("the string is written");
+        let bytes = writer.into_inner();
+        assert_eq!(bytes.len(), 8, "the length is in bytes");
+        assert_eq!(
+            &bytes[2..],
+            &[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80],
+            "the surrogates are written apart"
+        );
+
+        // The round trip.
+        let mut writer = Writer::new();
+        writer
+            .write_modified_utf8("a\0b\u{1F600}")
+            .expect("the string is written");
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            reader.read_modified_utf8(255).expect("the string is read"),
+            "a\0b\u{1F600}"
+        );
+    }
 
     #[test]
     fn integers_round_trip_big_endian() {
