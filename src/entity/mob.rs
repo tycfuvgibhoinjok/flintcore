@@ -199,7 +199,10 @@ impl MobType {
                 s * s
             }
             Self::Ghast | Self::Pig | Self::Cow | Self::Squid => 10,
-            Self::Sheep | Self::Wolf => 8,
+            // `EntitySheep` does not set the health, the default of
+            // `EntityLiving` is ten. The wolf has eight (`EntityWolf`).
+            Self::Sheep => 10,
+            Self::Wolf => 8,
             Self::Chicken => 4,
         }
     }
@@ -587,9 +590,13 @@ impl Mob {
                 // The friction of the ground (`EntityLiving.a(float, float)`): the
                 // block below the mob has its own friction factor.
                 let friction = if self.on_ground {
+                    // The block of the friction is under the bottom of the
+                    // box of the mob (`EntityLiving.a(float, float)`), the
+                    // bottom of the box is the position of the mob plus the
+                    // offset of the step.
                     let below = world.get_block(
                         self.x.floor() as i32,
-                        (self.y.floor() as i32) - 1,
+                        ((self.y + self.step_offset as f64).floor() as i32) - 1,
                         self.z.floor() as i32,
                     );
                     if below > 0 {

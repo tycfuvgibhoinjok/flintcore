@@ -5004,6 +5004,13 @@ impl Server {
             // Resolve current target position (player or sheep/mob)
             let cur_target_id = self.entities.get_mob(mob_id).and_then(|m| m.target_id);
             let mut target_pos: Option<(i32, bool, f64, f64, f64)> = None;
+            // The target of the mob before the search of a new one
+            // (`EntityCreature.c_()`): the attack of the mob uses it, a
+            // target that was found in this tick is not attacked yet.
+            let mut attack_target: Option<(i32, bool, f64, f64, f64)> = None;
+            // The target of the mob died: the reference clears the target
+            // and does not search a new one until the next tick.
+            let mut target_died = false;
             // The height of the eyes of the target (`EntityLiving.t()`).
             let mut target_eye_height = PLAYER_EYE_HEIGHT;
             if let Some(tid) = cur_target_id {
@@ -5012,18 +5019,27 @@ impl Server {
                 {
                     if !pdead {
                         target_pos = Some((tid, true, px, py, pz));
+                        attack_target = target_pos;
+                    } else {
+                        target_died = true;
                     }
                 } else if let Some(tmob) = self.entities.get_mob(tid) {
                     if !tmob.dead {
                         target_pos = Some((tid, false, tmob.x, tmob.y, tmob.z));
+                        attack_target = target_pos;
                         // The eyes of the target (`EntityLiving.t()`).
                         target_eye_height = tmob.eye_height();
+                    } else {
+                        target_died = true;
                     }
+                } else {
+                    // The target left the world.
+                    target_died = true;
                 }
             }
 
             // Acquire new target if none
-            if target_pos.is_none() && !corpse {
+            if target_pos.is_none() && !corpse && !target_died {
                 match mtype {
                     MobType::Zombie
                     | MobType::Skeleton
@@ -5172,7 +5188,7 @@ impl Server {
                 // (`EntityCreature.c_()`): it is reset at the beginning of
                 // the artificial intelligence.
                 mob.sees_target = mob.reference_sees_target();
-                if let Some((tid, is_player, tx, ty, tz)) = target_pos {
+                if let Some((tid, is_player, tx, ty, tz)) = attack_target {
                     let dx = tx - mob.x;
                     let dy = ty - mob.y;
                     let dz = tz - mob.z;
@@ -5181,8 +5197,15 @@ impl Server {
                     match mob.mob_type {
                         MobType::Creeper => {
                             // The fuse of the creeper (`EntityCreeper.a`):
-                            // it burns while the target is near.
-                            if (mob.creeper_state > 0 && dist < 7.0)
+                            // it burns while the target is near. Without the
+                            // line of sight the creeper whistles
+                            // (`EntityCreeper.b`) and the fuse runs down.
+                            if !has_los {
+                                mob.creeper_state = -1;
+                                if mob.creeper_fuse > 0 {
+                                    mob.creeper_fuse -= 1;
+                                }
+                            } else if (mob.creeper_state > 0 && dist < 7.0)
                                 || (mob.creeper_state <= 0 && dist < 3.0)
                             {
                                 mob.creeper_state = 1;
@@ -5285,9 +5308,6 @@ impl Server {
                             }
                         }
                     }
-                } else if mob.mob_type == MobType::Creeper && mob.creeper_fuse > 0 {
-                    mob.creeper_state = -1;
-                    mob.creeper_fuse -= 1;
                 }
             }
             // The explosion of the creeper (`EntityCreeper.a`): the blocks of
@@ -5304,45 +5324,47 @@ impl Server {
                 // A dead mob has no artificial intelligence
                 // (`EntityLiving.v()`): the input of the movement is zero.
             } else if let Some((ox, oy, oz)) = owner_pos {
+                // The tamed wolf (`EntityWolf.c_()`): the path to the owner is
+                // searched every tick, without a draw. The wolf teleports to
+                // the owner only when the path is missing and the owner is
+                // more than twelve blocks away (`EntityWolf.c`).
                 let dist = ((ox - mx).powi(2) + (oy - my).powi(2) + (oz - mz).powi(2)).sqrt();
-                if dist > 12.0 {
-                    // Teleport wolf near owner (`EntityWolf.c`)
-                    let bx = ox.floor() as i32 - 2;
-                    let by = oy.floor() as i32;
-                    let bz = oz.floor() as i32 - 2;
-                    'tp: for l in 0..=4 {
-                        for i1 in 0..=4 {
-                            if (l < 1 || i1 < 1 || l > 3 || i1 > 3)
-                                && self.world.is_solid_normal_at(bx + l, by - 1, bz + i1)
-                                && !self.world.is_solid_normal_at(bx + l, by, bz + i1)
-                                && !self.world.is_solid_normal_at(bx + l, by + 1, bz + i1)
-                            {
-                                teleport_to_owner = Some((
-                                    (bx + l) as f64 + 0.5,
-                                    by as f64,
-                                    (bz + i1) as f64 + 0.5,
-                                ));
-                                break 'tp;
+                if dist > 5.0 {
+                    let path = find_path(
+                        &self.world,
+                        mx,
+                        my + step_offset as f64,
+                        mz,
+                        length,
+                        width,
+                        ox,
+                        oy,
+                        oz,
+                        16.0,
+                    );
+                    if path.is_empty() && dist > 12.0 {
+                        // Teleport wolf near owner (`EntityWolf.c`)
+                        let bx = ox.floor() as i32 - 2;
+                        let by = oy.floor() as i32;
+                        let bz = oz.floor() as i32 - 2;
+                        'tp: for l in 0..=4 {
+                            for i1 in 0..=4 {
+                                if (l < 1 || i1 < 1 || l > 3 || i1 > 3)
+                                    && self.world.is_solid_normal_at(bx + l, by - 1, bz + i1)
+                                    && !self.world.is_solid_normal_at(bx + l, by, bz + i1)
+                                    && !self.world.is_solid_normal_at(bx + l, by + 1, bz + i1)
+                                {
+                                    teleport_to_owner = Some((
+                                        (bx + l) as f64 + 0.5,
+                                        by as f64,
+                                        (bz + i1) as f64 + 0.5,
+                                    ));
+                                    break 'tp;
+                                }
                             }
                         }
-                    }
-                } else if dist > 5.0 {
-                    let should_repath = self.entities.get_mob_mut(mob_id).is_some_and(|m| {
-                        m.path.is_empty() || self.entity_random.next_i32_bound(20) == 0
-                    });
-                    if should_repath {
-                        new_path = Some(find_path(
-                            &self.world,
-                            mx,
-                            my + step_offset as f64,
-                            mz,
-                            length,
-                            width,
-                            ox,
-                            oy,
-                            oz,
-                            16.0,
-                        ));
+                    } else {
+                        new_path = Some(path);
                     }
                 }
             } else if !matches!(mtype, MobType::Ghast | MobType::Slime | MobType::Squid) {
@@ -6018,8 +6040,10 @@ impl Server {
                 }
 
                 // The fall damage of the mob (`EntityLiving.a(float)`): the
-                // reference hits the mob once with all the damage.
-                if fall_damage > 3.0 {
+                // reference hits the mob once with all the damage. The
+                // chicken (`EntityChicken.a(float)`) and the ghast
+                // (`EntityFlying.a(float)`) have no damage of a fall.
+                if fall_damage > 3.0 && !matches!(mob.mob_type, MobType::Chicken | MobType::Ghast) {
                     fall_hit = ((fall_damage - 3.0).ceil() as i32).max(0) as i16;
                 }
                 // The cactus (`BlockCactus.a`): the mob inside a cactus takes
@@ -11661,6 +11685,58 @@ mod tests {
         }
         let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
         assert_eq!(mob.pigzombie_anger, 500);
+    }
+
+    /// The sheep has ten points of health.
+    ///
+    /// Java `EntitySheep` does not set the health, the default of
+    /// `EntityLiving` is ten.
+    #[test]
+    fn the_sheep_has_ten_points_of_health() {
+        let (server, mob_id) = mob_scenario_server("sheep");
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.health, 10);
+    }
+
+    /// The chicken does not take the damage of a fall.
+    ///
+    /// Java `EntityChicken.a(float)`: the method is empty, the chicken does
+    /// not take the damage of a fall.
+    #[test]
+    fn the_chicken_does_not_take_the_damage_of_a_fall() {
+        let (mut server, mob_id) = mob_scenario_server("chicken");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.y = 74.0;
+            mob.mot_y = 0.0;
+            mob.fall_distance = 0.0;
+        }
+        for _ in 0..60 {
+            server.tick_mobs();
+        }
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        // The chicken has four points of health, none of them is gone.
+        assert_eq!(mob.health, 4);
+    }
+
+    /// The creeper whistles when it does not see its target.
+    ///
+    /// Java `EntityCreeper.b(Entity, float)`: the fuse of the creeper runs
+    /// down when the mob does not see its target.
+    #[test]
+    fn the_creeper_whistles_when_it_does_not_see_its_target() {
+        let (mut server, mob_id) = mob_scenario_server("creeper");
+        // The creeper finds the player in the first tick.
+        server.tick_mobs();
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.creeper_fuse = 5;
+        }
+        // A wall between the creeper and the player.
+        for y in 64..=68 {
+            server.world.set_block(5, y, 0, blocks::STONE);
+        }
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.creeper_fuse, 4);
     }
 
     /// The traces of the port have to be the traces of the reference, tick by
