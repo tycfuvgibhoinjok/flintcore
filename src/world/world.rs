@@ -1843,10 +1843,13 @@ impl World {
                     && blocks::is_opaque_cube(below)
             }
             blocks::DEAD_BUSH => {
-                (self.light_at(x, y, z) >= 8 || self.can_see_sky(x, y, z)) && below == blocks::SAND
+                // The block of the plant is at or above the terrain
+                // (`World.isChunkLoaded`), not under the sky.
+                (self.light_at(x, y, z) >= 8 || self.java_is_chunk_loaded_at(x, y, z))
+                    && below == blocks::SAND
             }
             _ => {
-                (self.light_at(x, y, z) >= 8 || self.can_see_sky(x, y, z))
+                (self.light_at(x, y, z) >= 8 || self.java_is_chunk_loaded_at(x, y, z))
                     && matches!(below, blocks::GRASS | blocks::DIRT | blocks::FARMLAND)
             }
         }

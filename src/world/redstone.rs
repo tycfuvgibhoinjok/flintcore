@@ -243,14 +243,11 @@ impl World {
             return true;
         }
         if id == blocks::REPEATER_OFF || id == blocks::REPEATER_ON {
-            let meta_dir = (self.get_data(x, y, z) & 3) as i32;
-            let opp = match meta_dir {
-                0 => 2,
-                1 => 3,
-                2 => 0,
-                _ => 1,
-            };
-            return dir == meta_dir || dir == opp;
+            // The repeater is connected to the wire from **one** side only
+            // (`BedBlockTextures.b`).
+            let meta_dir = (self.get_data(x, y, z) & 3) as usize;
+            const CONNECTED_SIDE: [i32; 4] = [2, 3, 0, 1];
+            return dir == CONNECTED_SIDE[meta_dir];
         }
         false
     }
@@ -3094,19 +3091,13 @@ impl World {
                         }
                     }
                     blocks::BROWN_MUSHROOM | blocks::RED_MUSHROOM => {
-                        // BlockMushroom.a (BlockMushroom.java:17-51)
-                        if y > 0
-                            && (self.light_at(wx, y, wz) >= 13
-                                || !blocks::is_opaque_cube(self.get_block(wx, y - 1, wz)))
-                        {
-                            self.world_events.push(WorldEvent::DropItem {
-                                x: wx as f64,
-                                y: y as f64,
-                                z: wz as f64,
-                                item: ItemStack::new(block_id as i16, 1, 0),
-                            });
-                            self.java_set_type_id(wx, y, wz, blocks::AIR);
-                        } else if self.mechanics.mushroom_spread && rng.next_i32_bound(100) == 0 {
+                        // BlockMushroom.a (BlockMushroom.java:17-51): the
+                        // random tick of the mushroom never destroys it (the
+                        // method of the reference overrides the one of
+                        // `BlockFlower`) and the number of the spread is
+                        // drawn first.
+                        let spread = rng.next_i32_bound(100) == 0;
+                        if spread && self.mechanics.mushroom_spread {
                             let tx = wx + rng.next_i32_bound(3) - 1;
                             let ty = y + rng.next_i32_bound(2) - rng.next_i32_bound(2);
                             let tz = wz + rng.next_i32_bound(3) - 1;
@@ -3353,6 +3344,32 @@ mod tests {
             }
         }
         world
+    }
+
+    /// The repeater is connected to the wire from one side only.
+    ///
+    /// Java `BlockRedstoneWire.c`: the repeater is connected to the wire
+    /// from the side `BedBlockTextures.b[meta & 3]` only, so the wire
+    /// feeds the repeater from the right side and there are no feedback
+    /// loops.
+    #[test]
+    fn the_repeater_is_connected_to_the_wire_from_one_side_only() {
+        let mut world = make_flat_world();
+        world.set_block(0, 64, 0, blocks::REPEATER_OFF);
+        world.java_set_data(0, 64, 0, 0);
+        // The side of the repeater is the direction 2 (`BedBlockTextures.b`).
+        assert!(
+            world.can_wire_connect(0, 64, 0, 2),
+            "the wire is connected to the repeater from the right side"
+        );
+        assert!(
+            !world.can_wire_connect(0, 64, 0, 4),
+            "the wire is not connected to the repeater from the other side"
+        );
+        assert!(
+            !world.can_wire_connect(0, 64, 0, 1),
+            "the wire is not connected to the repeater from the sides"
+        );
     }
 
     /// The random tick releases the pressed button.
