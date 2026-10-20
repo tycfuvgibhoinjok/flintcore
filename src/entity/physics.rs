@@ -251,6 +251,30 @@ fn contains_fluid_block(world: &World, aabb: &Aabb, water: bool) -> bool {
     false
 }
 
+/// The number of the blocks of the given kind in the box shrunk by 0.001.
+///
+/// Java `Entity.move()`: every block of the box of the entity shrunk by
+/// 0.001 is visited and the method of the block is called.
+pub fn count_blocks(world: &World, aabb: &Aabb, id: u8) -> u32 {
+    let min_x = (aabb.min_x + 0.001).floor() as i32;
+    let min_y = (aabb.min_y + 0.001).floor() as i32;
+    let min_z = (aabb.min_z + 0.001).floor() as i32;
+    let max_x = (aabb.max_x - 0.001).floor() as i32;
+    let max_y = (aabb.max_y - 0.001).floor() as i32;
+    let max_z = (aabb.max_z - 0.001).floor() as i32;
+    let mut count = 0;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                if world.get_block(x, y, z) == id {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Java `World.c(AxisAlignedBB)`: is there a liquid in the box?
 ///
 /// The reference checks the water and the lava.
@@ -661,8 +685,6 @@ pub fn move_entity(
         let fallback_z = moved_z;
         let fallback_box = *aabb;
 
-        moved_x = original_x;
-        moved_z = original_z;
         *aabb = start_box;
 
         collect_collision_boxes(
@@ -695,7 +717,12 @@ pub fn move_entity(
             down = obstacle.clip_y(aabb, down);
         }
         aabb.offset(0.0, down, 0.0);
+        // The movement of the step is the movement of the mob
+        // (`Entity.move()`: the values of the step are the values of the
+        // movement).
+        moved_x = step_x;
         moved_y = down;
+        moved_z = step_z;
 
         if fallback_x * fallback_x + fallback_z * fallback_z
             >= moved_x * moved_x + moved_z * moved_z

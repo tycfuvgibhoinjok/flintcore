@@ -293,6 +293,9 @@ pub struct Mob {
     pub in_water: bool,
     /// Java `Entity.bA`: the mob is in the water.
     pub in_lava: bool,
+    /// Java `Entity.bf`: the mob is in a web, the movement of the next
+    /// tick is damped (`Entity.move()`).
+    pub web: bool,
     /// Java `Entity.positionChanged`: the last movement changed the position.
     pub position_changed: bool,
     /// Java `Entity.br`: the offset between the box of the mob and its
@@ -462,6 +465,7 @@ impl Mob {
             horiz_collided: false,
             in_water: false,
             in_lava: false,
+            web: false,
             position_changed: false,
             step_offset: 0.0,
             move_strafe: 0.0,
@@ -665,13 +669,29 @@ impl Mob {
             }
         }
 
+        // The web (`Entity.move()`): the movement is damped and the
+        // velocity of the mob is set to zero when the flag is set. The flag
+        // is set by `BlockWeb.a` at the end of the previous movement.
+        let mut req_x = self.mot_x;
+        let mut req_y = self.mot_y;
+        let mut req_z = self.mot_z;
+        if self.web {
+            self.web = false;
+            req_x *= 0.25;
+            req_y *= 0.05;
+            req_z *= 0.25;
+            self.mot_x = 0.0;
+            self.mot_y = 0.0;
+            self.mot_z = 0.0;
+        }
+
         // The movement (`Entity.move`).
         let result = move_entity(
             world,
             &mut aabb,
-            self.mot_x,
-            self.mot_y,
-            self.mot_z,
+            req_x,
+            req_y,
+            req_z,
             0.5,
             self.step_offset,
             self.on_ground,
@@ -685,7 +705,7 @@ impl Mob {
         self.step_offset = result.step_offset;
         self.on_ground = result.on_ground;
         self.position_changed = result.position_changed;
-        self.horiz_collided = result.moved_x != self.mot_x || result.moved_z != self.mot_z;
+        self.horiz_collided = result.moved_x != req_x || result.moved_z != req_z;
 
         // The animation of the walk (`EntityLiving.v()`): the time of the
         // animation of the hit follows the speed of the mob, and the
@@ -699,6 +719,12 @@ impl Mob {
         }
         self.attack_anim += (walk - self.attack_anim) * 0.4;
         self.walk_dist += self.attack_anim;
+
+        // The web (`BlockWeb.a`): the flag is set when the box of the mob
+        // holds a web, the movement of the next tick is damped then.
+        if crate::entity::physics::count_blocks(world, &aabb, blocks::WEB) > 0 {
+            self.web = true;
+        }
 
         // The fall distance (`Entity.a(double, boolean)`).
         let mut fall_damage = 0.0;
@@ -714,13 +740,13 @@ impl Mob {
         }
 
         // The velocity of the blocked axes is dropped.
-        if result.moved_x != self.mot_x {
+        if result.moved_x != req_x {
             self.mot_x = 0.0;
         }
-        if result.moved_y != self.mot_y {
+        if result.moved_y != req_y {
             self.mot_y = 0.0;
         }
-        if result.moved_z != self.mot_z {
+        if result.moved_z != req_z {
             self.mot_z = 0.0;
         }
 

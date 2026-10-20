@@ -6417,23 +6417,7 @@ impl Server {
     /// Java `Entity.move()`: every block of the box shrunk by 0.001 is
     /// visited and the cactus damages the entity once each.
     fn count_cactuses(&self, box_: &Aabb) -> u32 {
-        let min_x = (box_.min_x + 0.001).floor() as i32;
-        let min_y = (box_.min_y + 0.001).floor() as i32;
-        let min_z = (box_.min_z + 0.001).floor() as i32;
-        let max_x = (box_.max_x - 0.001).floor() as i32;
-        let max_y = (box_.max_y - 0.001).floor() as i32;
-        let max_z = (box_.max_z - 0.001).floor() as i32;
-        let mut count = 0;
-        for x in min_x..=max_x {
-            for y in min_y..=max_y {
-                for z in min_z..=max_z {
-                    if self.world.get_block(x, y, z) == blocks::CACTUS {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        count
+        crate::entity::physics::count_blocks(&self.world, box_, blocks::CACTUS)
     }
 
     /// Java `Entity.collide(Entity)`: the two entities push each other
@@ -12615,6 +12599,44 @@ mod tests {
             server.entity_random.draws - before >= 2,
             "the sound of the attack of the slime draws two numbers"
         );
+    }
+
+    /// The mob in a web is slowed down.
+    ///
+    /// Java `Entity.move()`: the flag `bf` is set by `BlockWeb.a` when the
+    /// box of the mob holds a web, and the movement of the next tick is
+    /// damped (`d0 *= 0.25`, `d1 *= 0.05`, `d2 *= 0.25`) and the velocity
+    /// of the mob is set to zero.
+    #[test]
+    fn the_mob_in_a_web_is_slowed_down() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.x = 0.5;
+            mob.y = 64.0;
+            mob.z = 0.5;
+            mob.mot_x = 0.2;
+        }
+        // The web is in the box of the mob.
+        server.world.set_block(0, 64, 0, blocks::WEB);
+        // The first tick: the flag of the web is set at the end of the
+        // movement, the mob still moves.
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        eprintln!(
+            "web={} mot_x={} mot_y={} x={} on_ground={} pos_changed={}",
+            mob.web, mob.mot_x, mob.mot_y, mob.x, mob.on_ground, mob.position_changed
+        );
+        assert!(mob.web, "the mob is in a web");
+        assert!(mob.mot_x > 0.0, "the mob still moves in the first tick");
+
+        // The second tick: the movement is damped and the velocity of the
+        // mob is set to zero.
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.mot_x, 0.0, "the velocity of the mob is set to zero");
+        // The flag is set again at the end of the movement, the mob is
+        // still in the web.
+        assert!(mob.web, "the mob is still in the web");
     }
 
     /// The mobs push each other away.
