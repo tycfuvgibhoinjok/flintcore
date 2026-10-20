@@ -185,10 +185,10 @@ Mob movement parity harness:
   Build and run it as described in `tools/poseidon_mobs/README.md`.
 - The traces are the golden file `tests/golden/poseidon_mob_traces.txt`; the
   test `the_mob_movement_matches_the_poseidon_reference` in `src/server.rs`
-  reproduces the eight scenarios and compares them tick by tick. The test is
+  reproduces the sixteen scenarios and compares them tick by tick. The test is
   `#[ignore]`d (it is slow), the test
-  `the_mob_scenarios_of_the_reference_match` compares the same eight scenarios
-  and runs in the normal test suite.
+  `the_mob_scenarios_of_the_reference_match` compares the same sixteen
+  scenarios and runs in the normal test suite.
 - The port follows the reference classes one by one: `AxisAlignedBB` and
   `Entity.move` (`src/entity/physics.rs`), `EntityLiving.a(float, float)`
   (the acceleration, the drag and the jump), `Pathfinder`/`Path` (the A* with
@@ -225,8 +225,8 @@ Mob movement parity harness:
   | `wolf`    | **300 ticks (all)**   | - |
   | `pigzombie` | **300 ticks (all)** | - |
   | `giant`   | **300 ticks (all)**   | - |
-  | `creeper` | 50 ticks              | the acceleration of the creeper |
-  | `skeleton`| 1 tick                | the bow of the skeleton |
+  | `creeper` | **300 ticks (all)**   | - |
+  | `skeleton`| **300 ticks (all)**   | - |
 
   The harness has the scenarios of every mob of the reference: the pig, the
   zombie, the spider, the slime, the squid, the ghast, the creeper, the
@@ -286,6 +286,25 @@ Mob movement parity harness:
     world when the counter of the death passes twenty. The harness of the
     reference prints the frozen state of the mob after that, the port does
     the same.
+  - The flag `EntityLiving.e` ("the mob sees its target") is reset at the
+    beginning of the artificial intelligence (`EntityCreature.c_()`) and the
+    attack of the creeper and of the skeleton sets it. It has two effects: the
+    path of the mob is not computed again while the flag is set, and the mob
+    that follows a path looks straight at its target and walks sideways
+    (`EntityCreature.c_()`: the yaw is the direction of the target and the
+    inputs of the movement are the projection of the forward input on the new
+    yaw). The attack of the mob happens **before** the path of the mob, so
+    the order of the draws of the random numbers depends on it.
+  - The arrow of the skeleton draws six normal values: three in the
+    constructor of the arrow and three in its direction (`EntityArrow.a`).
+    The values of the constructor are overwritten by the direction, but they
+    are drawn, so they shift the stream of the random numbers.
+  - The explosion of the creeper happens inside its attack, before the
+    movement of the mob (`EntityCreeper.a`): the mob falls into the hole of
+    the explosion in the same tick. The source of the explosion is not
+    damaged by it (`World.b(Entity, AxisAlignedBB)` skips the source) and
+    the creeper dies without a corpse: the world removes it at the beginning
+    of its next tick (`World.tickEntities`).
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.

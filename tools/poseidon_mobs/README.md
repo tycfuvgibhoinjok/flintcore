@@ -22,7 +22,8 @@ The reference sources have to be compiled once into `target/poseidon_classes`
 javac -nowarn -cp "target/poseidon_classes:.references/Project-Poseidon/libs/*" \
     -d target/poseidon_classes tools/poseidon_mobs/PoseidonMobTrace.java
 
-for s in flat chase water wall lava slime squid ghast; do
+for s in flat chase water wall lava slime squid ghast \
+         creeper skeleton chicken cow sheep wolf pigzombie giant; do
   java -cp "target/poseidon_classes:.references/Project-Poseidon/libs/*" \
     flintcore.test.PoseidonMobTrace $s 12345 /tmp/mob_traces/$s.txt 300
 done
@@ -75,10 +76,15 @@ header of the golden file documents the command).
   does.
 - A mob that died is not updated any more: the world removes the dead
   entities at the end of its tick (`World.tickEntities`), so the harness
-  stops the mob when the counter of the death (`EntityLiving.deathTicks`)
-  passes twenty and prints the frozen state of the mob. The flag `dead` of
-  the entity cannot be used: the monsters of the harness die at once
-  (`EntityMonster.m_()`: the world of the harness is in the peaceful mode).
+  stops the mob when the flag `Entity.dead` is set and prints the frozen
+  state of the mob. The flag cannot be used before the fix of the harness:
+  the monsters of the harness died at once (`EntityMonster.m_()`: the world
+  of the harness was in the peaceful mode), so the harness sets
+  `world.spawnMonsters = 1` now.
+- The player of the harness is invulnerable: it is created without the
+  constructor, so it has no connection and it can not send the packet of the
+  damage (`EntityPlayer.a(Statistic, int)`). The explosion of a creeper
+  would break the harness otherwise.
 - The floor of the scenarios is grass: the animals score the blocks of their
   walk with the grass below them (`EntityAnimal.a`), so the goal of the walk
   does not depend on the light.

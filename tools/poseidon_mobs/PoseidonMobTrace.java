@@ -224,6 +224,11 @@ public class PoseidonMobTrace {
         world.isLoading = true;
         world.manager = new PlayerManager(ms, 0, 10);
         world.random = new Random(seed);
+        // The monsters of the world live (`EntityMonster.m_()`): the world of
+        // the harness is in the peaceful mode, so every monster would die at
+        // the beginning of its first tick and the flag `Entity.dead` could
+        // not be used to detect the death of a mob.
+        world.spawnMonsters = 1;
         // The entity tracker broadcasts the damage and the death packets.
         world.tracker = new EntityTracker(ms, 0);
 
@@ -260,6 +265,12 @@ public class PoseidonMobTrace {
         // a mob ignores a target without health.
         player.id = 1000;
         player.health = 20;
+        // The player of the harness has no connection, so it can not send the
+        // packet of the damage. The player is invulnerable, the explosion of
+        // a creeper would break the harness otherwise.
+        Field hurtResistance = EntityPlayer.class.getDeclaredField("bM");
+        hurtResistance.setAccessible(true);
+        hurtResistance.setInt(player, 1000);
         world.addEntity(player);
         return player;
     }
@@ -524,8 +535,8 @@ public class PoseidonMobTrace {
             }
         }
         if (System.getenv("FLINT_HEALTH") != null) {
-            System.err.printf(java.util.Locale.ROOT, "HEALTH %d health=%d noDamage=%d lastDamage=%d fire=%d%n",
-                tick, mob.health, mob.noDamageTicks, mob.lastDamage, mob.fireTicks);
+            System.err.printf(java.util.Locale.ROOT, "HEALTH %d health=%d noDamage=%d lastDamage=%d fire=%d dead=%s deathTicks=%d%n",
+                tick, mob.health, mob.noDamageTicks, mob.lastDamage, mob.fireTicks, mob.dead, mob.deathTicks);
         }
         if (System.getenv("FLINT_JUMP") != null) {
             try {
@@ -751,9 +762,10 @@ public class PoseidonMobTrace {
                 // once it left the world.
                 if (in_world) {
                     mob.m_();
-                    if (mob.deathTicks > 20) {
-                        // `EntityLiving.die()`: the world removes the entity
-                        // at the end of its tick.
+                    if (mob.dead) {
+                        // `Entity.die()`: the world removes the entity at the
+                        // end of its tick. The creeper that explodes dies the
+                        // same way, its health does not change.
                         in_world = false;
                     }
                 }

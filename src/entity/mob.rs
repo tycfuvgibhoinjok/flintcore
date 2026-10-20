@@ -285,6 +285,10 @@ pub struct Mob {
     pub move_strafe: f32,
     /// Java `EntityLiving.aA`: the forward movement input.
     pub move_forward: f32,
+    /// Java `EntityLiving.e`: the mob sees its target. The flag is reset at
+    /// the beginning of the artificial intelligence (`EntityCreature.c_()`)
+    /// and the attack of the creeper and of the skeleton sets it.
+    pub sees_target: bool,
     /// Java `EntityLiving.aC`: the mob wants to jump.
     pub jump_flag: bool,
     /// Java `EntityLiving.aB`: the drift of the yaw while the mob looks
@@ -298,6 +302,10 @@ pub struct Mob {
     pub look_ticks: i32,
     pub velocity_changed: bool,
     pub dead: bool,
+    /// Java `Entity.dead`: the world removes the entity at the beginning of
+    /// its next tick (`World.tickEntities`). The creeper that explodes dies
+    /// this way, its health does not change.
+    pub removed: bool,
     /// Java `EntityLiving.deathTicks`: the number of the ticks the corpse of
     /// the mob lives. The mob leaves the world when the counter passes
     /// twenty.
@@ -434,6 +442,7 @@ impl Mob {
             step_offset: 0.0,
             move_strafe: 0.0,
             move_forward: 0.0,
+            sees_target: false,
             jump_flag: false,
             yaw_drift: 0.0,
             idle_sound_ticks: 0,
@@ -441,6 +450,7 @@ impl Mob {
             look_ticks: 0,
             velocity_changed: false,
             dead: false,
+            removed: false,
             death_ticks: 0,
             no_despawn_ticks: 0,
             target_id: None,
@@ -809,6 +819,19 @@ impl Mob {
     /// from the players? Every mob can, except the tamed wolf.
     pub fn can_despawn(&self) -> bool {
         !(self.mob_type == MobType::Wolf && self.wolf_tamed)
+    }
+
+    /// Java `EntityCreature.w()`: the value of the flag `EntityLiving.e` at
+    /// the beginning of the artificial intelligence.
+    ///
+    /// Only the wolf overrides the method of the reference: the flag is true
+    /// when the wolf sits or begs for the food. The begging is not
+    /// implemented in the port, so only the sitting wolf has the flag.
+    pub fn reference_sees_target(&self) -> bool {
+        match self.mob_type {
+            MobType::Wolf => self.wolf_sitting,
+            _ => false,
+        }
     }
 
     pub fn held_item(&self) -> Option<ItemStack> {

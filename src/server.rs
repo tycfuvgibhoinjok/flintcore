@@ -4810,6 +4810,21 @@ impl Server {
 
     fn tick_mobs(&mut self) {
         let active_dimension = self.active_dimension;
+        // The world removes the dead entities at the beginning of its tick
+        // (`World.tickEntities`), so the mob that died in the explosion of a
+        // creeper leaves the world now.
+        let removed: Vec<i32> = self
+            .entities
+            .iter_mobs()
+            .filter(|m| m.removed)
+            .map(|m| m.entity_id)
+            .collect();
+        for mob_id in removed {
+            let _ = self.entities.remove_mob(mob_id);
+            for out in self.tracker.untrack_mob(mob_id) {
+                self.send_tracked(out.recipient_id, out.packet);
+            }
+        }
         // The corpses of the dead mobs leave the world at the end of the tick
         // in which they die (`World.tickEntities` removes the dead entities
         // after the update of the entities).
@@ -4849,7 +4864,6 @@ impl Server {
         let mut melee_hits_mob = Vec::new();
         let mut arrows_to_shoot = Vec::new();
         let mut fireballs_to_shoot = Vec::new();
-        let mut creeper_explosions = Vec::new();
         let mut status_packets = Vec::new();
         let mut burned_mobs = Vec::new();
         // The collision boxes of the other entities and the scratch buffer of
@@ -5095,6 +5109,152 @@ impl Server {
                 None
             };
 
+            let has_los = target_pos.is_some_and(|(_, _, tx, ty, tz)| {
+                self.world
+                    .ray_trace((mx, my + 1.0, mz), (tx, ty + 1.0, tz), false)
+                    .is_none()
+            });
+
+            // The attack of the mob (`EntityCreature.c_()`): the melee, the
+            // fuse of the creeper and the bow of the skeleton. The reference
+            // attacks before the path of the mob, the attack of the creeper
+            // and of the skeleton sets the flag of the mob that sees its
+            // target (`EntityLiving.e`).
+            //
+            // The explosion of the creeper happens inside the attack, before
+            // the movement of the mob: the mob falls into the hole of the
+            // explosion in the same tick.
+            let mut creeper_explosion: Option<(f64, f64, f64, f32)> = None;
+            if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                // The flag of the mob that sees its target
+                // (`EntityCreature.c_()`): it is reset at the beginning of
+                // the artificial intelligence.
+                mob.sees_target = mob.reference_sees_target();
+                if let Some((tid, is_player, tx, ty, tz)) = target_pos {
+                    let dx = tx - mob.x;
+                    let dy = ty - mob.y;
+                    let dz = tz - mob.z;
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+                    match mob.mob_type {
+                        MobType::Creeper => {
+                            // The fuse of the creeper (`EntityCreeper.a`):
+                            // it burns while the target is near.
+                            if (mob.creeper_state > 0 && dist < 7.0)
+                                || (mob.creeper_state <= 0 && dist < 3.0)
+                            {
+                                mob.creeper_state = 1;
+                                mob.creeper_fuse += 1;
+                                // The mob sees its target
+                                // (`EntityCreeper.a`).
+                                mob.sees_target = true;
+                                if mob.creeper_fuse >= 30 {
+                                    let radius: f32 = if mob.creeper_powered { 6.0 } else { 3.0 };
+                                    // The creeper dies in the explosion
+                                    // (`EntityCreeper.a`): its health does not
+                                    // change, the world removes the entity at
+                                    // the beginning of its next tick
+                                    // (`World.tickEntities`).
+                                    mob.removed = true;
+                                    creeper_explosion = Some((mob.x, mob.y, mob.z, radius));
+                                }
+                            } else {
+                                mob.creeper_state = -1;
+                                if mob.creeper_fuse > 0 {
+                                    mob.creeper_fuse -= 1;
+                                }
+                            }
+                        }
+                        MobType::Skeleton => {
+                            // The bow of the skeleton (`EntitySkeleton.a`):
+                            // the mob shoots only when it sees its target.
+                            if dist < 10.0 && has_los {
+                                if mob.attack_ticks == 0 {
+                                    // The arrow of the reference: the
+                                    // constructor of the arrow and its
+                                    // direction draw three normal values
+                                    // each (`EntityArrow.a`).
+                                    let spread: Vec<f64> = (0..6)
+                                        .map(|_| self.entity_random.next_gaussian())
+                                        .collect();
+                                    arrows_to_shoot.push((
+                                        mob_id,
+                                        mob.x,
+                                        mob.y + 1.0,
+                                        mob.z,
+                                        dx,
+                                        (ty + 1.4) - (mob.y + 1.2),
+                                        dz,
+                                        spread,
+                                    ));
+                                    mob.attack_ticks = 30;
+                                }
+                                // The yaw of the mob is the direction of the
+                                // target (`EntitySkeleton.a`).
+                                mob.yaw = (crate::util::fdlibm::atan2(dz, dx) * 180.0
+                                    / crate::entity::mob::JAVA_PI_DOUBLE)
+                                    as f32
+                                    - 90.0;
+                                // The mob sees its target
+                                // (`EntitySkeleton.a`).
+                                mob.sees_target = true;
+                            }
+                        }
+                        MobType::Spider | MobType::Wolf => {
+                            if has_los
+                                && dist > 2.0
+                                && dist < 6.0
+                                && mob.on_ground
+                                && self.entity_random.next_i32_bound(10) == 0
+                            {
+                                let h = (dx * dx + dz * dz).sqrt().max(0.01);
+                                mob.mot_x = dx / h * 0.4 + mob.mot_x * 0.2;
+                                mob.mot_z = dz / h * 0.4 + mob.mot_z * 0.2;
+                                mob.mot_y = 0.4;
+                            } else if has_los
+                                && dist < 2.0
+                                && dy.abs() < 2.0
+                                && mob.attack_ticks <= 0
+                            {
+                                mob.attack_ticks = 20;
+                                let dmg =
+                                    mob.mob_type.attack_damage(mob.slime_size, mob.wolf_tamed);
+                                if is_player {
+                                    melee_hits_player.push((tid, dmg, mob.x, mob.z));
+                                } else {
+                                    melee_hits_mob.push((tid, dmg, mob_id, mob.x, mob.z));
+                                }
+                            }
+                        }
+                        _ => {
+                            let dmg = mob.mob_type.attack_damage(mob.slime_size, mob.wolf_tamed);
+                            if has_los
+                                && dmg > 0
+                                && dist < 2.0
+                                && dy.abs() < 2.0
+                                && mob.attack_ticks <= 0
+                            {
+                                mob.attack_ticks = 20;
+                                if is_player {
+                                    melee_hits_player.push((tid, dmg, mob.x, mob.z));
+                                } else {
+                                    melee_hits_mob.push((tid, dmg, mob_id, mob.x, mob.z));
+                                }
+                            }
+                        }
+                    }
+                } else if mob.mob_type == MobType::Creeper && mob.creeper_fuse > 0 {
+                    mob.creeper_state = -1;
+                    mob.creeper_fuse -= 1;
+                }
+            }
+            // The explosion of the creeper (`EntityCreeper.a`): the blocks of
+            // the blast are destroyed before the movement of the mob.
+            if let Some((ex, ey, ez, radius)) = creeper_explosion {
+                let allow_blocks = self.config.mechanics.creeper_block_damage;
+                self.create_explosion_ex(ex, ey, ez, radius, false, allow_blocks, Some(mob_id));
+            }
+
             // Compute A* path when needed
             let mut new_path: Option<Vec<(i32, i32, i32)>> = None;
             let mut teleport_to_owner: Option<(f64, f64, f64)> = None;
@@ -5174,71 +5334,18 @@ impl Server {
                         .entities
                         .get_mob(mob_id)
                         .is_some_and(|m| !m.path.is_empty());
-                if let Some((tid, is_player, tx, ty, tz)) = target_pos {
-                    // The path to the target: it is computed when the path is
-                    // missing or when the roll of the reference hits.
-                    let should_repath = !has_path || self.entity_random.next_i32_bound(20) == 0;
-                    if should_repath {
-                        new_path = Some(find_path(
-                            &self.world,
-                            mx,
-                            my + step_offset as f64,
-                            mz,
-                            length,
-                            width,
-                            tx,
-                            self.target_box_bottom(tid, is_player, ty),
-                            tz,
-                            16.0,
-                        ));
-                        path_to_target = true;
-                    }
-                }
-                if !path_to_target {
-                    // The walk of the mob (`EntityCreature.B()`).
-                    let has_path = new_path.is_some()
-                        || self
-                            .entities
-                            .get_mob(mob_id)
-                            .is_some_and(|m| !m.path.is_empty());
-                    let wander = self.entities.get_mob_mut(mob_id).is_some_and(|m| {
-                        !m.wolf_sitting
-                            && ((!has_path && self.entity_random.next_i32_bound(80) == 0)
-                                || self.entity_random.next_i32_bound(80) == 0)
-                    });
-                    if wander {
-                        // The goal of the walk: the best of ten candidates.
-                        let mut wander_goal = None;
-                        if let Some(m) = self.entities.get_mob_mut(mob_id) {
-                            let mut best_score = -99999.0f32;
-                            for _ in 0..10 {
-                                let rx = (m.x + (self.entity_random.next_i32_bound(13) - 6) as f64)
-                                    .floor() as i32;
-                                let ry = (m.y + (self.entity_random.next_i32_bound(7) - 3) as f64)
-                                    .floor() as i32;
-                                let rz = (m.z + (self.entity_random.next_i32_bound(13) - 6) as f64)
-                                    .floor() as i32;
-                                // The score of a block (`EntityAnimal.a` and
-                                // `EntityMonster.a`): the light of the block
-                                // goes through the curve of the reference.
-                                let light =
-                                    light_curve(chunk_light_at(&self.world, rx, ry, rz, sky_sub));
-                                let score = if m.mob_type.is_animal() {
-                                    if self.world.get_block(rx, ry - 1, rz) == blocks::GRASS {
-                                        10.0
-                                    } else {
-                                        light - 0.5
-                                    }
-                                } else {
-                                    0.5 - light
-                                };
-                                if score > best_score {
-                                    best_score = score;
-                                    wander_goal = Some((rx, ry, rz));
-                                }
-                            }
-                        }
-                        if let Some((gx, gy, gz)) = wander_goal {
+                // The flag of the mob that sees its target
+                // (`EntityLiving.e`).
+                let sees_target = self.entities.get_mob(mob_id).is_some_and(|m| m.sees_target);
+                // The mob that attacked its target does not walk to it
+                // again (`EntityCreature.c_()`): the flag of the mob that
+                // sees its target blocks the path and the walk.
+                if !sees_target {
+                    if let Some((tid, is_player, tx, ty, tz)) = target_pos {
+                        // The path to the target: it is computed when the path is
+                        // missing or when the roll of the reference hits.
+                        let should_repath = !has_path || self.entity_random.next_i32_bound(20) == 0;
+                        if should_repath {
                             new_path = Some(find_path(
                                 &self.world,
                                 mx,
@@ -5246,21 +5353,85 @@ impl Server {
                                 mz,
                                 length,
                                 width,
-                                gx as f64 + 0.5,
-                                gy as f64 + 0.5,
-                                gz as f64 + 0.5,
-                                10.0,
+                                tx,
+                                self.target_box_bottom(tid, is_player, ty),
+                                tz,
+                                16.0,
                             ));
+                            path_to_target = true;
+                        }
+                    }
+                    if !path_to_target {
+                        // The walk of the mob (`EntityCreature.B()`).
+                        let has_path = new_path.is_some()
+                            || self
+                                .entities
+                                .get_mob(mob_id)
+                                .is_some_and(|m| !m.path.is_empty());
+                        let wander = self.entities.get_mob_mut(mob_id).is_some_and(|m| {
+                            !m.wolf_sitting
+                                && ((!has_path && self.entity_random.next_i32_bound(80) == 0)
+                                    || self.entity_random.next_i32_bound(80) == 0)
+                        });
+                        if wander {
+                            // The goal of the walk: the best of ten candidates.
+                            let mut wander_goal = None;
+                            if let Some(m) = self.entities.get_mob_mut(mob_id) {
+                                let mut best_score = -99999.0f32;
+                                for _ in 0..10 {
+                                    let rx =
+                                        (m.x + (self.entity_random.next_i32_bound(13) - 6) as f64)
+                                            .floor() as i32;
+                                    let ry =
+                                        (m.y + (self.entity_random.next_i32_bound(7) - 3) as f64)
+                                            .floor() as i32;
+                                    let rz =
+                                        (m.z + (self.entity_random.next_i32_bound(13) - 6) as f64)
+                                            .floor() as i32;
+                                    // The score of a block (`EntityAnimal.a` and
+                                    // `EntityMonster.a`): the light of the block
+                                    // goes through the curve of the reference.
+                                    let light = light_curve(chunk_light_at(
+                                        &self.world,
+                                        rx,
+                                        ry,
+                                        rz,
+                                        sky_sub,
+                                    ));
+                                    let score = if m.mob_type.is_animal() {
+                                        if self.world.get_block(rx, ry - 1, rz) == blocks::GRASS {
+                                            10.0
+                                        } else {
+                                            light - 0.5
+                                        }
+                                    } else {
+                                        0.5 - light
+                                    };
+                                    if score > best_score {
+                                        best_score = score;
+                                        wander_goal = Some((rx, ry, rz));
+                                    }
+                                }
+                            }
+                            if let Some((gx, gy, gz)) = wander_goal {
+                                new_path = Some(find_path(
+                                    &self.world,
+                                    mx,
+                                    my + step_offset as f64,
+                                    mz,
+                                    length,
+                                    width,
+                                    gx as f64 + 0.5,
+                                    gy as f64 + 0.5,
+                                    gz as f64 + 0.5,
+                                    10.0,
+                                ));
+                            }
                         }
                     }
                 }
             }
 
-            let has_los = target_pos.is_some_and(|(_, _, tx, ty, tz)| {
-                self.world
-                    .ray_trace((mx, my + 1.0, mz), (tx, ty + 1.0, tz), false)
-                    .is_none()
-            });
             let in_rain = self.world.is_being_rained_on(
                 mx.floor() as i32,
                 my.floor() as i32,
@@ -5516,106 +5687,6 @@ impl Server {
                             }
                         }
                         _ => {
-                            // Target engagement (Melee / Creeper fuse / Skeleton bow / Spider & Wolf leap)
-                            if let Some((tid, is_player, tx, ty, tz)) = target_pos {
-                                let dx = tx - mob.x;
-                                let dy = ty - mob.y;
-                                let dz = tz - mob.z;
-                                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-
-                                match mob.mob_type {
-                                    MobType::Creeper => {
-                                        if has_los
-                                            && ((mob.creeper_state > 0 && dist < 7.0) || dist < 3.0)
-                                        {
-                                            mob.creeper_state = 1;
-                                            mob.creeper_fuse += 1;
-                                            if mob.creeper_fuse >= 30 {
-                                                let radius =
-                                                    if mob.creeper_powered { 6.0 } else { 3.0 };
-                                                mob.dead = true;
-                                                creeper_explosions
-                                                    .push((mob_id, mob.x, mob.y, mob.z, radius));
-                                            }
-                                        } else {
-                                            mob.creeper_state = -1;
-                                            if mob.creeper_fuse > 0 {
-                                                mob.creeper_fuse -= 1;
-                                            }
-                                        }
-                                    }
-                                    MobType::Skeleton => {
-                                        if dist < 10.0 && has_los && mob.attack_ticks == 0 {
-                                            // The arrow of the reference
-                                            // (`EntitySkeleton.a`): the
-                                            // constructor of the arrow and its
-                                            // spread draw twelve normal
-                                            // values.
-                                            let spread: Vec<f64> = (0..12)
-                                                .map(|_| self.entity_random.next_gaussian())
-                                                .collect();
-                                            arrows_to_shoot.push((
-                                                mob_id,
-                                                mob.x,
-                                                mob.y + 1.0,
-                                                mob.z,
-                                                dx,
-                                                (ty + 1.4) - (mob.y + 1.2),
-                                                dz,
-                                                spread,
-                                            ));
-                                            mob.attack_ticks = 30;
-                                        }
-                                    }
-                                    MobType::Spider | MobType::Wolf => {
-                                        if dist > 2.0
-                                            && dist < 6.0
-                                            && mob.on_ground
-                                            && self.entity_random.next_i32_bound(10) == 0
-                                        {
-                                            let h = (dx * dx + dz * dz).sqrt().max(0.01);
-                                            mob.mot_x = dx / h * 0.4 + mob.mot_x * 0.2;
-                                            mob.mot_z = dz / h * 0.4 + mob.mot_z * 0.2;
-                                            mob.mot_y = 0.4;
-                                        } else if dist < 2.0
-                                            && dy.abs() < 2.0
-                                            && mob.attack_ticks <= 0
-                                        {
-                                            mob.attack_ticks = 20;
-                                            let dmg = mob
-                                                .mob_type
-                                                .attack_damage(mob.slime_size, mob.wolf_tamed);
-                                            if is_player {
-                                                melee_hits_player.push((tid, dmg, mob.x, mob.z));
-                                            } else {
-                                                melee_hits_mob
-                                                    .push((tid, dmg, mob_id, mob.x, mob.z));
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        let dmg = mob
-                                            .mob_type
-                                            .attack_damage(mob.slime_size, mob.wolf_tamed);
-                                        if dmg > 0
-                                            && dist < 2.0
-                                            && dy.abs() < 2.0
-                                            && mob.attack_ticks <= 0
-                                        {
-                                            mob.attack_ticks = 20;
-                                            if is_player {
-                                                melee_hits_player.push((tid, dmg, mob.x, mob.z));
-                                            } else {
-                                                melee_hits_mob
-                                                    .push((tid, dmg, mob_id, mob.x, mob.z));
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if mob.mob_type == MobType::Creeper && mob.creeper_fuse > 0 {
-                                mob.creeper_state = -1;
-                                mob.creeper_fuse -= 1;
-                            }
                             // The path following (`EntityCreature.c_()`).
                             //
                             // The mob walks to the next point of the path, turns at
@@ -5678,6 +5749,29 @@ impl Server {
                                         // The forward input of the mob (`EntityLiving.aA`).
                                         mob.move_forward =
                                             mob.mob_type.move_speed(mob.target_id.is_some());
+                                        // The mob that sees its target looks
+                                        // straight at it and walks sideways
+                                        // (`EntityCreature.c_()`).
+                                        if mob.sees_target {
+                                            if let Some((_, _, tx, _, tz)) = target_pos {
+                                                let d4 = tx - mob.x;
+                                                let d5 = tz - mob.z;
+                                                let f4 = mob.yaw;
+                                                // The reference uses the
+                                                // `Math.atan2` of the JDK.
+                                                mob.yaw = (crate::util::fdlibm::atan2(d5, d4)
+                                                    * 180.0
+                                                    / crate::entity::mob::JAVA_PI_DOUBLE)
+                                                    as f32
+                                                    - 90.0;
+                                                let f3 = (f4 - mob.yaw + 90.0)
+                                                    * std::f32::consts::PI
+                                                    / 180.0;
+                                                mob.move_strafe =
+                                                    -crate::util::math::sin(f3) * mob.move_forward;
+                                                mob.move_forward *= crate::util::math::cos(f3);
+                                            }
+                                        }
                                         if dy > 0.0 {
                                             jump = true;
                                         }
@@ -6044,15 +6138,6 @@ impl Server {
                 vy,
                 vz,
             );
-        }
-
-        for (creeper_id, cx, cy, cz, radius) in creeper_explosions {
-            let _ = self.entities.remove_mob(creeper_id);
-            for out in self.tracker.untrack_mob(creeper_id) {
-                self.send_tracked(out.recipient_id, out.packet);
-            }
-            let allow_blocks = self.config.mechanics.creeper_block_damage;
-            self.create_explosion_ex(cx, cy, cz, radius, false, allow_blocks);
         }
     }
 
@@ -6911,7 +6996,7 @@ impl Server {
 
         for (fx, fy, fz) in fireball_explosions {
             let allow_blocks = self.config.mechanics.ghast_block_damage;
-            self.create_explosion_ex(fx, fy, fz, 1.0, true, allow_blocks);
+            self.create_explosion_ex(fx, fy, fz, 1.0, true, allow_blocks, None);
         }
     }
 
@@ -7006,7 +7091,7 @@ impl Server {
                 self.send_tracked(out.recipient_id, out.packet);
             }
             let allow_blocks = self.config.mechanics.tnt_block_damage;
-            self.create_explosion_ex(tx, ty, tz, 4.0, false, allow_blocks);
+            self.create_explosion_ex(tx, ty, tz, 4.0, false, allow_blocks, None);
         }
     }
 
@@ -7987,9 +8072,15 @@ impl Server {
 
     /// Java `Explosion.java` — 16x16x16 raycast block destruction, entity damage/knockback, and `Packet60Explosion`.
     pub fn create_explosion(&mut self, ex: f64, ey: f64, ez: f64, radius: f32, set_fire: bool) {
-        self.create_explosion_ex(ex, ey, ez, radius, set_fire, true);
+        self.create_explosion_ex(ex, ey, ez, radius, set_fire, true, None);
     }
 
+    /// The explosion of the reference (`Explosion.java`).
+    ///
+    /// The source of the explosion is not damaged by it: the list of the
+    /// entities of the blast skips the source (`World.b(Entity,
+    /// AxisAlignedBB)`).
+    #[allow(clippy::too_many_arguments)]
     pub fn create_explosion_ex(
         &mut self,
         ex: f64,
@@ -7998,6 +8089,7 @@ impl Server {
         radius: f32,
         set_fire: bool,
         allow_block_damage: bool,
+        source_mob: Option<i32>,
     ) {
         let mut destroyed_blocks = HashSet::new();
         let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
@@ -8106,6 +8198,9 @@ impl Server {
 
         let mob_ids: Vec<i32> = self.entities.iter_mobs().map(|m| m.entity_id).collect();
         for mid in mob_ids {
+            if source_mob == Some(mid) {
+                continue;
+            }
             let dist_info = self.entities.get_mob(mid).and_then(|m| {
                 if m.dead {
                     return None;
@@ -10922,11 +11017,27 @@ fn random_look(
         // The mob turns towards the player (`EntityLiving.a(Entity, float,
         // float)`): the limit of the turn is 10 degrees and the limit of the
         // pitch is `EntityLiving.u()`.
-        if let Some(&(_, _, px, py, pz, _)) = players.iter().find(|&&(id, ..)| id == pid) {
-            look_at(mob, px, py, pz, PLAYER_EYE_HEIGHT, 10.0, 40.0);
+        let mut drop = false;
+        match players.iter().find(|&&(id, ..)| id == pid) {
+            Some(&(_, _, px, py, pz, dead)) => {
+                look_at(mob, px, py, pz, PLAYER_EYE_HEIGHT, 10.0, 40.0);
+                // The mob stops looking at the player when the player is dead
+                // or too far away (`EntityLiving.c_()`).
+                if dead || (px - mob.x).powi(2) + (py - mob.y).powi(2) + (pz - mob.z).powi(2) > 64.0
+                {
+                    drop = true;
+                }
+            }
+            None => drop = true,
+        }
+        // The counter of the ticks the mob looks at the player
+        // (`EntityLiving.aF`): the counter is checked before it is
+        // decremented.
+        if mob.look_ticks <= 0 {
+            drop = true;
         }
         mob.look_ticks -= 1;
-        if mob.look_ticks <= 0 {
+        if drop {
             mob.look_target = None;
         }
     } else {
@@ -11303,6 +11414,8 @@ mod tests {
             "slime",
             "squid",
             "ghast",
+            "creeper",
+            "skeleton",
             "chicken",
             "cow",
             "sheep",
@@ -11389,12 +11502,31 @@ mod tests {
         scenarios
     }
 
-    /// The traces of the port have to be the traces of the reference, tick by
-    /// tick and without a tolerance.
+    /// The draws of the shared random of the entities, tick by tick.
     ///
-    /// The golden traces are produced by the reference itself
-    /// (`tools/poseidon_mobs`), the scenario is ignored by default because it
-    /// needs the traces of the reference (they are in the repository).
+    /// The reference prints the same trace with the option
+    /// `-Dflint.trace.rng=1` (`tools/poseidon_mobs/PoseidonMobTrace.java`).
+    #[test]
+    #[ignore = "temp debug"]
+    fn dump_rng_trace() {
+        let scenario = std::env::var("MOB_SCENARIO").unwrap_or_else(|_| "skeleton".to_string());
+        let ticks: usize = std::env::var("MOB_TICKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let (mut server, _mob_id) = mob_scenario_server(&scenario);
+        server.entity_random.trace = true;
+        for tick in 0..ticks {
+            server.entity_random.trace_values.clear();
+            server.tick_mobs();
+            println!(
+                "RNG t={tick} n={} {:?}",
+                server.entity_random.trace_values.len(),
+                server.entity_random.trace_values
+            );
+        }
+    }
+
     #[test]
     #[ignore = "temp debug"]
     fn mob_trace_dump() {
@@ -11415,7 +11547,18 @@ mod tests {
                     }
                 }
                 println!("{sb}");
-                println!("IDLE {tick} a={}", mob.idle_sound_ticks);
+                println!(
+                    "IDLE {tick} a={} jump={} posch={} og={} moty={} step={} y={} path={} idx={}",
+                    mob.idle_sound_ticks,
+                    mob.jump_flag,
+                    mob.position_changed,
+                    mob.on_ground,
+                    mob.mot_y,
+                    mob.step_offset,
+                    mob.y,
+                    mob.path.len(),
+                    mob.path_index
+                );
             }
         }
     }
