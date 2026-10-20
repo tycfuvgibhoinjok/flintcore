@@ -4865,7 +4865,6 @@ impl Server {
         let mut arrows_to_shoot = Vec::new();
         let mut fireballs_to_shoot = Vec::new();
         let mut status_packets = Vec::new();
-        let mut burned_mobs = Vec::new();
         // The collision boxes of the other entities and the scratch buffer of
         // the collision boxes of the blocks (`World.getEntities`).
         let mut entity_boxes: Vec<Aabb> = Vec::new();
@@ -5453,6 +5452,10 @@ impl Server {
             // (`EntityLiving.a(float, float)`).
             let mut was_on_ground = false;
             let mut fall_damage = 0.0f32;
+            // The damage of the fall and of the cactus, they are applied
+            // after the movement of the mob.
+            let mut fall_hit: i16 = 0;
+            let mut cactus_hit = false;
             if let Some(mob) = self.entities.get_mob_mut(mob_id) {
                 pre_y = mob.y;
                 pre_mot_y = mob.mot_y;
@@ -5470,36 +5473,8 @@ impl Server {
                     mob.path_index = 0;
                 }
 
-                if mob.y < -64.0 {
-                    burned_mobs.push(mob_id);
-                }
-
-                let bx = mob.x.floor() as i32;
-                let by = mob.y.floor() as i32;
-                let bz = mob.z.floor() as i32;
-                let cur_block = self.world.get_block(bx, by, bz);
-                if cur_block == blocks::CACTUS {
-                    burned_mobs.push(mob_id);
-                }
-
-                let head_y = (mob.y + mob.eye_height()).floor() as i32;
-                if (0..128).contains(&head_y) {
-                    let head_block = self.world.get_block(bx, head_y, bz);
-                    if blocks::is_opaque_cube(head_block) {
-                        burned_mobs.push(mob_id);
-                    }
-                    if mob.mob_type != MobType::Squid {
-                        if blocks::is_water(head_block) {
-                            mob.air_ticks -= 1;
-                            if mob.air_ticks <= -20 {
-                                mob.air_ticks = 0;
-                                burned_mobs.push(mob_id);
-                            }
-                        } else {
-                            mob.air_ticks = 300;
-                        }
-                    }
-                }
+                // The void of the mob is handled in the update of the mob
+                // (`Entity.R()`).
 
                 // Wolf water shaking (`EntityWolf.v()`, `m_()`)
                 if mob.mob_type == MobType::Wolf {
@@ -5999,13 +5974,29 @@ impl Server {
                     }
                 }
 
-                // The fall damage of the mob (`EntityLiving.b(float)`).
+                // The fall damage of the mob (`EntityLiving.a(float)`): the
+                // reference hits the mob once with all the damage.
                 if fall_damage > 3.0 {
-                    let fdmg = ((fall_damage - 3.0).ceil() as i32).max(0);
-                    for _ in 0..fdmg {
-                        burned_mobs.push(mob_id);
-                    }
+                    fall_hit = ((fall_damage - 3.0).ceil() as i32).max(0) as i16;
                 }
+                // The cactus (`BlockCactus.a`): the mob inside a cactus takes
+                // one point of damage. The reference applies it in the
+                // collision of the movement, after the fall damage.
+                let bx = mob.x.floor() as i32;
+                let by = mob.y.floor() as i32;
+                let bz = mob.z.floor() as i32;
+                if self.world.get_block(bx, by, bz) == blocks::CACTUS {
+                    cactus_hit = true;
+                }
+            }
+
+            // The fall damage and the cactus of the mob (`Entity.move()`):
+            // the reference applies them in the collision of the movement.
+            if fall_hit > 0 {
+                let _ = self.damage_mob(mob_id, fall_hit, None, false);
+            }
+            if cactus_hit {
+                let _ = self.damage_mob(mob_id, 1, None, false);
             }
 
             if left_the_world {
@@ -6076,10 +6067,6 @@ impl Server {
                 entity_id,
                 status,
             }));
-        }
-
-        for mob_id in burned_mobs {
-            let _ = self.damage_mob(mob_id, 1, None, false);
         }
 
         for (pid, dmg, ax, az) in melee_hits_player {
@@ -6330,6 +6317,12 @@ impl Server {
             }
         }
 
+        // The void (`Entity.R()`): the mob below the world takes four points
+        // of damage (`EntityLiving.Y()`).
+        if self.entities.get_mob(mob_id).is_some_and(|m| m.y < -64.0) {
+            self.damage_mob(mob_id, 4, None, false);
+        }
+
         // The idle sound of the mob (`EntityLiving.R()`): the reference draws a
         // random number every tick of every living entity.
         {
@@ -6357,6 +6350,80 @@ impl Server {
                 if name.is_some() {
                     let _ = self.entity_random.next_f32();
                     let _ = self.entity_random.next_f32();
+                }
+            }
+        }
+
+        // The suffocation of the mob (`EntityLiving.R()`): the head of the
+        // mob is inside a block, the mob takes one point of damage.
+        {
+            let head = self.entities.get_mob(mob_id).map(|m| {
+                (
+                    m.x.floor() as i32,
+                    (m.y + m.eye_height()).floor() as i32,
+                    m.z.floor() as i32,
+                )
+            });
+            if let Some((hx, hy, hz)) = head {
+                if (0..128).contains(&hy) {
+                    let head_block = self.world.get_block(hx, hy, hz);
+                    if blocks::is_opaque_cube(head_block) {
+                        self.damage_mob(mob_id, 1, None, false);
+                    }
+                }
+            }
+        }
+
+        // The fire of a mob that is immune to it (`EntityLiving.R()`).
+        if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+            if mob.fire_proof() {
+                mob.fire_ticks = 0;
+            }
+        }
+
+        // The drowning of the mob (`EntityLiving.R()`): the air of the mob
+        // runs out, the mob makes eight bubbles and takes two points of
+        // damage.
+        {
+            let head = self.entities.get_mob(mob_id).map(|m| {
+                (
+                    m.x.floor() as i32,
+                    (m.y + m.eye_height()).floor() as i32,
+                    m.z.floor() as i32,
+                    m.mob_type == MobType::Squid,
+                )
+            });
+            if let Some((hx, hy, hz, breathes)) = head {
+                if (0..128).contains(&hy) && !breathes {
+                    let head_block = self.world.get_block(hx, hy, hz);
+                    if blocks::is_water(head_block) {
+                        let mut drown = false;
+                        if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                            mob.air_ticks -= 1;
+                            if mob.air_ticks == -20 {
+                                mob.air_ticks = 0;
+                                drown = true;
+                            }
+                        }
+                        if drown {
+                            // The bubbles of the drowning: eight times three
+                            // pairs of numbers.
+                            for _ in 0..8 {
+                                for _ in 0..3 {
+                                    let _ = self.entity_random.next_f32();
+                                    let _ = self.entity_random.next_f32();
+                                }
+                            }
+                            self.damage_mob(mob_id, 2, None, false);
+                            if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                                mob.fire_ticks = 0;
+                            }
+                        }
+                    } else if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                        mob.air_ticks = 300;
+                    }
+                } else if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                    mob.air_ticks = 300;
                 }
             }
         }
@@ -11397,6 +11464,82 @@ mod tests {
             ));
         }
         lines
+    }
+
+    /// The fall damage of a mob is one hit of all the damage.
+    ///
+    /// Java `EntityLiving.a(float)`: the damage is
+    /// `(int) Math.ceil(fall - 3.0F)` and the mob is hit once, so the window
+    /// of the invulnerability of the reference does not swallow it.
+    #[test]
+    fn the_fall_damage_of_a_mob_is_one_hit() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        // The mob falls from the height of ten blocks.
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.y = 74.0;
+            mob.mot_y = 0.0;
+            mob.fall_distance = 0.0;
+        }
+        for _ in 0..60 {
+            server.tick_mobs();
+        }
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        // The pig has ten points of health, `ceil(10 - 3)` of them are gone.
+        assert_eq!(mob.health, 3);
+    }
+
+    /// The mob below the world takes four points of damage.
+    ///
+    /// Java `Entity.R()` calls `EntityLiving.Y()`, which is four points of
+    /// damage.
+    #[test]
+    fn the_void_damage_of_a_mob_is_four() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.y = -70.0;
+        }
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        // The pig has ten points of health, four of them are gone.
+        assert_eq!(mob.health, 6);
+    }
+
+    /// The drowning of a mob takes two points of damage.
+    ///
+    /// Java `EntityLiving.R()`: the air of the mob runs out, the mob makes
+    /// eight bubbles and takes two points of damage.
+    #[test]
+    fn the_drowning_of_a_mob_hurts_it_twice() {
+        let (mut server, mob_id) = mob_scenario_server("water");
+        // The head of the mob is under the water.
+        for y in 64..=66 {
+            server.world.set_block(0, y, 0, blocks::STATIONARY_WATER);
+        }
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.x = 0.5;
+            mob.y = 64.0;
+            mob.z = 0.5;
+            // The air of the mob runs out at the next tick.
+            mob.air_ticks = -19;
+        }
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert_eq!(mob.health, 18);
+    }
+
+    /// The suffocation of a mob takes one point of damage.
+    ///
+    /// Java `EntityLiving.R()`: the head of the mob is inside a block.
+    #[test]
+    fn the_suffocation_of_a_mob_hurts_it_once() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        // The head of the mob is inside a block: the pig is 0.9 blocks high,
+        // so the head of the mob is in the block of its feet.
+        server.world.set_block(0, 64, 0, blocks::STONE);
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        // The pig has ten points of health, one of them is gone.
+        assert_eq!(mob.health, 9);
     }
 
     /// The traces of the port have to be the traces of the reference, tick by
