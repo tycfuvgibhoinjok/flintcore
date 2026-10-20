@@ -61,6 +61,15 @@ pub enum WorldEvent {
         y: i32,
         z: i32,
     },
+    /// The sound with its name (the packet 41 of the protocol of 1.7.3).
+    NamedSound {
+        name: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        volume: f32,
+        pitch: f32,
+    },
 }
 
 /// Java `RedstoneUpdateInfo`: tracks redstone torch toggle timestamps for burnout (>= 8 toggles in 100 ticks).
@@ -802,7 +811,11 @@ impl World {
             self.java_set_type_id(x, y, z, blocks::AIR);
         }
         let fuse = if short_fuse {
-            10 + (self.live_time.abs() as i32 % 20)
+            // The fuse of the TNT destroyed by the explosion
+            // (`BlockTNT.d`): the number is drawn from the random of the
+            // world, the fuse of the entity is eighty ticks.
+            let fuse = 80;
+            self.world_random.next_i32_bound(fuse / 4) + fuse / 8
         } else {
             80
         };

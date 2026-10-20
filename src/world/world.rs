@@ -6,6 +6,7 @@ use rayon::prelude::*;
 
 use crate::config::{FixesConfig, MechanicsConfig, SpawningConfig, WorldConfig, WorldgenConfig};
 use crate::gameplay::blocks;
+use crate::gameplay::items::ItemStack;
 use crate::net::packets::chunk::{MapChunk, PreChunk};
 use crate::util::rng::JavaRandom;
 use crate::util::{Error, Result};
@@ -14,6 +15,7 @@ use crate::world::chunk::{Chunk, ChunkPos, ChunkState, CHUNK_HEIGHT};
 use crate::world::decorate::GenWorld;
 use crate::world::generator::{Generator, HellGenerator};
 use crate::world::lighting::{LightType, LightingWorld};
+use crate::world::redstone::WorldEvent;
 use crate::world::storage::{ChunkLoader, LevelData, RegionFileCache, SessionLock};
 
 thread_local! {
@@ -2713,12 +2715,40 @@ impl World {
         let target = self.get_block(x, y, z);
         if target > 0 {
             if lava {
-                // BlockFluids.h fizz sound (world.random x2).
-                let _ = self.world_random.next_f32();
-                let _ = self.world_random.next_f32();
+                // `BlockFluids.h`: the sound of the fizz. The tone is the
+                // difference of two numbers of the random of the world, the
+                // eight smoke particles of the reference use the random of
+                // the system and are not sent.
+                let pitch =
+                    2.6f32 + (self.world_random.next_f32() - self.world_random.next_f32()) * 0.8f32;
+                self.world_events.push(WorldEvent::NamedSound {
+                    name: "random.fizz".to_string(),
+                    x: x as f64 + 0.5,
+                    y: y as f64 + 0.5,
+                    z: z as f64 + 0.5,
+                    volume: 0.5,
+                    pitch,
+                });
             } else {
-                // Block.g -> dropNaturally (world.random; drops are entities).
+                // `Block.g` -> `dropNaturally`: the block that is displaced
+                // by the water drops its item. The number of the drops and
+                // the item itself are drawn from the random of the world.
                 trace_rng3!(x, y, z);
+                let data = self.get_data(x, y, z);
+                let count = blocks::drop_count(target, &mut self.world_random);
+                for _ in 0..count {
+                    if self.world_random.next_f32() < 1.0 {
+                        let item_id = blocks::drop_item_id(target, data, &mut self.world_random);
+                        if item_id > 0 {
+                            self.world_events.push(WorldEvent::DropItem {
+                                x: x as f64,
+                                y: y as f64,
+                                z: z as f64,
+                                item: ItemStack::new(item_id, 1, blocks::drop_damage(target, data)),
+                            });
+                        }
+                    }
+                }
             }
         }
         self.java_set_type_id_and_data(x, y, z, id, level as u8);

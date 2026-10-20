@@ -8754,6 +8754,23 @@ impl Server {
                 WorldEvent::LightningStrike { x, y, z } => {
                     self.handle_lightning_strike(x, y, z);
                 }
+                WorldEvent::NamedSound {
+                    name,
+                    x,
+                    y,
+                    z,
+                    volume,
+                    pitch,
+                } => {
+                    self.broadcast(Clientbound::NamedSound(NamedSound {
+                        name,
+                        x,
+                        y,
+                        z,
+                        volume: f64::from(volume),
+                        pitch: f64::from(pitch),
+                    }));
+                }
             }
         }
     }
@@ -13027,6 +13044,81 @@ mod tests {
         assert!(
             positions.iter().any(|p| p.1 > 3),
             "the ray leaves the world above"
+        );
+    }
+
+    /// The fuse of the TNT destroyed by the explosion is drawn from the
+    /// random of the world.
+    ///
+    /// Java `BlockTNT.d`: the fuse is `world.random.nextInt(20) + 10`, so
+    /// two TNT of the same explosion do not have the same fuse and the fuse
+    /// does not depend on the time of the world.
+    #[test]
+    fn the_fuse_of_the_tnt_of_the_explosion_is_drawn_from_the_random() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.world.set_block(2, 64, 0, blocks::TNT);
+        server.world.set_block(-2, 64, 0, blocks::TNT);
+        server.create_explosion_ex(0.5, 64.0, 0.5, 4.0, false, true, None);
+        let fuses: Vec<i32> = server
+            .entities
+            .iter_primed_tnts()
+            .map(|tnt| tnt.fuse)
+            .collect();
+        assert_eq!(fuses.len(), 2, "the two TNT are primed");
+        for fuse in &fuses {
+            assert!(
+                (10..30).contains(fuse),
+                "the fuse is between ten and thirty ticks ({})",
+                fuse
+            );
+        }
+        assert_ne!(
+            fuses[0], fuses[1],
+            "the fuses are drawn from the random of the world"
+        );
+    }
+
+    /// The lava makes the sound of the fizz when it spreads.
+    ///
+    /// Java `BlockFlowing.flow` and `BlockFluids.h`: the lava that spreads
+    /// into a block makes the sound of the fizz, the tone is the difference
+    /// of two numbers of the random of the world.
+    #[test]
+    fn the_lava_makes_the_sound_of_the_fizz_when_it_spreads() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        // The lava flows into the water (`BlockFlowing.l`): the water is not
+        // the material of the lava and it is not solid.
+        server.world.set_block(0, 64, 0, blocks::STATIONARY_LAVA);
+        server.world.set_block(1, 64, 0, blocks::STATIONARY_WATER);
+        let mut rng = JavaRandom::new(12345);
+        server.world.java_fluid_tick(0, 64, 0, &mut rng, true);
+        let fizz = server.world.world_events.iter().any(
+            |event| matches!(event, WorldEvent::NamedSound { name, .. } if name == "random.fizz"),
+        );
+        assert!(fizz, "the lava makes the sound of the fizz");
+    }
+
+    /// The water drops the block it displaces.
+    ///
+    /// Java `BlockFlowing.flow`: the block that is displaced by the water
+    /// drops its item (`Block.g` -> `dropNaturally`) and the number of the
+    /// drops is drawn from the random of the world.
+    #[test]
+    fn the_water_drops_the_block_it_displaces() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        // The water flows into the flower: the flower is not solid.
+        server.world.set_block(0, 64, 0, blocks::STATIONARY_WATER);
+        server.world.set_block(1, 64, 0, blocks::YELLOW_FLOWER);
+        let mut rng = JavaRandom::new(12345);
+        server.world.java_fluid_tick(0, 64, 0, &mut rng, false);
+        let dropped = server.world.world_events.iter().any(|event| {
+            matches!(event, WorldEvent::DropItem { item, .. } if item.id == blocks::YELLOW_FLOWER as i16)
+        });
+        assert!(dropped, "the flower is dropped");
+        assert_eq!(
+            server.world.get_block(1, 64, 0),
+            blocks::WATER,
+            "the flower is replaced by the water"
         );
     }
 

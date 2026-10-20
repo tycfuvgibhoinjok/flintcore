@@ -633,6 +633,27 @@ pub fn is_liquid(id: u8) -> bool {
 ///
 /// The table is the one of the reference (the tool
 /// `tools/poseidon_mobs/BlockMaterial.java` prints it).
+///
+/// It is the same table as `is_solid`: the function is kept for the
+/// readability of the call sites that speak about the material.
+pub fn material_is_solid(id: u8) -> bool {
+    is_solid(id)
+}
+
+/// Java `Material.isBuildable()`: the material of the block can be built
+/// on.
+///
+/// In this reference the method has the same value as `Material.isSolid()`
+/// (both are overridden by `MaterialLogic`, `MaterialLiquid`,
+/// `MaterialPortal` and `MaterialTransparent`).
+pub fn material_is_buildable(id: u8) -> bool {
+    is_solid(id)
+}
+
+/// Java `Material.isSolid()`: the material of the block is solid.
+///
+/// The table is the one of the reference (the tool
+/// `tools/poseidon_mobs/BlockMaterial.java` prints it).
 pub fn is_solid(id: u8) -> bool {
     matches!(
         id,
@@ -712,47 +733,6 @@ pub fn is_water(id: u8) -> bool {
 
 pub fn is_lava(id: u8) -> bool {
     matches!(id, LAVA | STATIONARY_LAVA)
-}
-
-/// Java `Material.isSolid()`: false for air, liquids, plants, logic blocks
-/// (torches, wire, ladders, snow layer, ...) and transparent blocks (fire, portal).
-pub fn material_is_solid(id: u8) -> bool {
-    !matches!(
-        id,
-        AIR | WATER
-            | STATIONARY_WATER
-            | LAVA
-            | STATIONARY_LAVA
-            | SAPLING
-            | TALL_GRASS
-            | DEAD_BUSH
-            | YELLOW_FLOWER
-            | RED_ROSE
-            | BROWN_MUSHROOM
-            | RED_MUSHROOM
-            | CROPS
-            | TORCH
-            | FIRE
-            | REDSTONE_WIRE
-            | LADDER
-            | LEVER
-            | STONE_PLATE
-            | WOOD_PLATE
-            | REDSTONE_TORCH_OFF
-            | REDSTONE_TORCH_ON
-            | STONE_BUTTON
-            | SNOW
-            | PORTAL
-            | REPEATER_OFF
-            | REPEATER_ON
-    )
-}
-
-/// Java `Material.isBuildable()`. For every material reachable during world
-/// generation it matches `material_is_solid()` (MaterialLiquid, MaterialLogic
-/// and MaterialTransparent override both to false).
-pub fn material_is_buildable(id: u8) -> bool {
-    material_is_solid(id)
 }
 
 pub fn is_ice(id: u8) -> bool {
