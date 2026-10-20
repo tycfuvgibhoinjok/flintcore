@@ -8809,7 +8809,7 @@ impl Server {
                                 }
                                 let id = self.world.get_block(bx, by, bz);
                                 if id != blocks::AIR {
-                                    let res = Self::block_blast_resistance(id);
+                                    let res = blocks::explosion_resistance(id);
                                     power -= (res + 0.3) * 0.3;
                                 }
                                 if power > 0.0 && id != blocks::BEDROCK {
@@ -9017,28 +9017,6 @@ impl Server {
             ^ (bx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (by as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
             ^ (bz as u64).wrapping_mul(0x1656_67B1_9E37_79F9)) as i64
-    }
-
-    fn block_blast_resistance(id: u8) -> f32 {
-        match id {
-            blocks::BEDROCK => 18_000_000.0,
-            blocks::OBSIDIAN => 2000.0,
-            blocks::WATER | blocks::STATIONARY_WATER | blocks::LAVA | blocks::STATIONARY_LAVA => {
-                100.0
-            }
-            blocks::STONE
-            | blocks::COBBLESTONE
-            | blocks::MOSSY_COBBLESTONE
-            | blocks::BRICK
-            | blocks::DOUBLE_STEP
-            | blocks::STEP
-            | blocks::COBBLESTONE_STAIRS
-            | blocks::IRON_BLOCK
-            | blocks::GOLD_BLOCK
-            | blocks::DIAMOND_BLOCK => 6.0,
-            blocks::FURNACE | blocks::LIT_FURNACE | blocks::DISPENSER => 3.5,
-            _ => blocks::hardness(id).max(0.0),
-        }
     }
 
     fn block_intersects_any_player(&self, block_id: u8, x: i32, y: i32, z: i32) -> bool {

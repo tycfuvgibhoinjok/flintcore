@@ -467,6 +467,44 @@ pub fn is_normal_cube(id: u8) -> bool {
     is_opaque_cube(id) && !matches!(id, LEAVES | CHEST)
 }
 
+/// Java `Block.a(Entity)`: the resistance of the block to the explosion.
+///
+/// The resistance is the durability of the block divided by five, the
+/// table is the one of the reference (the tool
+/// `tools/poseidon_mobs/BlockExplosionResistance.java` prints it).
+pub fn explosion_resistance(id: u8) -> f32 {
+    match id {
+        BEDROCK => 3600000.0,
+        OBSIDIAN => 1200.0,
+        WATER | STATIONARY_WATER | STATIONARY_LAVA => 100.0,
+        STONE | COBBLESTONE | GOLD_BLOCK | IRON_BLOCK | DOUBLE_STEP | STEP | BRICK
+        | MOSSY_COBBLESTONE | DIAMOND_BLOCK | COBBLESTONE_STAIRS | JUKEBOX => 6.0,
+        MOB_SPAWNER | IRON_DOOR => 5.0,
+        WEB => 4.0,
+        DISPENSER | FURNACE | LIT_FURNACE => 3.5,
+        WOOD_PLANKS | GOLD_ORE | IRON_ORE | COAL_ORE | LAPIS_ORE | LAPIS_BLOCK | WOOD_STAIRS
+        | DIAMOND_ORE | WOODEN_DOOR | REDSTONE_ORE | LIT_REDSTONE_ORE | FENCE | TRAPDOOR => 3.0,
+        CHEST | WORKBENCH => 2.5,
+        LOG => 2.0,
+        BOOKSHELF => 1.5,
+        SIGN | WALL_SIGN | PUMPKIN | JACK_O_LANTERN => 1.0,
+        SANDSTONE | NOTE_BLOCK | WOOL => 0.8,
+        POWERED_RAIL | DETECTOR_RAIL | RAIL => 0.7,
+        GRASS | GRAVEL | SPONGE | FARMLAND | CLAY => 0.6,
+        DIRT | SAND | STICKY_PISTON | PISTON | PISTON_HEAD | LEVER | STONE_PLATE | WOOD_PLATE
+        | STONE_BUTTON | ICE | SOUL_SAND | CAKE => 0.5,
+        LADDER | CACTUS | NETHERRACK => 0.4,
+        GLASS | GLOWSTONE => 0.3,
+        LEAVES | BED | SNOW_BLOCK => 0.2,
+        SNOW => 0.1,
+        SAPLING | LAVA | TALL_GRASS | DEAD_BUSH | PISTON_MOVING | YELLOW_FLOWER | RED_ROSE
+        | BROWN_MUSHROOM | RED_MUSHROOM | TNT | TORCH | FIRE | REDSTONE_WIRE | CROPS
+        | REDSTONE_TORCH_OFF | REDSTONE_TORCH_ON | REED | PORTAL | REPEATER_OFF | REPEATER_ON
+        | LOCKED_CHEST => 0.0,
+        _ => 0.0,
+    }
+}
+
 /// Java `Block.t[]`: the block notifies the clients when its data changes.
 ///
 /// The table is the one of the reference (`tools/poseidon_mobs/BlockTable.java`
@@ -982,6 +1020,27 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 90, "the table of the reference is complete");
+
+        // The table of the resistance to the explosion.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/block_explosion_resistance.txt");
+        let table = std::fs::read_to_string(&path).expect("the table of the resistance");
+        let mut checked = 0;
+        for line in table.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(id) = parts.next().and_then(|v| v.parse::<u8>().ok()) else {
+                continue;
+            };
+            let value: f32 = parts.nth(1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            assert_eq!(
+                explosion_resistance(id),
+                value,
+                "the resistance to the explosion of the block {}",
+                id
+            );
+            checked += 1;
+        }
+        assert!(checked > 90, "the table of the resistance is complete");
     }
 
     /// The table of the random ticks is the table of the reference.
