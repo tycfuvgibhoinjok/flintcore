@@ -791,16 +791,17 @@ impl StepSound {
     }
 }
 
+/// The sound of the step of a block (`Block.stepSound`).
+///
+/// The reference sets the sound of the step only for the pistons (the
+/// sound of the stone with the pitch 1.5) and for the stairs (the sound
+/// of the block they are made of), every other block has the sound of
+/// the stone.
 pub fn step_sound(block_id: u8) -> StepSound {
     match block_id {
-        STONE | COBBLESTONE | MOSSY_COBBLESTONE | SANDSTONE | OBSIDIAN | GOLD_BLOCK
-        | IRON_BLOCK | LAPIS_BLOCK | DISPENSER | NOTE_BLOCK | DOUBLE_STEP | STEP | BRICK
-        | BOOKSHELF => StepSound::new("step.stone", 1.0, 1.0),
-        GRASS | FARMLAND => StepSound::new("step.grass", 1.0, 1.0),
-        SAND | SOUL_SAND => StepSound::new("step.sand", 1.0, 1.0),
-        WOOD_PLANKS | LOG => StepSound::new("step.wood", 1.0, 1.0),
-        GRAVEL => StepSound::new("step.gravel", 1.0, 1.0),
-        WOOL | SNOW | SNOW_BLOCK | CACTUS | CAKE => StepSound::new("step.cloth", 1.0, 1.0),
+        STICKY_PISTON | PISTON | PISTON_HEAD | PISTON_MOVING => {
+            StepSound::new("step.stone", 1.0, 1.5)
+        }
         _ => StepSound::new("step.stone", 1.0, 1.0),
     }
 }

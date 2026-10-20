@@ -6089,6 +6089,28 @@ impl Server {
             // between the movement of the mob and the rest of its update.
             self.mob_fire_phase(mob_id);
 
+            // The sound of the step of the mob (`Entity.move()`).
+            if let Some((name, volume, pitch)) =
+                self.entities.get_mob(mob_id).and_then(|mob| mob.step_sound)
+            {
+                let (x, y, z) = self
+                    .entities
+                    .get_mob(mob_id)
+                    .map(|mob| (mob.x, mob.y, mob.z))
+                    .unwrap_or((0.0, 0.0, 0.0));
+                self.broadcast(Clientbound::NamedSound(NamedSound {
+                    name: name.to_string(),
+                    x,
+                    y,
+                    z,
+                    volume: f64::from(volume),
+                    pitch: f64::from(pitch),
+                }));
+                if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                    mob.step_sound = None;
+                }
+            }
+
             // The pushing of the entities (`EntityLiving.v()`): it is the
             // last thing the reference does with the mob.
             self.push_mobs(mob_id);
@@ -6707,8 +6729,20 @@ impl Server {
         if fizz {
             // The sound of the fizz (`Entity.move()`): the pitch and the
             // volume are two numbers.
-            let _ = self.entity_random.next_f32();
-            let _ = self.entity_random.next_f32();
+            let pitch = (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.4 + 1.6;
+            let (x, y, z) = self
+                .entities
+                .get_mob(mob_id)
+                .map(|mob| (mob.x, mob.y, mob.z))
+                .unwrap_or((0.0, 0.0, 0.0));
+            self.broadcast(Clientbound::NamedSound(NamedSound {
+                name: "random.fizz".to_string(),
+                x,
+                y,
+                z,
+                volume: 0.7,
+                pitch: f64::from(pitch),
+            }));
         }
     }
 
@@ -6762,9 +6796,29 @@ impl Server {
                 mob.fire_ticks = 0;
             }
             if splash {
-                // The sound of the splash: two numbers.
-                let _ = self.entity_random.next_f32();
-                let _ = self.entity_random.next_f32();
+                // The sound of the splash (`Entity.R()`): the volume is the
+                // speed of the mob and the pitch is the difference of the two
+                // numbers of the stream.
+                let (mx, my, mz, vx, vy, vz) = self
+                    .entities
+                    .get_mob(mob_id)
+                    .map(|mob| (mob.x, mob.y, mob.z, mob.mot_x, mob.mot_y, mob.mot_z))
+                    .unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+                let mut volume =
+                    crate::util::math::math_helper_a(vx * vx * 0.2 + vy * vy + vz * vz * 0.2) * 0.2;
+                if volume > 1.0 {
+                    volume = 1.0;
+                }
+                let pitch =
+                    (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.4 + 1.0;
+                self.broadcast(Clientbound::NamedSound(NamedSound {
+                    name: "random.splash".to_string(),
+                    x: mx,
+                    y: my,
+                    z: mz,
+                    volume: f64::from(volume),
+                    pitch: f64::from(pitch),
+                }));
                 // The bubbles of the splash: three numbers each.
                 let particles = 1.0f32 + size.0 * 20.0f32;
                 let mut index = 0;
@@ -6856,9 +6910,24 @@ impl Server {
                     .get_mob(mob_id)
                     .map(|mob| mob.idle_sound_name(&mut self.entity_random))
                     .unwrap_or(None);
-                if name.is_some() {
-                    let _ = self.entity_random.next_f32();
-                    let _ = self.entity_random.next_f32();
+                if let Some(name) = name {
+                    // The pitch of the sound (`EntityLiving.Q()`): the
+                    // difference of the two numbers of the stream.
+                    let pitch =
+                        (self.entity_random.next_f32() - self.entity_random.next_f32()) * 0.2 + 1.0;
+                    let (volume, x, y, z) = self
+                        .entities
+                        .get_mob(mob_id)
+                        .map(|mob| (mob.sound_volume(), mob.x, mob.y, mob.z))
+                        .unwrap_or((1.0, 0.0, 0.0, 0.0));
+                    self.broadcast(Clientbound::NamedSound(NamedSound {
+                        name: name.to_string(),
+                        x,
+                        y,
+                        z,
+                        volume: f64::from(volume),
+                        pitch: f64::from(pitch),
+                    }));
                 }
             }
         }
@@ -12781,6 +12850,29 @@ mod tests {
             "the flow of the water pushes the mob to the X ({})",
             mob.mot_x
         );
+    }
+
+    /// The mob plays the sound of the step when it walks.
+    ///
+    /// Java `Entity.move()`: the distance of the walk is accumulated and
+    /// the sound of the step is played when the distance passes the
+    /// counter of the steps.
+    #[test]
+    fn the_mob_plays_the_sound_of_the_step() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        // The mob walks on the ground.
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.mot_x = 0.1;
+        }
+        for _ in 0..20 {
+            server.tick_mobs();
+        }
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(
+            mob.walk_accum > 0.0,
+            "the mob accumulates the distance of the walk"
+        );
+        assert!(mob.step_counter > 0, "the mob plays the sound of the step");
     }
 
     /// The mobs push each other away.

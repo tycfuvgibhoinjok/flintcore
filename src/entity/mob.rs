@@ -296,6 +296,14 @@ pub struct Mob {
     /// Java `Entity.bf`: the mob is in a web, the movement of the next
     /// tick is damped (`Entity.move()`).
     pub web: bool,
+    /// Java `Entity.bm`: the distance the mob walked, the sound of the step
+    /// is played when the distance passes the counter of the steps.
+    pub walk_accum: f32,
+    /// Java `Entity.b`: the counter of the steps of the mob.
+    pub step_counter: i32,
+    /// The sound of the step of the last movement: the name, the volume and
+    /// the pitch. The server sends it to the clients.
+    pub step_sound: Option<(&'static str, f32, f32)>,
     /// Java `Entity.positionChanged`: the last movement changed the position.
     pub position_changed: bool,
     /// Java `Entity.br`: the offset between the box of the mob and its
@@ -466,6 +474,9 @@ impl Mob {
             in_water: false,
             in_lava: false,
             web: false,
+            walk_accum: 0.0,
+            step_counter: 0,
+            step_sound: None,
             position_changed: false,
             step_offset: 0.0,
             move_strafe: 0.0,
@@ -601,6 +612,8 @@ impl Mob {
         let mut aabb = self.aabb();
         // The position of the mob before the movement (`EntityLiving.a`).
         let y_before = self.y;
+        let x_before = self.x;
+        let z_before = self.z;
 
         // The squid has its own movement (`EntitySquid.a(float, float)`): it
         // only moves, without the acceleration, the gravity and the drag of
@@ -726,6 +739,32 @@ impl Mob {
             self.web = true;
         }
 
+        // The sound of the step (`Entity.move()`): the distance of the
+        // walk is accumulated and the sound is played when the distance
+        // passes the counter of the steps.
+        self.walk_accum += crate::util::math::math_helper_a(
+            (self.x - x_before) * (self.x - x_before) + (self.z - z_before) * (self.z - z_before),
+        ) * 0.6;
+        let below_x = self.x.floor() as i32;
+        // The height of the entity (`Entity.height`) is zero for the mobs.
+        let below_y = (self.y - 0.2).floor() as i32;
+        let below_z = self.z.floor() as i32;
+        let mut below = world.get_block(below_x, below_y, below_z);
+        if world.get_block(below_x, below_y - 1, below_z) == blocks::FENCE {
+            below = blocks::FENCE;
+        }
+        if self.walk_accum > self.step_counter as f32 && below > 0 {
+            self.step_counter += 1;
+            let sound = blocks::step_sound(below);
+            // The snow above the mob has its own sound (the sound of the
+            // stone in this reference) and the sound is played even when
+            // the block under the mob is a liquid.
+            let snow_above = world.get_block(below_x, below_y + 1, below_z) == blocks::SNOW;
+            if snow_above || !blocks::material(below).is_liquid() {
+                self.step_sound = Some((sound.name, sound.volume1 * 0.15, sound.volume2));
+            }
+        }
+
         // The fall distance (`Entity.a(double, boolean)`).
         let mut fall_damage = 0.0;
         if result.on_ground {
@@ -829,6 +868,16 @@ impl Mob {
     pub fn eye_height(&self) -> f64 {
         let (_, width) = self.size();
         (width * 0.85f32) as f64
+    }
+
+    /// Java `EntityLiving.k()`: the volume of the sound of the mob.
+    pub fn sound_volume(&self) -> f32 {
+        match self.mob_type {
+            MobType::Cow | MobType::Squid | MobType::Wolf => 0.4,
+            MobType::Slime => 0.6,
+            MobType::Ghast => 10.0,
+            _ => 1.0,
+        }
     }
 
     /// Java `EntityLiving.h()`: the sound of the hit of the mob.

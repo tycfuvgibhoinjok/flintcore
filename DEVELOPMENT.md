@@ -365,6 +365,20 @@ Mob movement parity harness:
   - The sound of the attack of the slime is played when the damage is
     applied, and it draws two numbers for the pitch and the volume
     (`EntitySlime.b`).
+  - The sounds of the entities are sent to the client with the packet of
+    a named sound (the packet 41 of the protocol of 1.7.3): the idle
+    sound, the sound of the hit and of the death, the splash, the fizz
+    and the sound of the step.
+  - The sound of the step is played when the distance the mob walked
+    passes the counter of the steps (`Entity.move()`); in the reference
+    every block has the sound of the stone and the pistons have it with
+    the pitch 1.5.
+  - The flow of the water pushes the mob: the flows of the blocks of the
+    liquid in the box of the mob are summed, the sum is normalised and
+    the mob is pushed by 0.014 of it (`World.a`).
+  - The mob in a web is slowed down: the flag of the web is set at the
+    end of the movement and the movement of the next tick is damped
+    (`Entity.move()`).
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.
