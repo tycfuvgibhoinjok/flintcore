@@ -1225,9 +1225,14 @@ impl World {
     /// Java `World.setData(i, j, k, l)`: metadata write followed by physics.
     pub fn java_set_data(&mut self, x: i32, y: i32, z: i32, data: u8) -> bool {
         if self.java_set_raw_data(x, y, z, data) {
-            self.flag_dirty(x, y, z);
             let id = self.get_block(x, y, z);
-            self.java_apply_physics(x, y, z, id as i32);
+            // The block notifies the clients when its data changes only when
+            // the flag `Block.t[]` is set (`World.setData`).
+            if blocks::notifies_on_data_change(id) {
+                self.java_update(x, y, z, id as i32);
+            } else {
+                self.java_apply_physics(x, y, z, id as i32);
+            }
             true
         } else {
             false

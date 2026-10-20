@@ -467,6 +467,65 @@ pub fn is_normal_cube(id: u8) -> bool {
     is_opaque_cube(id) && !matches!(id, LEAVES | CHEST)
 }
 
+/// Java `Block.t[]`: the block notifies the clients when its data changes.
+///
+/// The table is the one of the reference (`tools/poseidon_mobs/BlockTable.java`
+/// prints it).
+pub fn notifies_on_data_change(id: u8) -> bool {
+    matches!(
+        id,
+        WOOD_PLANKS
+            | SAPLING
+            | WATER
+            | STATIONARY_WATER
+            | LAVA
+            | STATIONARY_LAVA
+            | LOG
+            | LEAVES
+            | DISPENSER
+            | NOTE_BLOCK
+            | BED
+            | POWERED_RAIL
+            | DETECTOR_RAIL
+            | STICKY_PISTON
+            | PISTON
+            | PISTON_HEAD
+            | WOOL
+            | TORCH
+            | FIRE
+            | WOOD_STAIRS
+            | CHEST
+            | REDSTONE_WIRE
+            | CROPS
+            | FURNACE
+            | LIT_FURNACE
+            | SIGN
+            | WOODEN_DOOR
+            | LADDER
+            | RAIL
+            | COBBLESTONE_STAIRS
+            | WALL_SIGN
+            | LEVER
+            | STONE_PLATE
+            | IRON_DOOR
+            | WOOD_PLATE
+            | REDSTONE_ORE
+            | LIT_REDSTONE_ORE
+            | REDSTONE_TORCH_OFF
+            | REDSTONE_TORCH_ON
+            | STONE_BUTTON
+            | JUKEBOX
+            | FENCE
+            | PUMPKIN
+            | JACK_O_LANTERN
+            | CAKE
+            | REPEATER_OFF
+            | REPEATER_ON
+            | LOCKED_CHEST
+            | TRAPDOOR
+    )
+}
+
 /// Java `World.e(x, y, z)`: the material of the block is solid and the
 /// block itself is one (`block.material.h() && block.b()`).
 ///
@@ -912,6 +971,12 @@ mod tests {
                 piston_mobility(id),
                 u8::try_from(number("mobility")).unwrap_or(0),
                 "the mobility of the block {}",
+                id
+            );
+            assert_eq!(
+                notifies_on_data_change(id),
+                flag("notify"),
+                "the notification of the data of the block {}",
                 id
             );
             checked += 1;
