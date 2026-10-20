@@ -496,6 +496,12 @@ impl Server {
                 s.tick_dropped_items();
                 s.process_world_events();
                 s.world.flush_pending_piston_syncs();
+                if ticks % 20 == 0 {
+                    // The time of the world is sent to the players of the
+                    // world every twenty ticks (`MinecraftServer.tick`).
+                    let time = s.world.world_time();
+                    s.broadcast(Clientbound::UpdateTime(UpdateTime { time }));
+                }
                 while s.world.java_do_lighting() {}
             });
         }
@@ -536,6 +542,10 @@ impl Server {
 
         if ticks % 20 == 0 {
             self.broadcast_keep_alive();
+            // The time of the world is sent to the players every twenty
+            // ticks (`MinecraftServer.tick`).
+            let time = self.world.world_time();
+            self.broadcast(Clientbound::UpdateTime(UpdateTime { time }));
         }
         if ticks % 600 == 0 {
             log::info(&format!(
@@ -12851,6 +12861,47 @@ mod tests {
             "the mob accumulates the distance of the walk"
         );
         assert!(mob.step_counter > 0, "the mob plays the sound of the step");
+    }
+
+    /// The time of the world is sent to the players every twenty ticks.
+    ///
+    /// Java `MinecraftServer.tick`: every twenty ticks the packet of the
+    /// time is sent to the players of the world.
+    #[test]
+    fn the_time_of_the_world_is_sent_to_the_players_every_twenty_ticks() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        // The connection of the player.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.connections.insert(
+            7,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().expect("the address"),
+                state: ConnectionState::Playing,
+                username: Some("Player".to_string()),
+                entity_id: 1,
+            },
+        );
+        let _player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+
+        // The twentieth tick sends the time.
+        server.tick(19);
+        let mut times = 0;
+        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            if matches!(packet, Clientbound::UpdateTime(_)) {
+                times += 1;
+            }
+        }
+        assert_eq!(times, 0, "the time is not sent before the twentieth tick");
+
+        server.tick(20);
+        let mut times = 0;
+        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            if matches!(packet, Clientbound::UpdateTime(_)) {
+                times += 1;
+            }
+        }
+        assert_eq!(times, 1, "the time is sent on the twentieth tick");
     }
 
     /// The mobs push each other away.
