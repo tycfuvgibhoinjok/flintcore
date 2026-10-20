@@ -13030,13 +13030,19 @@ mod tests {
         server.damage_mob(mob_id, 100, None, false);
         server.tick_mobs();
         // Not one packet of a named sound.
+        let mut received = 0usize;
         while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            received += 1;
             assert_ne!(
                 packet.id() as u8,
                 41,
                 "the packet of a named sound is not sent to the client"
             );
         }
+        assert!(
+            received > 0,
+            "the client has received the packets of the session"
+        );
     }
 
     /// The water drops the block it displaces.
