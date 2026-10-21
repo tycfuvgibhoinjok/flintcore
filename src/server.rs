@@ -11087,7 +11087,34 @@ impl Server {
             }
         }
 
+        // The answers of the command (`ConsoleCommandHandler.print`): the
+        // executor gets the text, the operators get it with the name of the
+        // executor.
         for msg in &result.broadcast_messages {
+            self.reply(sender, msg);
+            let text = format!("\u{00A7}7({username}: {msg})");
+            for op in &self.ops {
+                if op.eq_ignore_ascii_case(&username) {
+                    continue;
+                }
+                let conn_id = self
+                    .entities
+                    .iter_players()
+                    .find(|p| p.username.eq_ignore_ascii_case(op))
+                    .map(|p| p.conn_id);
+                if let Some(conn_id) = conn_id {
+                    self.send(
+                        conn_id,
+                        Clientbound::Chat(Chat {
+                            message: text.clone(),
+                        }),
+                    );
+                }
+            }
+        }
+
+        // The messages that go to everybody (the command `say`).
+        for msg in &result.all_messages {
             self.broadcast_chat(msg);
             // The console sees the broadcasts it triggers as well.
             if sender == CommandSender::Console {
@@ -14132,6 +14159,85 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Connected players:")),
             "console output was {output:?}"
+        );
+    }
+
+    /// The answer of a command goes to the executor and to the operators.
+    ///
+    /// Java `ConsoleCommandHandler.print(String, String)`: the executor gets
+    /// the text of the answer, the operators get it with the name of the
+    /// executor (`§7(<executor>: <answer>)`). The other players do not get
+    /// it; the command `say` goes to everybody.
+    #[test]
+    fn the_answer_of_a_command_goes_to_the_executor_and_to_the_operators() {
+        let (mut server, _tx, _output) = console_server();
+        // The connection of the executor and of the operator.
+        let (executor_tx, mut executor_rx) = mpsc::unbounded_channel();
+        let (op_tx, mut op_rx) = mpsc::unbounded_channel();
+        let (other_tx, mut other_rx) = mpsc::unbounded_channel();
+        for (conn_id, tx) in [(7, executor_tx), (8, op_tx), (9, other_tx)] {
+            server.connections.insert(
+                conn_id,
+                Connection {
+                    sender: tx,
+                    address: "127.0.0.1:25565".parse().expect("the address"),
+                    state: ConnectionState::Playing,
+                    username: Some(format!("Player{conn_id}")),
+                    entity_id: conn_id as i32,
+                },
+            );
+        }
+        // The players: the executor, the operator and the other player.
+        server
+            .entities
+            .insert_player(7, "Player7".to_string(), 2.5, 64.0, 0.5);
+        server
+            .entities
+            .insert_player(8, "Player8".to_string(), 2.5, 64.0, 0.5);
+        server
+            .entities
+            .insert_player(9, "Player9".to_string(), 2.5, 64.0, 0.5);
+        // The operator.
+        server.ops.insert("player8".to_string());
+        server.run_command(CommandSender::Player(7), "save-all");
+        // The executor gets the text of the answer.
+        let mut executor_messages = Vec::new();
+        while let Ok(Outbound::Packet(packet)) = executor_rx.try_recv() {
+            if let Clientbound::Chat(chat) = packet {
+                executor_messages.push(chat.message);
+            }
+        }
+        assert!(
+            executor_messages
+                .iter()
+                .any(|message| message.contains("Forcing save..")),
+            "the executor gets the answer of the command: {executor_messages:?}"
+        );
+        // The operator gets it with the name of the executor.
+        let mut op_messages = Vec::new();
+        while let Ok(Outbound::Packet(packet)) = op_rx.try_recv() {
+            if let Clientbound::Chat(chat) = packet {
+                op_messages.push(chat.message);
+            }
+        }
+        assert!(
+            op_messages
+                .iter()
+                .any(|message| message.contains("\u{00A7}7(Player7: Forcing save..)")),
+            "the operator gets the answer of the command: {op_messages:?}"
+        );
+        // The other players do not get it.
+        let mut other_messages = Vec::new();
+        while let Ok(Outbound::Packet(packet)) = other_rx.try_recv() {
+            if let Clientbound::Chat(chat) = packet {
+                other_messages.push(chat.message);
+            }
+        }
+        assert!(
+            !other_messages
+                .iter()
+                .any(|message| message.contains("Forcing save..")),
+            "the other players do not get the answer of the command: {other_messages:?}"
         );
     }
 

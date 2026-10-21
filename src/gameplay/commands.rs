@@ -58,7 +58,11 @@ pub struct CommandContext {
 #[derive(Debug, Default)]
 pub struct CommandResult {
     pub sender_messages: Vec<String>,
+    /// The answers of the command: they go to the executor and to the
+    /// operators (`ConsoleCommandHandler.print`).
     pub broadcast_messages: Vec<String>,
+    /// The messages that go to everybody (the command `say`).
+    pub all_messages: Vec<String>,
     pub target_messages: Vec<(String, String)>,
     pub actions: Vec<CommandAction>,
     pub handled: bool,
@@ -69,6 +73,7 @@ impl CommandResult {
         Self {
             sender_messages: Vec::new(),
             broadcast_messages: Vec::new(),
+            all_messages: Vec::new(),
             target_messages: Vec::new(),
             actions: Vec::new(),
             handled: false,
@@ -79,6 +84,7 @@ impl CommandResult {
         Self {
             sender_messages: Vec::new(),
             broadcast_messages: Vec::new(),
+            all_messages: Vec::new(),
             target_messages: Vec::new(),
             actions: Vec::new(),
             handled: true,
@@ -88,6 +94,12 @@ impl CommandResult {
     pub fn with_sender_message(mut self, msg: String) -> Self {
         self.sender_messages.push(msg);
         self.handled = true;
+        self
+    }
+
+    /// A message that goes to everybody (the command `say`).
+    pub fn with_all(mut self, msg: String) -> Self {
+        self.all_messages.push(msg);
         self
     }
 
@@ -381,7 +393,7 @@ impl Command for SayCommand {
                 .with_sender_message("\u{00A7}cUsage: /say <message>".to_string());
         }
         let message = args.join(" ");
-        CommandResult::handled().with_broadcast(format!("\u{00A7}d[Server] {message}"))
+        CommandResult::handled().with_all(format!("\u{00A7}d[Server] {message}"))
     }
 }
 
@@ -1606,8 +1618,9 @@ mod tests {
         let map = CommandMap::new();
         let result = map.dispatch("Player", "say hello world");
         assert!(result.handled);
-        assert_eq!(result.broadcast_messages.len(), 1);
-        assert!(result.broadcast_messages[0].contains("hello world"));
+        // The command `say` goes to everybody (`ConsoleCommandHandler`).
+        assert_eq!(result.all_messages.len(), 1);
+        assert!(result.all_messages[0].contains("hello world"));
     }
 
     #[test]
