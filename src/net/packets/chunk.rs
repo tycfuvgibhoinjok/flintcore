@@ -1,7 +1,7 @@
 use crate::util::bytes::{Reader, Writer};
 use crate::util::compress::{deflate_zlib, inflate_zlib, CHUNK_DEFLATE_LEVEL};
 use crate::util::Result;
-use crate::world::chunk::Chunk;
+use crate::world::chunk::{Chunk, CHUNK_HEIGHT, CHUNK_WIDTH};
 
 pub const DEFAULT_SIZE_X: u8 = 16;
 pub const DEFAULT_SIZE_Y: u8 = 128;
@@ -48,6 +48,42 @@ thread_local! {
 }
 
 impl MapChunk {
+    /// Java `Packet51MapChunk(int, int, int, int, int, int, World)`: the
+    /// packet of a region of the chunk.
+    pub fn from_region(
+        chunk: &Chunk,
+        x: i32,
+        y: i16,
+        z: i32,
+        size_x: u8,
+        size_y: u8,
+        size_z: u8,
+    ) -> Result<Self> {
+        let compressed = CHUNK_PAYLOAD_BUF.with(|cell| {
+            let mut payload = cell.borrow_mut();
+            payload.clear();
+            // The region inside the chunk (the coordinates of the packet are
+            // the world ones).
+            let x1 = (x - chunk.pos.x * 16).max(0) as usize;
+            let z1 = (z - chunk.pos.z * 16).max(0) as usize;
+            let y1 = (y.max(0)) as usize;
+            let x2 = (x1 + size_x as usize).min(CHUNK_WIDTH);
+            let z2 = (z1 + size_z as usize).min(CHUNK_WIDTH);
+            let y2 = (y1 + size_y as usize).min(CHUNK_HEIGHT);
+            chunk.write_region_payload(x1, y1, z1, x2, y2, z2, &mut payload);
+            deflate_zlib(&payload, CHUNK_DEFLATE_LEVEL)
+        })?;
+        Ok(Self {
+            x,
+            y,
+            z,
+            size_x,
+            size_y,
+            size_z,
+            compressed,
+        })
+    }
+
     pub fn from_chunk(chunk: &Chunk) -> Result<Self> {
         let compressed = CHUNK_PAYLOAD_BUF.with(|cell| {
             let mut payload = cell.borrow_mut();

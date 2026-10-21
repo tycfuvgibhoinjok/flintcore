@@ -54,7 +54,10 @@ pub struct Player {
     pub mot_z: f64,
     pub velocity_changed: bool,
     pub health: i16,
-    pub last_health: i16,
+    /// Java `EntityPlayer.bL`: the health of the last packet.  The
+    /// reference starts with `-99999999` ✓, so the first tick of the player
+    /// sends the packet of the health ✓.
+    pub last_health: i32,
     pub air_ticks: i16,
     pub fire_ticks: i16,
     pub fall_distance: f32,
@@ -139,7 +142,7 @@ impl Player {
             mot_z: 0.0,
             velocity_changed: false,
             health: 20,
-            last_health: 20,
+            last_health: -99_999_999,
             air_ticks: 300,
             fire_ticks: 0,
             fall_distance: 0.0,
@@ -298,7 +301,7 @@ impl Player {
 
     pub fn respawn(&mut self, spawn_x: f64, spawn_y: f64, spawn_z: f64) {
         self.health = 20;
-        self.last_health = 20;
+        self.last_health = -99_999_999;
         self.dead = false;
         self.x = spawn_x;
         self.y = spawn_y;

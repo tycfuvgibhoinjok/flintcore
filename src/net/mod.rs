@@ -15,6 +15,11 @@ pub type ConnId = u64;
 #[derive(Debug)]
 pub enum Outbound {
     Packet(Clientbound),
+    /// The start of a burst of packets: the packets of a low priority wait
+    /// until the end of the burst (`NetworkManager.f()`).
+    BurstStart,
+    /// The end of a burst of packets.
+    BurstEnd,
     Close,
 }
 

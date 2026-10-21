@@ -381,6 +381,59 @@ impl Chunk {
         }
     }
 
+    /// Java `Chunk.getData(byte[], int, int, int, int, int, int, int)`:
+    /// the data of the region of the chunk.
+    ///
+    /// The blocks come first, then the metadata, the light of the blocks and
+    /// the light of the sky — every one of them as the bytes of the nibbles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_region_payload(
+        &self,
+        x1: usize,
+        y1: usize,
+        z1: usize,
+        x2: usize,
+        y2: usize,
+        z2: usize,
+        out: &mut Vec<u8>,
+    ) {
+        // The blocks.
+        for x in x1..x2 {
+            for z in z1..z2 {
+                for y in y1..y2 {
+                    out.push(self.get_block(x, y, z));
+                }
+            }
+        }
+        // The metadata, the light of the blocks and the light of the sky.
+        for layer in 0..3u8 {
+            for x in x1..x2 {
+                for z in z1..z2 {
+                    let mut y = y1 & !1;
+                    while y < y2 {
+                        let low = self.nibble_value(layer, x, y, z);
+                        let high = if y + 1 < y2 {
+                            self.nibble_value(layer, x, y + 1, z)
+                        } else {
+                            0
+                        };
+                        out.push(low | (high << 4));
+                        y += 2;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The value of one of the layers of the nibbles.
+    fn nibble_value(&self, layer: u8, x: usize, y: usize, z: usize) -> u8 {
+        match layer {
+            0 => self.get_metadata(x, y, z),
+            1 => self.get_block_light(x, y, z),
+            _ => self.get_sky_light(x, y, z),
+        }
+    }
+
     pub fn write_payload(&self, out: &mut Vec<u8>) {
         out.clear();
         out.resize(PAYLOAD_LEN, 0);
@@ -411,6 +464,32 @@ mod tests {
         chunk.set_block(3, 40, 7, blocks::AIR);
         chunk.compact();
         assert_eq!(chunk.get_block(3, 40, 7), blocks::AIR);
+    }
+
+    /// The data of the region of the chunk.
+    ///
+    /// Java `Chunk.getData(byte[], ...)`: the blocks, the metadata, the
+    /// light of the blocks and the light of the sky.
+    #[test]
+    fn the_region_of_the_chunk_holds_the_blocks_and_the_light() {
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0));
+        chunk.set_block(1, 64, 2, blocks::STONE);
+        chunk.set_metadata(1, 64, 2, 5);
+        chunk.set_block_light(1, 64, 2, 11);
+        chunk.set_sky_light(1, 64, 2, 13);
+
+        let mut payload = Vec::new();
+        chunk.write_region_payload(1, 64, 2, 2, 66, 3, &mut payload);
+        // The blocks of the region.
+        assert_eq!(payload[0], blocks::STONE);
+        assert_eq!(payload[1], blocks::AIR);
+        // The metadata: the low nibble is the value of the even height.
+        assert_eq!(payload[2] & 15, 5, "the metadata of the block");
+        assert_eq!(payload[2] >> 4, 0, "the metadata of the block above");
+        // The light of the blocks.
+        assert_eq!(payload[3] & 15, 11, "the light of the block");
+        // The light of the sky.
+        assert_eq!(payload[4] & 15, 13, "the light of the sky");
     }
 
     #[test]

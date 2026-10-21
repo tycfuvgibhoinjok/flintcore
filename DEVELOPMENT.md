@@ -100,6 +100,14 @@ Known Beta quirks that must be preserved (non-exhaustive, add as discovered):
   rotation) and the thresholds that select which movement packet is sent.
 - Login flow, including the login packet's abused `dimension` byte used by
   proxies.
+- The login is one *burst* of packets: the packets of a low priority
+  (`Packet.k` — the data of the chunks, 51/52/53/130/131) wait until the
+  burst is over, so the data of the chunks follows the rest of the login
+  (`Outbound::BurstStart`/`BurstEnd`, `src/net/connection.rs`).
+- Ten dirty blocks in a chunk are sent as a *partial* `Packet51MapChunk` of
+  the region of the blocks (`Y` rounded down to an even number, the height
+  `max_y - min_y + 2`); the reference has no "resend the whole chunk"
+  threshold.
 
 World-generation quirks found while reaching block-for-block Overworld parity
 with Project-Poseidon (verification harness in §6):

@@ -222,6 +222,22 @@ impl Clientbound {
         }
     }
 
+    /// Java `Packet.k`: the packets of a low priority wait until the queue
+    /// of the other packets is empty (`NetworkManager.f()`).
+    ///
+    /// The packets are the data of the chunk (51), the change of the blocks
+    /// (52 and 53), the sign (130) and the map (131).
+    pub fn is_low_priority(&self) -> bool {
+        matches!(
+            self.id(),
+            PacketId::MapChunk
+                | PacketId::MultiBlockChange
+                | PacketId::BlockChange
+                | PacketId::UpdateSign
+                | PacketId::Packet131
+        )
+    }
+
     pub fn encode(&self, writer: &mut Writer) -> Result<()> {
         writer.write_u8(self.id().id());
         match self {

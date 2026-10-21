@@ -133,6 +133,261 @@ async fn read_string(stream: &mut TcpStream) -> String {
         .collect()
 }
 
+/// Reads the metadata of an entity: the types of the values.
+async fn read_metadata(stream: &mut TcpStream) {
+    loop {
+        let header = read_u8(stream).await;
+        if header == 127 {
+            break;
+        }
+        match (header >> 5) & 7 {
+            0 => {
+                let _ = read_u8(stream).await;
+            }
+            1 => {
+                let _ = read_i16(stream).await;
+            }
+            2 | 3 => {
+                let _ = read_i32(stream).await;
+            }
+            4 => {
+                let len = read_i16(stream).await as usize;
+                for _ in 0..len {
+                    let _ = read_i16(stream).await;
+                }
+            }
+            5 => {
+                let item_id = read_i16(stream).await;
+                if item_id >= 0 {
+                    let _ = read_u8(stream).await;
+                    let _ = read_i16(stream).await;
+                }
+            }
+            6 => {
+                for _ in 0..6 {
+                    let _ = read_i32(stream).await;
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Skips the payload of a packet of the world.
+///
+/// Returns `true` when the packet is known and its payload is consumed.
+async fn skip_packet_payload(stream: &mut TcpStream, id: u8) -> bool {
+    match id {
+        0 => {}
+        3 => {
+            let _ = read_string(stream).await;
+        }
+        4 => {
+            let _ = read_i64(stream).await;
+        }
+        5 | 28 => {
+            let _ = (
+                read_i32(stream).await,
+                read_i16(stream).await,
+                read_i16(stream).await,
+                read_i16(stream).await,
+            );
+        }
+        8 => {
+            let _ = read_i16(stream).await;
+        }
+        13 => {
+            let _ = (
+                read_f64(stream).await,
+                read_f64(stream).await,
+                read_f64(stream).await,
+                read_f64(stream).await,
+            );
+            let _ = (read_f32(stream).await, read_f32(stream).await);
+            let _ = read_bool(stream).await;
+        }
+        20 => {
+            let _ = read_i32(stream).await;
+            let _ = read_string(stream).await;
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+            let _ = (
+                read_u8(stream).await,
+                read_u8(stream).await,
+                read_i16(stream).await,
+            );
+        }
+        29 | 30 => {
+            let _ = read_i32(stream).await;
+        }
+        34 => {
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+            let _ = (read_u8(stream).await, read_u8(stream).await);
+        }
+        38 => {
+            let _ = (read_i32(stream).await, read_u8(stream).await);
+        }
+        18 => {
+            let _ = (read_i32(stream).await, read_u8(stream).await);
+        }
+        19 => {
+            let _ = (read_i32(stream).await, read_u8(stream).await);
+        }
+        21 => {
+            let _ = read_i32(stream).await;
+            let _ = (
+                read_i16(stream).await,
+                read_u8(stream).await,
+                read_i16(stream).await,
+            );
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+            let _ = (
+                read_u8(stream).await,
+                read_u8(stream).await,
+                read_u8(stream).await,
+            );
+        }
+        22 => {
+            let _ = (read_i32(stream).await, read_i32(stream).await);
+        }
+        23 => {
+            let _ = read_i32(stream).await;
+            let _ = read_u8(stream).await;
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+            let thrower = read_i32(stream).await;
+            if thrower > 0 {
+                let _ = (
+                    read_i16(stream).await,
+                    read_i16(stream).await,
+                    read_i16(stream).await,
+                );
+            }
+        }
+        24 => {
+            // The spawn of a mob: the metadata follows.
+            let _ = read_i32(stream).await;
+            let _ = read_u8(stream).await;
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+            let _ = (read_u8(stream).await, read_u8(stream).await);
+            read_metadata(stream).await;
+        }
+        25 => {
+            let _ = read_i32(stream).await;
+            let _ = read_u8(stream).await;
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+        }
+        33 => {
+            let _ = read_i32(stream).await;
+            let _ = (
+                read_i16(stream).await,
+                read_i16(stream).await,
+                read_i16(stream).await,
+            );
+            let _ = (read_u8(stream).await, read_u8(stream).await);
+            let _ = read_bool(stream).await;
+        }
+        35 => {
+            let _ = read_i32(stream).await;
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_i32(stream).await,
+            );
+            let _ = (read_u8(stream).await, read_u8(stream).await);
+            let _ = read_bool(stream).await;
+        }
+        39 => {
+            let _ = (read_i32(stream).await, read_i32(stream).await);
+        }
+        40 => {
+            // The metadata of the entity: the types of the values.
+            let _ = read_i32(stream).await;
+            read_metadata(stream).await;
+        }
+        50 => {
+            let _ = (
+                read_i32(stream).await,
+                read_i32(stream).await,
+                read_bool(stream).await,
+            );
+        }
+        51 => {
+            let _ = (
+                read_i32(stream).await,
+                read_i16(stream).await,
+                read_i32(stream).await,
+            );
+            let _ = (
+                read_u8(stream).await,
+                read_u8(stream).await,
+                read_u8(stream).await,
+            );
+            let len = read_i32(stream).await as usize;
+            let mut comp = vec![0u8; len];
+            stream.read_exact(&mut comp).await.unwrap();
+        }
+        103 => {
+            let _ = read_u8(stream).await;
+            let _ = read_i16(stream).await;
+            let item_id = read_i16(stream).await;
+            if item_id >= 0 {
+                let _ = (read_u8(stream).await, read_i16(stream).await);
+            }
+        }
+        104 => {
+            let _ = read_u8(stream).await;
+            let count = read_i16(stream).await;
+            for _ in 0..count {
+                let item_id = read_i16(stream).await;
+                if item_id >= 0 {
+                    let _ = (read_u8(stream).await, read_i16(stream).await);
+                }
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Reads the next packet of the client that is not in the list of the
+/// ignored packets.
+///
+/// The payload of the ignored packets is consumed, so the stream of the
+/// packets stays in sync.
+async fn read_next_packet_id(stream: &mut TcpStream, ignore: &[u8]) -> u8 {
+    loop {
+        let id = read_u8(stream).await;
+        if ignore.contains(&id) {
+            let _ = skip_packet_payload(stream, id).await;
+            continue;
+        }
+        return id;
+    }
+}
+
 async fn read_next_non_chunk_packet_id(stream: &mut TcpStream) -> u8 {
     loop {
         let id = read_u8(stream).await;
@@ -305,17 +560,34 @@ async fn client_streams_chunks_and_teleports() {
         assert_eq!(read_u8(&mut client).await, 4); // UpdateTime
         let _ = read_i64(&mut client).await;
 
-        // Read 9 initial spawn chunks (PreChunk + MapChunk pairs)
-        for _ in 0..9 {
-            let pre_id = read_u8(&mut client).await;
-            assert_eq!(pre_id, 50); // PreChunk
-            let _cx = read_i32(&mut client).await;
-            let _cz = read_i32(&mut client).await;
-            let mode = read_bool(&mut client).await;
-            assert!(mode);
+        // The 9 initial spawn chunks: the packets of the pre-chunk have a
+        // normal priority, the data of the chunks has a low priority.
+        read_pre_chunks(&mut client).await;
 
-            let map_id = read_u8(&mut client).await;
-            assert_eq!(map_id, 51); // MapChunk
+        // Read PlayerLookMove spawn teleport
+        let teleport_id = read_u8(&mut client).await;
+        assert_eq!(teleport_id, 13); // PlayerLookMove
+        let x = read_f64(&mut client).await;
+        let y = read_f64(&mut client).await;
+        let stance = read_f64(&mut client).await;
+        let z = read_f64(&mut client).await;
+        let _yaw = read_f32(&mut client).await;
+        let _pitch = read_f32(&mut client).await;
+        let on_ground = read_bool(&mut client).await;
+
+        assert_eq!(x, 0.5);
+        assert!((y - (stance + 1.62)).abs() < 1e-4);
+        assert!(stance >= 64.0);
+        assert_eq!(z, 0.5);
+        assert!(!on_ground);
+
+        // The data of the chunks has a low priority (`Packet.k`): it comes
+        // after the other packets of the login.
+        assert_eq!(read_u8(&mut client).await, 4); // UpdateTime
+        let _ = read_i64(&mut client).await;
+        read_window_items(&mut client).await;
+        for _ in 0..9 {
+            assert_eq!(read_u8(&mut client).await, 51); // MapChunk
             let _x = read_i32(&mut client).await;
             let _y = read_i16(&mut client).await;
             let _z = read_i32(&mut client).await;
@@ -334,23 +606,6 @@ async fn client_streams_chunks_and_teleports() {
             let payload = flintcore::util::compress::inflate_zlib(&compressed, 81920).unwrap();
             assert_eq!(payload.len(), 81920);
         }
-
-        // Read PlayerLookMove spawn teleport
-        let teleport_id = read_u8(&mut client).await;
-        assert_eq!(teleport_id, 13); // PlayerLookMove
-        let x = read_f64(&mut client).await;
-        let y = read_f64(&mut client).await;
-        let stance = read_f64(&mut client).await;
-        let z = read_f64(&mut client).await;
-        let _yaw = read_f32(&mut client).await;
-        let _pitch = read_f32(&mut client).await;
-        let on_ground = read_bool(&mut client).await;
-
-        assert_eq!(x, 0.5);
-        assert!((y - (stance + 1.62)).abs() < 1e-4);
-        assert!(stance >= 64.0);
-        assert_eq!(z, 0.5);
-        assert!(!on_ground);
 
         // Send a player movement packet back
         let mut move_writer = Writer::new();
@@ -372,81 +627,7 @@ async fn client_interacts_and_does_not_disconnect() {
     let harness = Harness::start().await;
     let exchange = async {
         let mut client = TcpStream::connect(harness.address).await.unwrap();
-        client.write_all(&handshake("Player3")).await.unwrap();
-        client.write_all(&login(14, "Player3")).await.unwrap();
-
-        assert_eq!(read_u8(&mut client).await, 2);
-        assert_eq!(read_string(&mut client).await, "-");
-
-        assert_eq!(read_u8(&mut client).await, 1);
-        let _ = read_i32(&mut client).await;
-        let _ = read_string(&mut client).await;
-        let _ = read_i64(&mut client).await;
-        let _ = read_u8(&mut client).await;
-
-        assert_eq!(read_u8(&mut client).await, 6); // SpawnPosition
-        let _ = (
-            read_i32(&mut client).await,
-            read_i32(&mut client).await,
-            read_i32(&mut client).await,
-        );
-
-        assert_eq!(read_u8(&mut client).await, 4); // UpdateTime
-        let _ = read_i64(&mut client).await;
-
-        // Consume the 9 initial chunks
-        for _ in 0..9 {
-            assert_eq!(read_u8(&mut client).await, 50); // PreChunk
-            let _ = (
-                read_i32(&mut client).await,
-                read_i32(&mut client).await,
-                read_bool(&mut client).await,
-            );
-
-            assert_eq!(read_u8(&mut client).await, 51); // MapChunk
-            let _ = (
-                read_i32(&mut client).await,
-                read_i16(&mut client).await,
-                read_i32(&mut client).await,
-            );
-            let _ = (
-                read_u8(&mut client).await,
-                read_u8(&mut client).await,
-                read_u8(&mut client).await,
-            );
-            let len = read_i32(&mut client).await as usize;
-            let mut comp = vec![0u8; len];
-            client.read_exact(&mut comp).await.unwrap();
-        }
-
-        // Consume PlayerLookMove spawn teleport
-        assert_eq!(read_u8(&mut client).await, 13);
-        let _ = (
-            read_f64(&mut client).await,
-            read_f64(&mut client).await,
-            read_f64(&mut client).await,
-            read_f64(&mut client).await,
-        );
-        let _ = (
-            read_f32(&mut client).await,
-            read_f32(&mut client).await,
-            read_bool(&mut client).await,
-        );
-
-        // WindowItems (104)
-        assert_eq!(read_u8(&mut client).await, 104);
-        let _win_id = read_u8(&mut client).await;
-        let count = read_i16(&mut client).await;
-        for _ in 0..count {
-            let item_id = read_i16(&mut client).await;
-            if item_id >= 0 {
-                let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
-            }
-        }
-
-        // UpdateHealth (8)
-        assert_eq!(read_u8(&mut client).await, 8);
-        let _ = read_i16(&mut client).await;
+        login_and_consume_spawn(&mut client, "Player3").await;
 
         // 1. Send ArmAnimation (id 18) - the packet that caused disconnection before
         let mut anim_writer = Writer::new();
@@ -536,6 +717,77 @@ async fn outdated_client_is_kicked() {
     harness.stop().await;
 }
 
+/// Reads the packets of the chunks (`Packet50PreChunk`).
+///
+/// The packets of the pre-chunk have a normal priority, so they are sent
+/// before the other packets of the login.
+async fn read_pre_chunks(client: &mut TcpStream) {
+    for _ in 0..9 {
+        assert_eq!(read_u8(client).await, 50, "PreChunk");
+        let _ = (
+            read_i32(client).await,
+            read_i32(client).await,
+            read_bool(client).await,
+        );
+    }
+}
+
+/// Reads the data of the chunks (`Packet51MapChunk`).
+///
+/// The data of the chunks has a low priority (`Packet.k`), so it is sent
+/// after the other packets of the login.  The packets of the pre-chunk of
+/// the chunks that the server streams later can come before it.
+async fn read_chunk_data(client: &mut TcpStream) {
+    let mut read = 0;
+    while read < 9 {
+        let id = read_u8(client).await;
+        match id {
+            51 => {
+                let _ = (
+                    read_i32(client).await,
+                    read_i16(client).await,
+                    read_i32(client).await,
+                );
+                let _ = (
+                    read_u8(client).await,
+                    read_u8(client).await,
+                    read_u8(client).await,
+                );
+                let len = read_i32(client).await as usize;
+                let mut comp = vec![0u8; len];
+                client.read_exact(&mut comp).await.unwrap();
+                read += 1;
+            }
+            50 => {
+                // The pre-chunk of the next chunk of the world.
+                let _ = (
+                    read_i32(client).await,
+                    read_i32(client).await,
+                    read_bool(client).await,
+                );
+            }
+            other => panic!("unexpected packet {other} in the data of the chunks"),
+        }
+    }
+}
+
+/// Reads the items of the inventory and the item in the hand.
+async fn read_window_items(client: &mut TcpStream) {
+    assert_eq!(read_u8(client).await, 104, "WindowItems");
+    let _win_id = read_u8(client).await;
+    let count = read_i16(client).await;
+    for _ in 0..count {
+        let item_id = read_i16(client).await;
+        if item_id >= 0 {
+            let _ = (read_u8(client).await, read_i16(client).await);
+        }
+    }
+    assert_eq!(read_u8(client).await, 103, "SetSlot");
+    let _ = read_u8(client).await;
+    let _ = read_i16(client).await;
+    let _item_id = read_i16(client).await;
+}
+
 async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
     client.write_all(&handshake(username)).await.unwrap();
     client.write_all(&login(14, username)).await.unwrap();
@@ -559,29 +811,7 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
     assert_eq!(read_u8(client).await, 4);
     let _ = read_i64(client).await;
 
-    for _ in 0..9 {
-        assert_eq!(read_u8(client).await, 50);
-        let _ = (
-            read_i32(client).await,
-            read_i32(client).await,
-            read_bool(client).await,
-        );
-
-        assert_eq!(read_u8(client).await, 51);
-        let _ = (
-            read_i32(client).await,
-            read_i16(client).await,
-            read_i32(client).await,
-        );
-        let _ = (
-            read_u8(client).await,
-            read_u8(client).await,
-            read_u8(client).await,
-        );
-        let len = read_i32(client).await as usize;
-        let mut comp = vec![0u8; len];
-        client.read_exact(&mut comp).await.unwrap();
-    }
+    read_pre_chunks(client).await;
 
     assert_eq!(read_u8(client).await, 13);
     let _ = (
@@ -618,6 +848,9 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
     let _ = read_u8(client).await;
     let _ = read_i16(client).await;
     let _item_id = read_i16(client).await;
+
+    // The data of the chunks has a low priority: it comes at the end.
+    read_chunk_data(client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -720,7 +953,8 @@ async fn chat_command_unknown() {
 
         assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
         let msg = read_string(&mut client).await;
-        assert_eq!(msg, "Unknown command. Type \"help\" for help.");
+        // Java `ConsoleCommandHandler.java:288`.
+        assert_eq!(msg, "Unknown console command. Type \"help\" for help.");
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -739,9 +973,17 @@ async fn chat_command_help() {
         writer.write_string("/help", 100).unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
-        let msg = read_string(&mut client).await;
-        assert!(msg.contains("Help"));
+        // Java `ConsoleCommandHandler.java:355-374`: every line of the help
+        // of the reference is a separate message.
+        let mut lines: Vec<String> = Vec::new();
+        for _ in 0..20 {
+            assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+            lines.push(read_string(&mut client).await);
+        }
+        let help = lines.join("\n");
+        assert!(help.contains("Console commands:"), "the help: {help}");
+        assert!(help.contains("help  or  ?"), "the help: {help}");
+        assert!(help.contains("say <message>"), "the help: {help}");
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -862,7 +1104,13 @@ async fn player_tracking_spawns_other_player() {
         // Watcher should receive NamedEntitySpawn (id 20) for Spawnee
         let mut found_spawn = false;
         for _ in 0..30 {
-            let id = read_u8(&mut client1).await;
+            let id = read_next_packet_id(
+                &mut client1,
+                &[
+                    0, 3, 4, 8, 13, 18, 19, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             if id == 20 {
                 let entity_id = read_i32(&mut client1).await;
                 assert!(entity_id > 0);
@@ -927,7 +1175,13 @@ async fn inventory_click_transaction() {
         // Should receive Transaction (id 106)
         let mut found_trans = false;
         for _ in 0..30 {
-            let id = read_u8(&mut client).await;
+            let id = read_next_packet_id(
+                &mut client,
+                &[
+                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             if id == 106 {
                 let window_id = read_u8(&mut client).await;
                 assert_eq!(window_id, 0);
@@ -990,7 +1244,13 @@ async fn respawn_double_packet_sequence() {
         // Poseidon double-respawn: skip chunks and find first Respawn(-1)
         let mut found_respawn1 = false;
         for _ in 0..30 {
-            let id = read_u8(&mut client).await;
+            let id = read_next_packet_id(
+                &mut client,
+                &[
+                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             if id == 9 {
                 let dim = read_u8(&mut client).await as i8;
                 assert_eq!(dim, -1);
@@ -1026,29 +1286,9 @@ async fn respawn_double_packet_sequence() {
         assert_eq!(read_u8(&mut client).await, 9);
         assert_eq!(read_u8(&mut client).await as i8, 0);
 
-        // Expect 9 spawn chunks
-        for _ in 0..9 {
-            assert_eq!(read_u8(&mut client).await, 50);
-            let _ = (
-                read_i32(&mut client).await,
-                read_i32(&mut client).await,
-                read_bool(&mut client).await,
-            );
-            assert_eq!(read_u8(&mut client).await, 51);
-            let _ = (
-                read_i32(&mut client).await,
-                read_i16(&mut client).await,
-                read_i32(&mut client).await,
-            );
-            let _ = (
-                read_u8(&mut client).await,
-                read_u8(&mut client).await,
-                read_u8(&mut client).await,
-            );
-            let len = read_i32(&mut client).await as usize;
-            let mut comp = vec![0u8; len];
-            client.read_exact(&mut comp).await.unwrap();
-        }
+        // Expect 9 spawn chunks (the data of the chunks has a low priority
+        // and comes at the end of the login).
+        read_pre_chunks(&mut client).await;
 
         // PlayerLookMove teleport (sent at end of stream_initial_chunks)
         assert_eq!(read_u8(&mut client).await, 13);
@@ -1105,28 +1345,31 @@ async fn chat_color_codes_and_section_sign() {
         let mut client = TcpStream::connect(harness.address).await.unwrap();
         login_and_consume_spawn(&mut client, "ColorUser").await;
 
-        // Send a message with section sign (§a)
+        // The message with the ampersand: the reference does not change it
+        // (the client does).
         let mut writer = Writer::new();
         writer.write_u8(3);
-        writer.write_string("§aGreen message", 100).unwrap();
+        writer.write_string("&cRed message", 100).unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        // Must NOT be kicked (not packet 255)
         let id = read_next_non_chunk_packet_id(&mut client).await;
         assert_eq!(id, 3);
         let msg = read_string(&mut client).await;
-        assert!(msg.contains("§aGreen message"));
+        assert_eq!(msg, "<ColorUser> &cRed message");
 
-        // Send a message with ampersand (&c)
+        // The character of the colour (`§`) is not in the file `font.txt` of
+        // the reference (`FontAllowedCharacters`), so the player is kicked
+        // with "Illegal characters in chat"
+        // (`NetServerHandler.java:811-815`).
         let mut writer2 = Writer::new();
         writer2.write_u8(3);
-        writer2.write_string("&cRed message", 100).unwrap();
+        writer2.write_string("§aGreen message", 100).unwrap();
         client.write_all(writer2.as_slice()).await.unwrap();
 
         let id2 = read_next_non_chunk_packet_id(&mut client).await;
-        assert_eq!(id2, 3);
-        let msg2 = read_string(&mut client).await;
-        assert!(msg2.contains("§cRed message"));
+        assert_eq!(id2, 255, "the character of the colour is not allowed");
+        let reason = read_string(&mut client).await;
+        assert_eq!(reason, "Illegal characters in chat");
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -1175,12 +1418,17 @@ async fn fall_damage_on_player_position() {
         let mut client = TcpStream::connect(harness.address).await.unwrap();
         login_and_consume_spawn(&mut client, "FallUser").await;
 
+        // The sixty ticks of the protection of the spawn
+        // (`EntityPlayer.bM`): the damage of the fall is not applied while
+        // the player is protected.
+        tokio::time::sleep(Duration::from_millis(10_000)).await;
+
         // First sync position on ground
         let mut writer0 = Writer::new();
         writer0.write_u8(11);
         writer0.write_f64(0.0);
         writer0.write_f64(64.0);
-        writer0.write_f64(64.0);
+        writer0.write_f64(65.62); // the stance: the height of the eyes
         writer0.write_f64(0.0);
         writer0.write_bool(true);
         client.write_all(writer0.as_slice()).await.unwrap();
@@ -1190,7 +1438,7 @@ async fn fall_damage_on_player_position() {
         writer.write_u8(11);
         writer.write_f64(0.0);
         writer.write_f64(59.0); // 5 blocks drop
-        writer.write_f64(59.0);
+        writer.write_f64(60.62);
         writer.write_f64(0.0);
         writer.write_bool(false);
         client.write_all(writer.as_slice()).await.unwrap();
@@ -1200,7 +1448,7 @@ async fn fall_damage_on_player_position() {
         writer2.write_u8(11);
         writer2.write_f64(0.0);
         writer2.write_f64(59.0);
-        writer2.write_f64(59.0);
+        writer2.write_f64(60.62);
         writer2.write_f64(0.0);
         writer2.write_bool(true);
         client.write_all(writer2.as_slice()).await.unwrap();
@@ -1210,7 +1458,11 @@ async fn fall_damage_on_player_position() {
         let mut got_damaged_health = false;
 
         while !got_hurt_animation || !got_damaged_health {
-            let id = read_u8(&mut client).await;
+            let id = read_next_packet_id(
+                &mut client,
+                &[0, 3, 4, 13, 20, 21, 31, 32, 34, 40, 50, 51, 103, 104],
+            )
+            .await;
             if id == 0 {
                 continue;
             } else if id == 50 {
@@ -1240,13 +1492,18 @@ async fn fall_damage_on_player_position() {
                 got_hurt_animation = true;
             } else if id == 8 {
                 let health = read_i16(&mut client).await;
+                if health == 20 {
+                    // The health of the player at the login: the reference
+                    // sends it in the first tick (`EntityPlayer.bL`).
+                    continue;
+                }
                 assert_eq!(health, 18, "Health should be 18 after 5 block fall");
                 got_damaged_health = true;
             }
         }
     };
 
-    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    timeout(Duration::from_secs(40), exchange).await.unwrap();
     harness.stop().await;
 }
 
@@ -1273,7 +1530,13 @@ async fn pvp_attack_deals_damage_and_velocity() {
         let mut got_hurt = false;
         let mut got_health = false;
         while !got_hurt || !got_health {
-            let id = read_u8(&mut victim).await;
+            let id = read_next_packet_id(
+                &mut victim,
+                &[
+                    0, 3, 4, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             if id == 0 {
                 continue;
             } else if id == 38 {
@@ -1283,15 +1546,12 @@ async fn pvp_attack_deals_damage_and_velocity() {
                 got_hurt = true;
             } else if id == 8 {
                 let health = read_i16(&mut victim).await;
+                if health == 20 {
+                    // The health of the player at the login.
+                    continue;
+                }
                 assert!(health < 20, "Victim health should be reduced, got {health}");
                 got_health = true;
-            } else if id == 28 {
-                let _ = (
-                    read_i32(&mut victim).await,
-                    read_i16(&mut victim).await,
-                    read_i16(&mut victim).await,
-                    read_i16(&mut victim).await,
-                );
             } else if id == 50 {
                 let _ = (
                     read_i32(&mut victim).await,
@@ -1371,7 +1631,13 @@ async fn negative_yaw_camera_rotation_tracked() {
         // Observer should receive packet 32 (EntityLook) with non-zero yaw (around 224)
         let mut got_look = false;
         for _ in 0..60 {
-            let id = read_u8(&mut client1).await;
+            let id = read_next_packet_id(
+                &mut client1,
+                &[
+                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             if id == 32 {
                 let ent = read_i32(&mut client1).await;
                 assert_eq!(ent, 2);
@@ -1381,23 +1647,6 @@ async fn negative_yaw_camera_rotation_tracked() {
                 assert_eq!(pitch, 234, "Negative pitch -30 deg must pack to 234, not 0");
                 got_look = true;
                 break;
-            } else if id == 0 {
-                continue;
-            } else if id == 3 {
-                let _ = read_string(&mut client1).await;
-            } else if id == 20 {
-                let _ = read_i32(&mut client1).await;
-                let _ = read_string(&mut client1).await;
-                let _ = (
-                    read_i32(&mut client1).await,
-                    read_i32(&mut client1).await,
-                    read_i32(&mut client1).await,
-                );
-                let _ = (
-                    read_u8(&mut client1).await,
-                    read_u8(&mut client1).await,
-                    read_i16(&mut client1).await,
-                );
             } else if id == 50 {
                 let _ = (
                     read_i32(&mut client1).await,
@@ -1467,7 +1716,13 @@ async fn block_mining_spawns_pickup_and_collects() {
         let mut got_pickup = false;
         let mut got_collect = false;
         for _ in 0..80 {
-            let id = read_u8(&mut client).await;
+            let id = read_next_packet_id(
+                &mut client,
+                &[
+                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             match id {
                 0 => {}
                 3 => {
@@ -1697,7 +1952,13 @@ async fn respawn_re_spawns_players_for_each_other() {
         let mut saw_destroy = false;
         let mut saw_respawn_entity = false;
         for _ in 0..80 {
-            let id = read_u8(&mut client2).await;
+            let id = read_next_packet_id(
+                &mut client2,
+                &[
+                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             match id {
                 0 => {}
                 3 => {
@@ -1805,7 +2066,13 @@ async fn boat_placement_and_mounting() {
 
         let mut boat_entity_id = None;
         for _ in 0..80 {
-            let id = read_u8(&mut client).await;
+            let id = read_next_packet_id(
+                &mut client,
+                &[
+                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             match id {
                 0 => {}
                 23 => {
@@ -1888,7 +2155,13 @@ async fn boat_placement_and_mounting() {
 
         let mut got_attach = false;
         for _ in 0..80 {
-            let id = read_u8(&mut client).await;
+            let id = read_next_packet_id(
+                &mut client,
+                &[
+                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 40, 50, 51, 103, 104,
+                ],
+            )
+            .await;
             match id {
                 0 => {}
                 13 => {

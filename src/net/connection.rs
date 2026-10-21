@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -151,6 +152,12 @@ async fn write_loop(
     faster_packets: bool,
 ) {
     let mut encoder = Writer::with_capacity(65536);
+    // The packets of a low priority wait until the queue of the packets of
+    // the normal priority is empty (`NetworkManager.f()`).
+    let mut deferred: VecDeque<crate::net::packets::Clientbound> = VecDeque::new();
+    // A burst of packets (the login): the packets of a low priority wait
+    // until the end of the burst.
+    let mut burst = false;
     loop {
         // The kick of the connection: the packet is sent and the
         // connection is closed.
@@ -162,26 +169,33 @@ async fn write_loop(
             }
             break;
         }
-        let Some(first) = outbound.recv().await else {
-            break;
-        };
         encoder.clear();
         let mut should_close = false;
-        match first {
-            Outbound::Packet(packet) => {
-                if packet.encode(&mut encoder).is_err() {
-                    break;
-                }
-            }
-            Outbound::Close => {
-                should_close = true;
-            }
-        }
-        while faster_packets && !should_close && encoder.as_slice().len() < 262_144 {
+        // The packets of this write: the ones of a low priority are held
+        // back until the queue of the other packets is empty.
+        loop {
             match outbound.try_recv() {
                 Ok(Outbound::Packet(packet)) => {
-                    if packet.encode(&mut encoder).is_err() {
+                    if packet.is_low_priority() {
+                        deferred.push_back(packet);
+                    } else if packet.encode(&mut encoder).is_err() {
                         should_close = true;
+                        break;
+                    }
+                }
+                Ok(Outbound::BurstStart) => {
+                    burst = true;
+                }
+                Ok(Outbound::BurstEnd) => {
+                    // The burst is over: the packets of a low priority go.
+                    burst = false;
+                    while let Some(packet) = deferred.pop_front() {
+                        if packet.encode(&mut encoder).is_err() {
+                            should_close = true;
+                            break;
+                        }
+                    }
+                    if should_close {
                         break;
                     }
                 }
@@ -189,7 +203,89 @@ async fn write_loop(
                     should_close = true;
                     break;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    // The queue is empty: the packets of a low priority may
+                    // go — but the packets of the login are sent one by one,
+                    // so the queue can be empty in the middle of them.  Wait
+                    // a moment for the next packet of the normal priority.
+                    if !deferred.is_empty() && !burst {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        match outbound.try_recv() {
+                            Ok(Outbound::Packet(packet)) => {
+                                if packet.is_low_priority() {
+                                    deferred.push_back(packet);
+                                } else if packet.encode(&mut encoder).is_err() {
+                                    should_close = true;
+                                    break;
+                                }
+                            }
+                            Ok(Outbound::BurstStart) => {
+                                burst = true;
+                            }
+                            Ok(Outbound::BurstEnd) => {
+                                burst = false;
+                                while let Some(packet) = deferred.pop_front() {
+                                    if packet.encode(&mut encoder).is_err() {
+                                        should_close = true;
+                                        break;
+                                    }
+                                }
+                                if should_close {
+                                    break;
+                                }
+                            }
+                            Ok(Outbound::Close) => {
+                                should_close = true;
+                                break;
+                            }
+                            Err(_) => {
+                                while let Some(packet) = deferred.pop_front() {
+                                    if packet.encode(&mut encoder).is_err() {
+                                        should_close = true;
+                                        break;
+                                    }
+                                }
+                                if should_close {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !should_close && encoder.as_slice().is_empty() {
+                        // Nothing to send: wait for the next packet.
+                        match outbound.recv().await {
+                            Some(Outbound::Packet(packet)) => {
+                                if packet.is_low_priority() {
+                                    deferred.push_back(packet);
+                                } else if packet.encode(&mut encoder).is_err() {
+                                    should_close = true;
+                                }
+                            }
+                            Some(Outbound::BurstStart) => {
+                                burst = true;
+                            }
+                            Some(Outbound::BurstEnd) => {
+                                burst = false;
+                                while let Some(packet) = deferred.pop_front() {
+                                    if packet.encode(&mut encoder).is_err() {
+                                        should_close = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Outbound::Close) => {
+                                should_close = true;
+                            }
+                            None => {
+                                should_close = true;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            if !faster_packets || encoder.as_slice().len() >= 262_144 {
+                break;
             }
         }
         if !encoder.as_slice().is_empty() {

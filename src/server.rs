@@ -616,8 +616,8 @@ impl Server {
             .entities
             .iter_players_mut()
             .filter_map(|p| {
-                if p.health != p.last_health {
-                    p.last_health = p.health;
+                if p.health as i32 != p.last_health {
+                    p.last_health = p.health as i32;
                     Some((p.conn_id, p.health))
                 } else {
                     None
@@ -10352,7 +10352,12 @@ impl Server {
         while self.world.java_do_lighting() {}
 
         for (pos, dirty, watchers) in dirty_list {
-            if dirty.full_resync || dirty.count >= 64 {
+            // Java `PlayerInstance.a()`: the whole chunk is sent only when
+            // the chunk has to be sent again from scratch (`full_resync` is a
+            // mechanism of the port: the trees that cross the border of the
+            // chunks).  The array of the dirty blocks holds ten blocks, so the
+            // threshold of the reference (ten) is the only one.
+            if dirty.full_resync {
                 if let Ok((pre, map)) = self.world.prepare_chunk_packets(pos) {
                     let pkt = Clientbound::MapChunk(map);
                     for conn_id in watchers {
@@ -10370,6 +10375,60 @@ impl Server {
                             self.send(conn_id, pkt.clone());
                             if let Some(chunk) = self.world.get_chunk(pos) {
                                 for te in &chunk.tile_entities {
+                                    if let TileEntityKind::Sign { lines } = &te.kind {
+                                        self.send(
+                                            conn_id,
+                                            Clientbound::UpdateSign(UpdateSign {
+                                                x: te.x,
+                                                y: te.y as i16,
+                                                z: te.z,
+                                                lines: lines.clone(),
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if dirty.count == 10 {
+                // Java `PlayerInstance.a()`: ten dirty blocks are sent as
+                // the partial `Packet51MapChunk` of the region of the
+                // blocks.
+                let min_y = dirty.min_y.div_euclid(2) * 2;
+                let max_y = (dirty.max_y.div_euclid(2) + 1) * 2;
+                let size_x = (dirty.max_x - dirty.min_x + 1) as u8;
+                let size_y = (max_y - min_y + 2) as u8;
+                let size_z = (dirty.max_z - dirty.min_z + 1) as u8;
+                let x = pos.x * 16 + dirty.min_x;
+                let z = pos.z * 16 + dirty.min_z;
+                if let Some(chunk) = self.world.get_chunk(pos) {
+                    if let Ok(map) = crate::net::packets::chunk::MapChunk::from_region(
+                        chunk,
+                        x,
+                        min_y as i16,
+                        z,
+                        size_x,
+                        size_y,
+                        size_z,
+                    ) {
+                        for conn_id in watchers {
+                            let should_send = self.entities.get_by_conn(conn_id).is_some_and(|p| {
+                                p.dimension == self.active_dimension && p.sent_chunks.contains(&pos)
+                            });
+                            if should_send {
+                                self.send(conn_id, Clientbound::MapChunk(map.clone()));
+                                // The tile entities of the region.
+                                for te in &chunk.tile_entities {
+                                    if te.x < x
+                                        || te.x >= x + size_x as i32
+                                        || te.y < min_y
+                                        || te.y >= min_y + size_y as i32
+                                        || te.z < z
+                                        || te.z >= z + size_z as i32
+                                    {
+                                        continue;
+                                    }
                                     if let TileEntityKind::Sign { lines } = &te.kind {
                                         self.send(
                                             conn_id,
@@ -11049,6 +11108,10 @@ impl Server {
             player.dimension = login_dimension;
         }
 
+        // The burst of the login: the packets of a low priority (the data of
+        // the chunks) wait until the burst is over (`NetworkManager.f()`).
+        self.send_burst_start(id);
+
         self.with_dimension(login_dimension, |s| {
             // `NetLoginHandler.b`: the login packet carries the player's world
             // seed and dimension, the spawn position packet the raw world
@@ -11117,6 +11180,9 @@ impl Server {
                 }),
             );
         }
+
+        // The end of the burst of the login.
+        self.send_burst_end(id);
 
         // Poseidon: PlayerJoinEvent -> broadcast join message to other players
         let join_msg = self.config.messages.join.replacen("%player%", name, 1);
@@ -12037,6 +12103,21 @@ impl Server {
     fn send(&self, id: ConnId, packet: Clientbound) {
         if let Some(connection) = self.connections.get(&id) {
             let _ = connection.sender.send(Outbound::Packet(packet));
+        }
+    }
+
+    /// The start of a burst of packets: the packets of a low priority wait
+    /// until the end of the burst.
+    fn send_burst_start(&self, id: ConnId) {
+        if let Some(connection) = self.connections.get(&id) {
+            let _ = connection.sender.send(Outbound::BurstStart);
+        }
+    }
+
+    /// The end of a burst of packets.
+    fn send_burst_end(&self, id: ConnId) {
+        if let Some(connection) = self.connections.get(&id) {
+            let _ = connection.sender.send(Outbound::BurstEnd);
         }
     }
 
@@ -13694,7 +13775,11 @@ mod tests {
         let mut ids: Vec<u8> = Vec::new();
         let mut slots: Vec<(i8, i16)> = Vec::new();
         let mut health = 0;
-        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+        while let Ok(outbound) = rx.try_recv() {
+            let Outbound::Packet(packet) = outbound else {
+                // The markers of the burst of the login carry no data.
+                continue;
+            };
             match packet {
                 Clientbound::UpdateHealth(_) => health += 1,
                 Clientbound::SetSlot(slot) => slots.push((slot.window_id, slot.slot)),
@@ -13715,6 +13800,48 @@ mod tests {
         assert!(ids.contains(&104), "the items of the inventory are sent");
         assert_eq!(slots, vec![(-1, -1)], "the item in hand");
         assert_eq!(health, 0, "the health is not sent at the login");
+    }
+
+    /// The first tick of the player sends the packet of the health.
+    ///
+    /// Java `EntityPlayer.bL` starts with `-99999999` ✓, so the health of
+    /// the player differs from it in the first tick and the packet of the
+    /// health is sent (`EntityPlayer.java:345-348`).
+    #[test]
+    fn the_first_tick_sends_the_packet_of_the_health() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.connections.insert(
+            7,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().expect("the address"),
+                state: ConnectionState::Playing,
+                username: Some("Tester".to_string()),
+                entity_id: 1,
+                idle_ticks: 0,
+            },
+        );
+        server.handle_packet(
+            7,
+            Serverbound::Login(crate::net::packets::Login {
+                protocol: crate::net::protocol::PROTOCOL_VERSION,
+                username: "Tester".to_string(),
+                map_seed: 0,
+                dimension: 0,
+            }),
+        );
+        // The packets of the login.
+        while rx.try_recv().is_ok() {}
+        // The first tick.
+        server.tick(0);
+        let mut health = None;
+        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            if let Clientbound::UpdateHealth(packet) = packet {
+                health = Some(packet.health);
+            }
+        }
+        assert_eq!(health, Some(20), "the health of the player");
     }
 
     /// The connection that received nothing is disconnected.
@@ -14226,6 +14353,102 @@ mod tests {
         // The mob on the ground is in the first slice.
         let first = entities[0].get_str("id").expect("the name of the type");
         assert_eq!(first, "Cow", "the mob of the lower slice comes first");
+    }
+
+    /// The partial packet of the region holds the blocks of the region.
+    ///
+    /// Java `PlayerInstance.a()`: ten dirty blocks are sent as the partial
+    /// `Packet51MapChunk` of the region of the blocks.
+    #[test]
+    fn the_partial_packet_of_the_region_holds_the_blocks_of_the_region() {
+        use crate::net::packets::chunk::MapChunk;
+        use crate::util::compress::inflate_zlib;
+        use crate::world::chunk::{Chunk, ChunkPos};
+
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0));
+        chunk.set_block(1, 64, 2, blocks::STONE);
+        chunk.set_metadata(1, 64, 2, 3);
+
+        let map = MapChunk::from_region(&chunk, 1, 64, 2, 1, 2, 1).unwrap();
+        assert_eq!(map.x, 1, "the x of the packet");
+        assert_eq!(map.y, 64, "the y of the packet");
+        assert_eq!(map.z, 2, "the z of the packet");
+        assert_eq!(map.size_x, 1, "the width of the region");
+        assert_eq!(map.size_y, 2, "the height of the region");
+        assert_eq!(map.size_z, 1, "the depth of the region");
+
+        let payload = inflate_zlib(&map.compressed, 1024 * 1024).unwrap();
+        // The blocks of the region.
+        assert_eq!(payload[0], blocks::STONE, "the block of the region");
+        assert_eq!(payload[1], blocks::AIR, "the block above");
+        // The metadata: the low nibble is the even height.
+        assert_eq!(payload[2] & 15, 3, "the metadata of the block");
+    }
+
+    /// The array of the dirty blocks holds ten blocks.
+    ///
+    /// Java `PlayerInstance.a(int, int, int)`: `short[10]`, the eleventh
+    /// block is dropped.
+    #[test]
+    fn the_chunk_holds_ten_dirty_blocks_at_most() {
+        use crate::world::chunk::ChunkPos;
+
+        let config = crate::config::WorldConfig {
+            seed: 100,
+            save_enabled: false,
+            view_distance: 2,
+            ..Default::default()
+        };
+        let mut world = crate::world::world::World::new(config);
+        world.live_enable();
+        world.live_player_join(1, 8.5, 8.5);
+        world.take_dirty_chunks();
+
+        for i in 0..12 {
+            world.flag_dirty(i, 64, 8);
+        }
+
+        let dirty = world.take_dirty_chunks();
+        let entry = dirty
+            .iter()
+            .find(|(pos, _, _)| *pos == ChunkPos::new(0, 0))
+            .expect("the dirty chunk");
+        assert_eq!(entry.1.count, 10, "ten dirty blocks at most");
+        assert_eq!(entry.1.min_x, 0, "the minimum x of the region");
+        assert_eq!(entry.1.max_x, 11, "the maximum x of the region");
+    }
+
+    /// The packets of the data of the chunk and of the blocks have a low
+    /// priority.
+    ///
+    /// Java `Packet.k`: the packets 51, 52, 53, 130 and 131 have a low
+    /// priority — they wait until the queue of the other packets is empty.
+    #[test]
+    fn the_packets_of_the_data_of_the_chunk_have_a_low_priority() {
+        use crate::net::packets::Clientbound;
+
+        assert!(Clientbound::MapChunk(crate::net::packets::chunk::MapChunk {
+            x: 0,
+            y: 0,
+            z: 0,
+            size_x: 16,
+            size_y: 128,
+            size_z: 16,
+            compressed: Vec::new(),
+        })
+        .is_low_priority());
+        assert!(Clientbound::BlockChange(BlockChange {
+            x: 0,
+            y: 0,
+            z: 0,
+            block_type: 0,
+            metadata: 0,
+        })
+        .is_low_priority());
+        assert!(!Clientbound::Chat(Chat {
+            message: "hi".to_string(),
+        })
+        .is_low_priority());
     }
 
     /// The mobs push each other away.

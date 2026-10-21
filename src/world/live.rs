@@ -31,21 +31,19 @@ use crate::world::chunk::{ChunkPos, ChunkState};
 use crate::world::storage::nbt::NbtTag;
 use crate::world::world::World;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DirtyChunk {
-    pub blocks: [u16; 64],
+    /// Java `PlayerInstance.dirtyBlocks`: the array holds ten blocks.
+    pub blocks: [u16; 10],
     pub count: usize,
     pub full_resync: bool,
-}
-
-impl Default for DirtyChunk {
-    fn default() -> Self {
-        Self {
-            blocks: [0; 64],
-            count: 0,
-            full_resync: false,
-        }
-    }
+    /// The region of the dirty blocks (the coordinates of the chunk).
+    pub min_x: i32,
+    pub max_x: i32,
+    pub min_y: i32,
+    pub max_y: i32,
+    pub min_z: i32,
+    pub max_z: i32,
 }
 
 /// Shared state for the live/server choreography.
@@ -476,14 +474,31 @@ impl World {
         if self.live.instances.contains_key(&pos) {
             let entry = self.live.dirty_chunks.entry(pos).or_default();
             if !entry.full_resync {
-                if entry.count < 64 {
-                    let short1 = (((x & 15) as u16) << 12) | (((z & 15) as u16) << 8) | (y as u16);
+                // Java `PlayerInstance.a(int, int, int)`: the region of the
+                // dirty blocks and the array of ten blocks.
+                let lx = x & 15;
+                let lz = z & 15;
+                if entry.count == 0 {
+                    entry.min_x = lx;
+                    entry.max_x = lx;
+                    entry.min_y = y;
+                    entry.max_y = y;
+                    entry.min_z = lz;
+                    entry.max_z = lz;
+                } else {
+                    entry.min_x = entry.min_x.min(lx);
+                    entry.max_x = entry.max_x.max(lx);
+                    entry.min_y = entry.min_y.min(y);
+                    entry.max_y = entry.max_y.max(y);
+                    entry.min_z = entry.min_z.min(lz);
+                    entry.max_z = entry.max_z.max(lz);
+                }
+                if entry.count < 10 {
+                    let short1 = ((lx as u16) << 12) | ((lz as u16) << 8) | (y as u16);
                     if !entry.blocks[..entry.count].contains(&short1) {
                         entry.blocks[entry.count] = short1;
                         entry.count += 1;
                     }
-                } else {
-                    entry.full_resync = true;
                 }
             }
         }
@@ -640,6 +655,47 @@ impl World {
 mod tests {
     use super::*;
     use crate::config::WorldConfig;
+
+    /// The array of the dirty blocks holds ten blocks.
+    ///
+    /// Java `PlayerInstance.a(int, int, int)`: `short[10]`, the eleventh
+    /// block is dropped.
+    #[test]
+    fn the_chunk_holds_ten_dirty_blocks_at_most() {
+        let config = WorldConfig {
+            seed: 100,
+            save_enabled: false,
+            view_distance: 2,
+            ..Default::default()
+        };
+        let mut world = World::new(config);
+        world.live_enable();
+        world.live_player_join(1, 8.5, 8.5);
+
+        // The population of the chunks marks them for a full re-send; the
+        // dirty blocks are counted apart.
+        world.take_dirty_chunks();
+
+        for i in 0..12 {
+            world.flag_dirty(i % 16, 64, 8);
+        }
+
+        let dirty = world.take_dirty_chunks();
+        let entry = dirty
+            .iter()
+            .find(|(pos, _, _)| *pos == ChunkPos::new(0, 0))
+            .expect("the dirty chunk");
+        assert_eq!(entry.1.count, 10, "ten dirty blocks at most");
+        // The region of the dirty blocks.
+        assert_eq!(entry.1.min_x, 0, "the minimum x of the region");
+        // The region is updated for every flagged block, the eleventh block
+        // is only dropped from the array.
+        assert_eq!(entry.1.max_x, 11, "the maximum x of the region");
+        assert_eq!(entry.1.min_y, 64, "the minimum y of the region");
+        assert_eq!(entry.1.max_y, 64, "the maximum y of the region");
+        assert_eq!(entry.1.min_z, 8, "the minimum z of the region");
+        assert_eq!(entry.1.max_z, 8, "the maximum z of the region");
+    }
 
     #[test]
     fn player_join_spiral_covers_exact_view_square() {
