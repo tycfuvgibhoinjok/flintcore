@@ -375,6 +375,17 @@ async fn skip_packet_payload(stream: &mut TcpStream, id: u8) -> bool {
                 }
             }
         }
+        130 => {
+            // The sign: the four lines of the text.
+            let _ = (
+                read_i32(stream).await,
+                read_i16(stream).await,
+                read_i32(stream).await,
+            );
+            for _ in 0..4 {
+                let _ = read_string(stream).await;
+            }
+        }
         _ => return false,
     }
     true
