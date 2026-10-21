@@ -12321,9 +12321,16 @@ fn random_look(
         // float)`): the limit of the turn is 10 degrees and the limit of the
         // pitch is `EntityLiving.u()`.
         let mut drop = false;
+        // Java `EntityLiving.u()`: the limit of the pitch is 40, the sitting
+        // wolf has 20 (`EntityWolf.java:211-213`).
+        let pitch_limit = if mob.mob_type == MobType::Wolf && mob.wolf_sitting {
+            20.0
+        } else {
+            40.0
+        };
         match players.iter().find(|&&(id, ..)| id == pid) {
             Some(&(_, _, px, py, pz, dead)) => {
-                look_at(mob, px, py, pz, PLAYER_EYE_HEIGHT, 10.0, 40.0);
+                look_at(mob, px, py, pz, PLAYER_EYE_HEIGHT, 10.0, pitch_limit);
                 // The mob stops looking at the player when the player is dead
                 // or too far away (`EntityLiving.c_()`).
                 if dead || (px - mob.x).powi(2) + (py - mob.y).powi(2) + (pz - mob.z).powi(2) > 64.0

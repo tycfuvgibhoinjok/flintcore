@@ -861,9 +861,17 @@ impl Mob {
     ///
     /// The reference uses the width of the mob, not its height, and the
     /// multiplication is a single precision one.
+    /// Java `EntityLiving.t()`: the height of the eyes of the mob.
+    ///
+    /// The base is `width * 0.85F` ✓, the wolf overrides it with
+    /// `width * 0.8F` ✓ (`EntityWolf.java:207-209` ✓).
     pub fn eye_height(&self) -> f64 {
         let (_, width) = self.size();
-        (width * 0.85f32) as f64
+        let factor = match self.mob_type {
+            MobType::Wolf => 0.8f32,
+            _ => 0.85f32,
+        };
+        (width * factor) as f64
     }
 
     /// Java `EntityLiving.k()`: the volume of the sound of the mob.
@@ -946,7 +954,10 @@ impl Mob {
                 } else {
                     let roll = rng.next_i32_bound(3);
                     Some(if roll == 0 {
-                        if self.wolf_tamed {
+                        // Java `EntityWolf.g()`: the whine needs the tamed
+                        // wolf with the health below ten (the datawatcher 18
+                        // is the health ✓).
+                        if self.wolf_tamed && self.health < 10 {
                             "mob.wolf.whine"
                         } else {
                             "mob.wolf.panting"
@@ -2139,6 +2150,40 @@ pub fn chunk_sky_light_at(world: &World, x: i32, y: i32, z: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wolf whines only when it is tamed and its health is below ten.
+    ///
+    /// Java `EntityWolf.g()`: `isTamed() && datawatcher.b(18) < 10` — the
+    /// datawatcher 18 is the health of the wolf ✓.
+    #[test]
+    fn the_wolf_whines_only_when_it_is_tamed_and_its_health_is_low() {
+        // The seed whose first draw of `nextInt(3)` is zero — the branch of
+        // the whine.
+        let mut seed = 0i64;
+        while JavaRandom::new(seed).next_i32_bound(3) != 0 {
+            seed += 1;
+        }
+        let mut mob = Mob::new(1, MobType::Wolf, 0.0, 64.0, 0.0, &mut JavaRandom::new(0));
+        // The wild wolf pants.
+        assert_eq!(
+            mob.idle_sound_name(&mut JavaRandom::new(seed)),
+            Some("mob.wolf.panting")
+        );
+        // The tamed wolf with the health of ten pants too.
+        mob.wolf_tamed = true;
+        mob.health = 10;
+        assert_eq!(
+            mob.idle_sound_name(&mut JavaRandom::new(seed)),
+            Some("mob.wolf.panting")
+        );
+        // The tamed wolf with the health of nine whines.
+        mob.health = 9;
+        assert_eq!(
+            mob.idle_sound_name(&mut JavaRandom::new(seed)),
+            Some("mob.wolf.whine")
+        );
+    }
+
     use crate::config::{WorldConfig, MOB_SPAWN_NAMES};
     use crate::world::chunk::CHUNK_AREA;
 
