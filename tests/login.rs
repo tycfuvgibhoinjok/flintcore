@@ -751,45 +751,6 @@ async fn read_pre_chunks(client: &mut TcpStream) {
     }
 }
 
-/// Reads the data of the chunks (`Packet51MapChunk`).
-///
-/// The data of the chunks has a low priority (`Packet.k`), so it is sent
-/// after the other packets of the login.  The packets of the pre-chunk of
-/// the chunks that the server streams later can come before it.
-async fn read_chunk_data(client: &mut TcpStream) {
-    let mut read = 0;
-    while read < 9 {
-        let id = read_u8(client).await;
-        match id {
-            51 => {
-                let _ = (
-                    read_i32(client).await,
-                    read_i16(client).await,
-                    read_i32(client).await,
-                );
-                let _ = (
-                    read_u8(client).await,
-                    read_u8(client).await,
-                    read_u8(client).await,
-                );
-                let len = read_i32(client).await as usize;
-                let mut comp = vec![0u8; len];
-                client.read_exact(&mut comp).await.unwrap();
-                read += 1;
-            }
-            50 => {
-                // The pre-chunk of the next chunk of the world.
-                let _ = (
-                    read_i32(client).await,
-                    read_i32(client).await,
-                    read_bool(client).await,
-                );
-            }
-            other => panic!("unexpected packet {other} in the data of the chunks"),
-        }
-    }
-}
-
 /// Reads the items of the inventory and the item in the hand.
 async fn read_window_items(client: &mut TcpStream) {
     assert_eq!(read_u8(client).await, 104, "WindowItems");
@@ -814,62 +775,99 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
     assert_eq!(read_u8(client).await, 2);
     assert_eq!(read_string(client).await, "-");
 
-    assert_eq!(read_u8(client).await, 1);
-    let _ = read_i32(client).await;
-    let _ = read_string(client).await;
-    let _ = read_i64(client).await;
-    let _ = read_u8(client).await;
-
-    assert_eq!(read_u8(client).await, 6);
-    let _ = (
-        read_i32(client).await,
-        read_i32(client).await,
-        read_i32(client).await,
-    );
-
-    assert_eq!(read_u8(client).await, 4);
-    let _ = read_i64(client).await;
-
-    read_pre_chunks(client).await;
-
-    assert_eq!(read_u8(client).await, 13);
-    let _ = (
-        read_f64(client).await,
-        read_f64(client).await,
-        read_f64(client).await,
-        read_f64(client).await,
-    );
-    let _ = (
-        read_f32(client).await,
-        read_f32(client).await,
-        read_bool(client).await,
-    );
-
-    // The second packet of the time (`NetLoginHandler`: the time of the
-    // player is sent after the position of the player).
-    assert_eq!(read_u8(client).await, 4);
-    let _ = read_i64(client).await;
-
-    // Consume initial WindowItems (104)
-    assert_eq!(read_u8(client).await, 104);
-    let _win_id = read_u8(client).await;
-    let count = read_i16(client).await;
-    for _ in 0..count {
-        let item_id = read_i16(client).await;
-        if item_id >= 0 {
-            let _ = (read_u8(client).await, read_i16(client).await);
+    // The packets of the login (`NetLoginHandler`): the login, the spawn
+    // position, the time of the world, the position of the player, the
+    // second packet of the time, the items of the inventory and the item in
+    // hand.  The data of the chunks has a low priority (`Packet.k`), so it
+    // comes at the end.
+    let mut pre_chunks = 0;
+    let mut chunk_data = 0;
+    let mut times = 0;
+    let mut spawn = false;
+    let mut items = false;
+    let mut slot = false;
+    while pre_chunks < 9 || chunk_data < 9 || times < 2 || !spawn || !items || !slot {
+        let id = read_u8(client).await;
+        match id {
+            1 => {
+                let _ = read_i32(client).await;
+                let _ = read_string(client).await;
+                let _ = read_i64(client).await;
+                let _ = read_u8(client).await;
+            }
+            4 => {
+                let _ = read_i64(client).await;
+                times += 1;
+            }
+            6 => {
+                let _ = (
+                    read_i32(client).await,
+                    read_i32(client).await,
+                    read_i32(client).await,
+                );
+            }
+            13 => {
+                let _ = (
+                    read_f64(client).await,
+                    read_f64(client).await,
+                    read_f64(client).await,
+                    read_f64(client).await,
+                );
+                let _ = (read_f32(client).await, read_f32(client).await);
+                let _ = read_bool(client).await;
+                spawn = true;
+            }
+            50 => {
+                let _ = (
+                    read_i32(client).await,
+                    read_i32(client).await,
+                    read_bool(client).await,
+                );
+                pre_chunks += 1;
+            }
+            51 => {
+                let _ = (
+                    read_i32(client).await,
+                    read_i16(client).await,
+                    read_i32(client).await,
+                );
+                let _ = (
+                    read_u8(client).await,
+                    read_u8(client).await,
+                    read_u8(client).await,
+                );
+                let len = read_i32(client).await as usize;
+                let mut comp = vec![0u8; len];
+                client.read_exact(&mut comp).await.unwrap();
+                chunk_data += 1;
+            }
+            103 => {
+                let _ = read_u8(client).await;
+                let _ = read_i16(client).await;
+                let item_id = read_i16(client).await;
+                if item_id >= 0 {
+                    let _ = (read_u8(client).await, read_i16(client).await);
+                }
+                slot = true;
+            }
+            104 => {
+                let _ = read_u8(client).await;
+                let count = read_i16(client).await;
+                for _ in 0..count {
+                    let item_id = read_i16(client).await;
+                    if item_id >= 0 {
+                        let _ = (read_u8(client).await, read_i16(client).await);
+                    }
+                }
+                items = true;
+            }
+            other => {
+                // The packets of the world that the server sends between the
+                // packets of the login.
+                let _ = skip_packet_payload(client, other).await;
+            }
         }
     }
-
-    // The item in the hand (`EntityPlayer.a(Container, List)`): the packet
-    // of the slot of the hand follows the items of the inventory.
-    assert_eq!(read_u8(client).await, 103);
-    let _ = read_u8(client).await;
-    let _ = read_i16(client).await;
-    let _item_id = read_i16(client).await;
-
-    // The data of the chunks has a low priority: it comes at the end.
-    read_chunk_data(client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
