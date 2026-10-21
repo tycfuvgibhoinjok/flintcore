@@ -2356,28 +2356,27 @@ impl World {
         biome.can_rain()
     }
 
-    /// Java `World.i()` (`World.java:1770-1850`): tick weather timers; returns `Some(new_raining)` when rain state changes.
+    /// Java `World.i()` (`World.java:1769-1850`): the tick of the weather.
+    ///
+    /// The method returns the state of the rain **before** the tick when the
+    /// intensity of the rain crosses the threshold of `0.2` ✓ — the reference
+    /// sends the packet of the weather then ✓ (`WorldServer.java:181-195` ✓,
+    /// `World.v()` ✓).
     pub fn tick_weather(&mut self) -> Option<bool> {
-        // The intensity of the rain and of the thunder (`World.g()`): they
-        // rise by one hundredth every tick while the weather lasts.
-        let storm = self.level_data.borrow().raining;
-        let thundering = self.level_data.borrow().thundering;
-        let rain = self.rain_intensity.get();
-        let thunder = self.thunder_intensity.get();
-        self.rain_intensity
-            .set((rain + if storm { 0.01 } else { -0.01 }).clamp(0.0, 1.0));
-        self.thunder_intensity
-            .set((thunder + if thundering { 0.01 } else { -0.01 }).clamp(0.0, 1.0));
+        // `World.v()`: the rain is on when the intensity of the rain is
+        // greater than 0.2.
+        // `World.v()`: the comparison is in a double precision ✓.
+        let was_raining = self.rain_intensity.get() as f64 > 0.2;
         if !self.mechanics.do_weather {
             let mut ld = self.level_data.borrow_mut();
-            let was_raining = ld.raining;
             ld.raining = false;
             ld.thundering = false;
+            self.rain_intensity.set(0.0);
+            self.thunder_intensity.set(0.0);
             return if was_raining { Some(false) } else { None };
         }
         let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
         let mut ld = self.level_data.borrow_mut();
-        let was_raining = ld.raining;
 
         if ld.thunder_time <= 0 {
             if ld.thundering {
@@ -2405,11 +2404,29 @@ impl World {
             }
         }
 
-        let new_raining = ld.raining;
+        // The flags are read after the durations are processed: the reference
+        // changes them in the tick (`World.i()` ✓).
+        let storm = ld.raining;
+        let thundering = ld.thundering;
         drop(ld);
         self.tick_random = rng;
-        if new_raining != was_raining {
-            Some(new_raining)
+
+        // The intensity of the rain and of the thunder (`World.i()`): the sum
+        // is in a double precision ✓ and the value is rounded to a single
+        // precision one ✓ (`this.j = (float)((double)this.j + 0.01D)` ✓).
+        let rain = self.rain_intensity.get();
+        let thunder = self.thunder_intensity.get();
+        let rain = ((rain as f64 + if storm { 0.01 } else { -0.01 }) as f32).clamp(0.0, 1.0);
+        let thunder =
+            ((thunder as f64 + if thundering { 0.01 } else { -0.01 }) as f32).clamp(0.0, 1.0);
+        self.rain_intensity.set(rain);
+        self.thunder_intensity.set(thunder);
+
+        // `World.v()`: the packet of the weather is sent when the intensity
+        // of the rain crosses the threshold of 0.2.
+        let is_raining = rain as f64 > 0.2;
+        if was_raining != is_raining {
+            Some(was_raining)
         } else {
             None
         }
@@ -3339,6 +3356,35 @@ mod tests {
     use super::*;
     use crate::config::WorldConfig;
 
+    /// The packet of the weather is sent when the intensity of the rain
+    /// crosses the threshold of `0.2`.
+    ///
+    /// Java `World.v()` (`World.java:2416-2418`) — the rain is on when the
+    /// intensity of the rain is greater than `0.2` ✓ — and
+    /// `WorldServer.java:181-195` ✓: the packet goes to the players of the
+    /// world when the state changes ✓.
+    #[test]
+    fn the_weather_packet_is_sent_when_the_intensity_of_the_rain_crosses_the_threshold() {
+        let mut world = make_flat_world();
+        // The rain is on and the intensity is below the threshold: the
+        // intensity grows above it and the packet is sent.
+        {
+            let mut ld = world.level_data.borrow_mut();
+            ld.raining = true;
+            // The durations are long enough not to change the flags.
+            ld.rain_time = 1000;
+            ld.thunder_time = 1000;
+        }
+        world.rain_intensity.set(0.19f32);
+        assert_eq!(world.tick_weather(), Some(false), "the rain starts");
+        // The intensity is above the threshold: nothing changes.
+        assert_eq!(world.tick_weather(), None, "the rain does not change");
+        // The rain stops: the intensity falls below the threshold.
+        world.level_data.borrow_mut().raining = false;
+        world.rain_intensity.set(0.2f32);
+        assert_eq!(world.tick_weather(), Some(true), "the rain stops");
+    }
+
     fn make_flat_world() -> World {
         let mut world = World::new(WorldConfig {
             seed: 42,
@@ -3687,7 +3733,9 @@ mod tests {
             ld.thundering = false;
             ld.thunder_time = 1;
         }
-        assert_eq!(world.tick_weather(), Some(true));
+        // The flags change, but the intensity of the rain is still below the
+        // threshold of `0.2` — the packet of the weather is not sent yet.
+        assert_eq!(world.tick_weather(), None);
         assert!(world.is_raining());
         assert!(world.is_thundering());
 

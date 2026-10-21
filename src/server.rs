@@ -478,11 +478,14 @@ impl Server {
             }
         }
 
-        // Weather cycle (`World.i()` + `WorldServer.java:182-195` Packet70Bed rain toggle)
+        // Weather cycle (`World.i()` + `WorldServer.java:181-195`): the packet
+        // of the weather is sent when the intensity of the rain crosses the
+        // threshold of `0.2` (`World.v()`) — the reason is 2 when the rain was
+        // on before the tick.
         if self.world.live_is_active() {
-            if let Some(new_raining) = self.world.tick_weather() {
+            if let Some(was_raining) = self.world.tick_weather() {
                 self.broadcast(Clientbound::Bed(Bed {
-                    reason: if new_raining { 1 } else { 2 },
+                    reason: if was_raining { 2 } else { 1 },
                 }));
             }
         }
