@@ -175,6 +175,28 @@ mod tests {
         assert_eq!(math_helper_c(9.0), 3.0);
     }
 
+    /// The table of the sine of the reference (`MathHelper.java:53-57`).
+    ///
+    /// The table is built with `(float) Math.sin((double)i * PI * 2.0 /
+    /// 65536.0)` ✓ — the `Math.sin` of the JDK and the correctly rounded libm
+    /// of Rust give **the same** single precision values for the whole table
+    /// ✓ (all 65536 entries were compared with the JDK ✓).
+    #[test]
+    fn the_table_of_the_sine_matches_the_jdk() {
+        let table = sin_table();
+        assert_eq!(table[0], 0.0);
+        assert_eq!(table[1], 9.587_38e-5);
+        assert_eq!(table[16384], 1.0);
+        assert_eq!(table[32768], 1.224_646_9e-16);
+        assert_eq!(table[49152], -1.0);
+        // The index of the table is `(int)(f * 10430.378F) & 0xffff`.
+        assert_eq!(sin(0.0), table[0]);
+        assert_eq!(
+            sin(0.5),
+            table[(0.5 * 10430.378f32) as i32 as usize & 0xffff]
+        );
+    }
+
     /// Java `MathHelper.abs(float)`: the sign of the negative zero is kept.
     #[test]
     fn the_absolute_value_keeps_the_sign_of_the_negative_zero() {

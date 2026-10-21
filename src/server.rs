@@ -4000,7 +4000,8 @@ impl Server {
             let dx = boat_snap.prev_x - boat_snap.x;
             let dz = boat_snap.prev_z - boat_snap.z;
             if dx * dx + dz * dz > 0.001 {
-                let target_yaw = (dz.atan2(dx) * 180.0 / std::f64::consts::PI) as f32;
+                let target_yaw =
+                    (crate::util::fdlibm::atan2(dz, dx) * 180.0 / std::f64::consts::PI) as f32;
                 let mut diff = target_yaw - boat_snap.yaw;
                 while diff >= 180.0 {
                     diff -= 360.0;
@@ -5523,7 +5524,7 @@ impl Server {
                                 mob.yaw = (crate::util::fdlibm::atan2(dz, dx) * 180.0
                                     / crate::entity::mob::JAVA_PI_DOUBLE)
                                     as f32
-                                    - 90.0;
+                                    - 90.0f32;
                                 // The mob sees its target
                                 // (`EntitySkeleton.a`).
                                 mob.sees_target = true;
@@ -5996,7 +5997,7 @@ impl Server {
                                 let tdz = tz - mob.z;
                                 if tdx * tdx + tdy * tdy + tdz * tdz < 64.0 * 64.0 && has_los {
                                     mob.yaw = -(crate::util::fdlibm::atan2(tdx, tdz) as f32)
-                                        * 180.0
+                                        * 180.0f32
                                         / crate::entity::mob::JAVA_PI;
                                     mob.look_yaw = mob.yaw;
                                     mob.ghast_charge += 1;
@@ -6020,7 +6021,7 @@ impl Server {
                                 // flight (`EntityGhast.c_()`).
                                 let yaw = -(crate::util::fdlibm::atan2(mob.mot_x, mob.mot_z)
                                     as f32)
-                                    * 180.0
+                                    * 180.0f32
                                     / crate::entity::mob::JAVA_PI;
                                 mob.yaw = yaw;
                                 mob.look_yaw = yaw;
@@ -6080,7 +6081,7 @@ impl Server {
                                             * 180.0
                                             / crate::entity::mob::JAVA_PI_DOUBLE)
                                             as f32
-                                            - 90.0;
+                                            - 90.0f32;
                                         let mut diff = target_yaw - mob.yaw;
                                         while diff < -180.0 {
                                             diff += 360.0;
@@ -6106,10 +6107,10 @@ impl Server {
                                                     * 180.0
                                                     / crate::entity::mob::JAVA_PI_DOUBLE)
                                                     as f32
-                                                    - 90.0;
-                                                let f3 = (f4 - mob.yaw + 90.0)
-                                                    * std::f32::consts::PI
-                                                    / 180.0;
+                                                    - 90.0f32;
+                                                let f3 = (f4 - mob.yaw + 90.0f32)
+                                                    * crate::entity::mob::JAVA_PI
+                                                    / 180.0f32;
                                                 mob.move_strafe =
                                                     -crate::util::math::sin(f3) * mob.move_forward;
                                                 mob.move_forward *= crate::util::math::cos(f3);
@@ -6254,10 +6255,10 @@ impl Server {
                         }
                         // The yaw of the swim (`EntityLiving.K`).
                         mob.look_yaw +=
-                            (-(crate::util::fdlibm::atan2(mob.mot_x, mob.mot_z) as f32) * 180.0
+                            (-(crate::util::fdlibm::atan2(mob.mot_x, mob.mot_z) as f32) * 180.0f32
                                 / crate::entity::mob::JAVA_PI
                                 - mob.look_yaw)
-                                * 0.1;
+                                * 0.1f32;
                         mob.yaw = mob.look_yaw;
                     } else {
                         mob.squid_tentacle_angle = crate::util::math::sin(mob.squid_phase).abs()
@@ -6324,9 +6325,9 @@ impl Server {
                     if moved > 0.05 {
                         // The reference uses its own `TrigMath.atan2` here and
                         // the whole expression is a single precision one.
-                        look = (crate::util::math::trig::atan2(dz, dx) as f32) * 180.0
+                        look = (crate::util::math::trig::atan2(dz, dx) as f32) * 180.0f32
                             / crate::entity::mob::JAVA_PI
-                            - 90.0;
+                            - 90.0f32;
                     }
                     let mut diff = look - mob.look_yaw;
                     while diff < -180.0 {
@@ -12258,7 +12259,7 @@ fn look_at(
     let distance = crate::util::math::math_helper_a(dx * dx + dz * dz) as f64;
     let target_yaw = (crate::util::fdlibm::atan2(dz, dx) * 180.0
         / crate::entity::mob::JAVA_PI_DOUBLE) as f32
-        - 90.0;
+        - 90.0f32;
     let target_pitch = (-(crate::util::fdlibm::atan2(dy, distance) * 180.0
         / crate::entity::mob::JAVA_PI_DOUBLE)) as f32;
     mob.pitch = -clamped_turn(mob.pitch, target_pitch, pitch_limit);

@@ -449,6 +449,26 @@ mod tests {
         assert_eq!(player.pitch, -30.0, "the pitch of the player");
     }
 
+    /// The box of the player starts at its position.
+    ///
+    /// Java `EntityPlayer.s()` overrides `EntityHuman.s()` and sets
+    /// `this.height = 0.0F` — so the bottom of the box of the player is its
+    /// position and the top is 1.8 blocks higher (`Entity.setPosition`).
+    /// The goal of the path of a mob is the bottom of the box of its target
+    /// (`Pathfinder.java:15`).
+    #[test]
+    fn the_box_of_the_player_starts_at_its_position() {
+        let player = Player::new(1, 1, "Player".to_string(), 0.5, 64.0, 0.5);
+        let box_ = player.bounding_box();
+        assert_eq!(box_.min_y, 64.0, "the bottom of the box is the position");
+        assert_eq!(
+            box_.max_y,
+            64.0 + 1.8f32 as f64,
+            "the top of the box is 1.8 blocks higher"
+        );
+        assert_eq!(player.box_bottom(), 64.0, "the bottom of the box");
+    }
+
     /// The armour of the player reduces any damage.
     ///
     /// Java `EntityHuman.c(int)`: the armour of the player reduces the
