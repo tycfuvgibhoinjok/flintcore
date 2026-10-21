@@ -641,13 +641,13 @@ impl World {
             }
             return (x, y, z);
         }
+        // Java `World.f(int, int)` (`World.java:1026-1041`): the height of the
+        // spawn is the highest **solid** block of the column of the spawn plus
+        // one — the liquids are not solid (`Material.isSolid()`) — and there is
+        // no fallback: an empty column gives −1 (the reference does not put
+        // the player at the height of the configuration).
         let ground = self.highest_solid_y(x, z);
-        let y = if ground > 0 {
-            ground
-        } else {
-            default_y.max(64)
-        };
-        (x, y, z)
+        (x, ground, z)
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -3808,12 +3808,17 @@ impl GenWorld for World {
         }
     }
 
+    /// Java `World.f(int, int)`: the height of the highest solid block of the
+    /// column plus one (−1 when the column has no solid block).
+    ///
+    /// The liquids are not solid (`Material.isSolid()`) — the reference does
+    /// not count them.
     fn highest_solid_y(&self, x: i32, z: i32) -> i32 {
         let pos = ChunkPos::new(x >> 4, z >> 4);
         if let Some(chunk) = self.chunks.get(&pos) {
             for y in (1..CHUNK_HEIGHT as i32).rev() {
                 let id = chunk.get_block((x & 15) as usize, y as usize, (z & 15) as usize);
-                if blocks::is_solid(id) || blocks::is_liquid(id) {
+                if blocks::is_solid(id) {
                     return y + 1;
                 }
             }
@@ -3891,6 +3896,47 @@ impl LightingWorld for World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The height of the spawn is the height of the highest solid block of the
+    /// column of the spawn.
+    ///
+    /// Java `World.f(int, int)` (`World.java:1026-1041`): the highest block
+    /// with a solid material plus one — the liquids are not solid — and an
+    /// empty column gives −1 (there is no fallback to the height of the
+    /// configuration).
+    #[test]
+    fn the_height_of_the_spawn_is_the_height_of_the_highest_solid_block() {
+        let config = WorldConfig {
+            seed: 12345,
+            save_enabled: false,
+            spawn_x: 0,
+            spawn_y: 64,
+            spawn_z: 0,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        world.populate_chunk(ChunkPos::new(0, 0));
+        // An empty column with a stone at 70 and water at 71: the water is
+        // not solid, so the height of the spawn is above the stone.
+        for y in 0..CHUNK_HEIGHT as i32 {
+            world.set_block(0, y, 0, blocks::AIR);
+        }
+        world.set_block(0, 70, 0, blocks::STONE);
+        world.set_block(0, 71, 0, blocks::STATIONARY_WATER);
+        assert_eq!(
+            world.safe_spawn_point(),
+            (0, 71, 0),
+            "the height of the spawn is above the stone"
+        );
+
+        // A column without a solid block: the reference gives −1.
+        world.set_block(0, 70, 0, blocks::AIR);
+        assert_eq!(
+            world.safe_spawn_point(),
+            (0, -1, 0),
+            "there is no solid block in the column of the spawn"
+        );
+    }
 
     /// The light of the sky is reduced by the time of the day.
     ///
