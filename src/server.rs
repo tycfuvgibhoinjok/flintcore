@@ -109,6 +109,13 @@ pub struct Server {
     /// it with the seed of the world, so the behaviour of the mobs is
     /// reproducible.
     pub entity_random: JavaRandom,
+    /// The random stream of the angle of the primed TNT.
+    ///
+    /// Java `EntityTNTPrimed` draws the angle from `Math.random()`, which
+    /// is not the shared stream of the entities; the port uses its own
+    /// stream so that the shared stream stays the same as in the
+    /// reference.
+    pub tnt_random: JavaRandom,
 }
 
 impl Server {
@@ -121,6 +128,8 @@ impl Server {
         world.allow_nether = config.server.allow_nether;
         // The random stream of the entities (`Entity.SHARED_RANDOM`).
         let entity_random = JavaRandom::new(config.world.seed);
+        // The stream of the angle of the primed TNT (`Math.random()`).
+        let tnt_random = JavaRandom::new(config.world.seed ^ 0x5454_4E54);
         world.live.keep_spawn_in_memory = config.world.keep_spawn_in_memory;
         world.spawning = config.spawning.clone();
         world.worldgen = config.worldgen.clone();
@@ -240,6 +249,7 @@ impl Server {
             console_rx: None,
             console_sink: Box::new(|message: &str| log::console(message)),
             entity_random,
+            tnt_random,
         }
     }
 
@@ -502,9 +512,9 @@ impl Server {
         self.tick_projectiles();
         self.tick_primed_tnts();
         self.tick_minecarts();
-        if ticks % 100 == 0 {
-            self.tick_paintings();
-        }
+        // The paintings are ticked every tick, the check of the painting
+        // itself happens every hundred ticks (`EntityPainting.m_()`).
+        self.tick_paintings();
         self.tick_dropped_items();
         self.process_world_events();
         self.world.flush_pending_piston_syncs();
@@ -3709,13 +3719,16 @@ impl Server {
         }
     }
 
+    /// Java `EntityBoat`: the box of the boat is 1.5 blocks long and 0.6
+    /// blocks high (`length = 1.5`, `width = 0.6`), the bottom of the box
+    /// is at the height of the boat.
     fn boat_aabb_collides_solid(&self, x: f64, y: f64, z: f64) -> bool {
-        let min_x = (x - 0.7).floor() as i32;
-        let max_x = (x + 0.7).floor() as i32;
-        let min_y = (y - 0.25).floor() as i32;
-        let max_y = (y + 0.25).floor() as i32;
-        let min_z = (z - 0.7).floor() as i32;
-        let max_z = (z + 0.7).floor() as i32;
+        let min_x = (x - 0.75).floor() as i32;
+        let max_x = (x + 0.75).floor() as i32;
+        let min_y = y.floor() as i32;
+        let max_y = (y + 0.6).floor() as i32;
+        let min_z = (z - 0.75).floor() as i32;
+        let max_z = (z + 0.75).floor() as i32;
 
         for bx in min_x..=max_x {
             for by in min_y..=max_y {
@@ -7333,6 +7346,14 @@ impl Server {
                 }
             }
 
+            // Java `EntityArrow.m_()`: the counter of the shake is
+            // decreased every tick.
+            if let Some(p) = self.entities.get_projectile_mut(pid) {
+                if p.shake > 0 {
+                    p.shake -= 1;
+                }
+            }
+
             if proj_snapshot.in_ground {
                 let gbx = proj_snapshot.x.floor() as i32;
                 let gby = proj_snapshot.y.floor() as i32;
@@ -7348,15 +7369,33 @@ impl Server {
                     if proj_snapshot.kind == ProjectileKind::Arrow && proj_snapshot.from_player {
                         // Check if a player walks over the stuck arrow to pick it up
                         let allow_others = self.config.mechanics.arrows_pickup_by_others;
+                        // Java `EntityArrow.b(EntityHuman)`: the arrow is
+                        // picked up when the counter of the shake is zero and
+                        // the player is inside the box grown by one block in
+                        // X and Z (`EntityHuman.v()`).
+                        let can_pickup = self
+                            .entities
+                            .get_projectile(pid)
+                            .is_some_and(|p| p.shake <= 0);
                         let collector = self.entities.iter_players().find_map(|p| {
                             if !p.dead
                                 && p.dimension == self.active_dimension
                                 && (allow_others || proj_snapshot.shooter_id == Some(p.entity_id))
-                                && (p.x - proj_snapshot.x).abs() <= 1.2
-                                && (p.y - proj_snapshot.y).abs() <= 1.8
-                                && (p.z - proj_snapshot.z).abs() <= 1.2
+                                && can_pickup
                             {
-                                Some((p.entity_id, p.conn_id))
+                                let box_ = p.bounding_box().grown(1.0, 0.0, 1.0);
+                                if box_.intersects(&crate::entity::physics::Aabb::new(
+                                    proj_snapshot.x - 0.1,
+                                    proj_snapshot.y - 0.1,
+                                    proj_snapshot.z - 0.1,
+                                    proj_snapshot.x + 0.1,
+                                    proj_snapshot.y + 0.1,
+                                    proj_snapshot.z + 0.1,
+                                )) {
+                                    Some((p.entity_id, p.conn_id))
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             }
@@ -7380,28 +7419,69 @@ impl Server {
             let next_y = proj_snapshot.y + proj_snapshot.mot_y;
             let next_z = proj_snapshot.z + proj_snapshot.mot_z;
 
-            // Check entity collisions along segment
-            let hit_mob = self.entities.iter_mobs().find_map(|m| {
-                if m.dead || Some(m.entity_id) == proj_snapshot.shooter_id {
-                    return None;
+            // Java `EntityArrow.m_()`: the hit is checked along the segment
+            // of the movement — the ray from the current position to the
+            // next one, cut at the block that was hit.  The box of the
+            // entity is grown by 0.3, the nearest hit wins.
+            let start = (proj_snapshot.x, proj_snapshot.y, proj_snapshot.z);
+            let mut end = (next_x, next_y, next_z);
+            if let Some((bx, by, bz, _)) = self.world.ray_trace(start, end, false) {
+                let block = crate::entity::physics::Aabb::new(
+                    bx as f64,
+                    by as f64,
+                    bz as f64,
+                    bx as f64 + 1.0,
+                    by as f64 + 1.0,
+                    bz as f64 + 1.0,
+                );
+                if let Some((point, _)) = block.calculate_intercept(start, end) {
+                    end = point;
                 }
-                let (w, h) = m.size();
-                let hw = (w as f64) * 0.5 + 0.3;
-                if (next_x - m.x).abs() <= hw
-                    && next_y >= m.y - 0.2
-                    && next_y <= m.y + (h as f64) + 0.2
-                    && (next_z - m.z).abs() <= hw
-                {
-                    Some(m.entity_id)
-                } else {
-                    None
+            }
+
+            let hit_mob = if proj_snapshot.kind == ProjectileKind::Arrow {
+                let mut hit: Option<(i32, f64)> = None;
+                for m in self.entities.iter_mobs() {
+                    if m.dead || Some(m.entity_id) == proj_snapshot.shooter_id {
+                        continue;
+                    }
+                    let box_ = m.aabb().grown(0.3, 0.3, 0.3);
+                    let Some((point, _)) = box_.calculate_intercept(start, end) else {
+                        continue;
+                    };
+                    let dx = point.0 - start.0;
+                    let dy = point.1 - start.1;
+                    let dz = point.2 - start.2;
+                    let distance = dx * dx + dy * dy + dz * dz;
+                    if hit.map(|(_, best)| distance < best).unwrap_or(true) {
+                        hit = Some((m.entity_id, distance));
+                    }
                 }
-            });
+                hit.map(|(id, _)| id)
+            } else {
+                self.entities.iter_mobs().find_map(|m| {
+                    if m.dead || Some(m.entity_id) == proj_snapshot.shooter_id {
+                        return None;
+                    }
+                    let (w, h) = m.size();
+                    let hw = (w as f64) * 0.5 + 0.3;
+                    if (next_x - m.x).abs() <= hw
+                        && next_y >= m.y - 0.2
+                        && next_y <= m.y + (h as f64) + 0.2
+                        && (next_z - m.z).abs() <= hw
+                    {
+                        Some(m.entity_id)
+                    } else {
+                        None
+                    }
+                })
+            };
 
             if let Some(mob_id) = hit_mob {
+                // Java `EntityFireball`: the fireball does no direct
+                // damage, the damage comes from the explosion.
                 let dmg = match proj_snapshot.kind {
                     ProjectileKind::Arrow => 4,
-                    ProjectileKind::Fireball => 6,
                     _ => 0,
                 };
                 mob_hits.push((
@@ -7427,32 +7507,58 @@ impl Server {
                 }
             }
 
-            let hit_player = self.entities.iter_players().find_map(|p| {
-                if p.dead
-                    || p.dimension != self.active_dimension
-                    || (Some(p.entity_id) == proj_snapshot.shooter_id
-                        && proj_snapshot.ticks_in_air < 5)
-                {
-                    return None;
+            let hit_player = if proj_snapshot.kind == ProjectileKind::Arrow {
+                let mut hit: Option<(i32, f64)> = None;
+                for p in self.entities.iter_players() {
+                    if p.dead
+                        || p.dimension != self.active_dimension
+                        || (Some(p.entity_id) == proj_snapshot.shooter_id
+                            && proj_snapshot.ticks_in_air < 5)
+                    {
+                        continue;
+                    }
+                    let box_ = p.bounding_box().grown(0.3, 0.3, 0.3);
+                    let Some((point, _)) = box_.calculate_intercept(start, end) else {
+                        continue;
+                    };
+                    let dx = point.0 - start.0;
+                    let dy = point.1 - start.1;
+                    let dz = point.2 - start.2;
+                    let distance = dx * dx + dy * dy + dz * dz;
+                    if hit.map(|(_, best)| distance < best).unwrap_or(true) {
+                        hit = Some((p.entity_id, distance));
+                    }
                 }
-                if (next_x - p.x).abs() <= 0.6
-                    && next_y >= p.y - 0.2
-                    && next_y <= p.y + 1.9
-                    && (next_z - p.z).abs() <= 0.6
-                {
-                    Some(p.entity_id)
-                } else {
-                    None
-                }
-            });
+                hit.map(|(id, _)| id)
+            } else {
+                self.entities.iter_players().find_map(|p| {
+                    if p.dead
+                        || p.dimension != self.active_dimension
+                        || (Some(p.entity_id) == proj_snapshot.shooter_id
+                            && proj_snapshot.ticks_in_air < 5)
+                    {
+                        return None;
+                    }
+                    if (next_x - p.x).abs() <= 0.6
+                        && next_y >= p.y - 0.2
+                        && next_y <= p.y + 1.9
+                        && (next_z - p.z).abs() <= 0.6
+                    {
+                        Some(p.entity_id)
+                    } else {
+                        None
+                    }
+                })
+            };
 
             if let Some(player_id) = hit_player {
                 if !self.config.server.pvp && proj_snapshot.from_player {
                     // PvP disabled: player-fired arrows/snowballs/rods don't hit other players
                 } else {
+                    // Java `EntityFireball`: the fireball does no direct
+                    // damage, the damage comes from the explosion.
                     let dmg = match proj_snapshot.kind {
                         ProjectileKind::Arrow => 4,
-                        ProjectileKind::Fireball => 5,
                         _ => 0,
                     };
                     player_hits.push((player_id, dmg, proj_snapshot.x, proj_snapshot.z));
@@ -7490,6 +7596,10 @@ impl Server {
                             p.mot_y = 0.0;
                             p.mot_z = 0.0;
                             p.in_ground = true;
+                            // Java `EntityArrow.m_()`: the arrow shakes for
+                            // seven ticks, it can only be picked up when
+                            // the counter is zero.
+                            p.shake = 7;
                         }
                     }
                     ProjectileKind::Egg => {
@@ -7631,7 +7741,10 @@ impl Server {
     }
 
     fn spawn_primed_tnt_at(&mut self, x: f64, y: f64, z: f64, fuse: i32) {
-        let tid = self.entities.spawn_primed_tnt(x, y, z, fuse);
+        // Java `EntityTNTPrimed`: the angle of the hit is a random angle of
+        // the full circle.
+        let angle = (self.tnt_random.next_f64() * std::f64::consts::PI * 2.0) as f32;
+        let tid = self.entities.spawn_primed_tnt(x, y, z, fuse, angle as f64);
         let active_dimension = self.active_dimension;
         let players: Vec<_> = self
             .entities
@@ -7707,8 +7820,12 @@ impl Server {
                 tnt.mot_x *= 0.98;
                 tnt.mot_y *= 0.98;
                 tnt.mot_z *= 0.98;
+                // Java `EntityTNTPrimed.m_()`: `if (this.fuseTicks-- <= 0)` —
+                // the fuse is checked before it is decreased, so the primed
+                // TNT explodes on the eighty-first tick.
+                let fuse = tnt.fuse;
                 tnt.fuse -= 1;
-                if tnt.fuse <= 0 {
+                if fuse <= 0 {
                     tnt.dead = true;
                     exploded.push((tid, tnt.x, tnt.y, tnt.z));
                 }
@@ -8270,6 +8387,41 @@ impl Server {
         }
     }
 
+    /// Java `World.getEntities(Entity, AxisAlignedBB)`: does an entity
+    /// intersect the box?
+    fn entity_intersects_box(&self, box_: &crate::entity::physics::Aabb) -> bool {
+        use crate::entity::physics::Aabb;
+        for m in self.entities.iter_mobs() {
+            if !m.dead && m.aabb().intersects(box_) {
+                return true;
+            }
+        }
+        for p in self.entities.iter_players() {
+            if !p.dead && p.bounding_box().intersects(box_) {
+                return true;
+            }
+        }
+        for item in self.entities.iter_dropped_items() {
+            if item.dead {
+                continue;
+            }
+            let item_box = Aabb::for_entity(item.x, item.y, item.z, 0.25, 0.25, 0.0, 0.0);
+            if item_box.intersects(box_) {
+                return true;
+            }
+        }
+        for boat in self.entities.iter_boats() {
+            if boat.dead {
+                continue;
+            }
+            let boat_box = Aabb::for_entity(boat.x, boat.y, boat.z, 1.5, 0.6, 0.3, 0.0);
+            if boat_box.intersects(box_) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn painting_can_survive(
         &self,
         x: i32,
@@ -8280,6 +8432,13 @@ impl Server {
         ignore_id: Option<i32>,
     ) -> bool {
         let (aabb, wall_blocks) = Painting::bounds_and_wall_blocks(x, y, z, direction, title);
+        // Java `EntityPainting.h()`: the painting breaks when an entity
+        // intersects its box.
+        let box_ =
+            crate::entity::physics::Aabb::new(aabb.0, aabb.1, aabb.2, aabb.3, aabb.4, aabb.5);
+        if self.entity_intersects_box(&box_) {
+            return false;
+        }
         for (wx, wy, wz) in wall_blocks {
             if !(0..128).contains(&wy) {
                 return false;
@@ -8315,15 +8474,34 @@ impl Server {
     fn tick_paintings(&mut self) {
         let active_dimension = self.active_dimension;
         let mut broken = Vec::new();
-        for p in self.entities.iter_paintings() {
-            if p.dead || self.entities.dimension_of(p.entity_id) != active_dimension {
+        let paintings: Vec<(i32, i32, i32, i32, i32, String)> = self
+            .entities
+            .iter_paintings()
+            .filter(|p| !p.dead && self.entities.dimension_of(p.entity_id) == active_dimension)
+            .map(|p| (p.entity_id, p.x, p.y, p.z, p.direction, p.title.clone()))
+            .collect();
+        for (pid, x, y, z, direction, title) in paintings {
+            if !self.world.is_chunk_loaded(ChunkPos::new(x >> 4, z >> 4)) {
                 continue;
             }
-            if !self.world.is_chunk_loaded(p.chunk_pos()) {
+            // Java `EntityPainting.m_()`: `if (this.f++ == 100)` — the
+            // painting is checked every hundred ticks and the counter is
+            // reset after the check.
+            let Some(counter) = self.entities.get_painting_mut(pid).map(|p| {
+                let counter = p.tick_count;
+                p.tick_count += 1;
+                counter
+            }) else {
+                continue;
+            };
+            if counter != 100 {
                 continue;
             }
-            if !self.painting_can_survive(p.x, p.y, p.z, p.direction, &p.title, Some(p.entity_id)) {
-                broken.push((p.entity_id, p.x, p.y, p.z));
+            if let Some(p) = self.entities.get_painting_mut(pid) {
+                p.tick_count = 0;
+            }
+            if !self.painting_can_survive(x, y, z, direction, &title, Some(pid)) {
+                broken.push((pid, x, y, z));
             }
         }
         for (pid, x, y, z) in broken {
@@ -8331,13 +8509,32 @@ impl Server {
                 for outbound in self.tracker.untrack_painting(pid) {
                     self.send_tracked(outbound.recipient_id, outbound.packet);
                 }
-                self.spawn_dropped_item_random(
-                    x as f64 + 0.5,
-                    y as f64 + 0.5,
-                    z as f64 + 0.5,
+                // Java `EntityPainting.m_()`: the painting drops the item at
+                // its own position.
+                let item_id = self.entities.spawn_dropped_item(
                     ItemStack::new(items::PAINTING, 1, 0),
-                    10,
+                    x as f64,
+                    y as f64,
+                    z as f64,
+                    0.0,
+                    0.0,
+                    0.0,
+                    // Java `EntityItem`: the delay of the pick-up is zero
+                    // by default.
+                    0,
                 );
+                let active_dimension = self.active_dimension;
+                let players: Vec<_> = self
+                    .entities
+                    .iter_players()
+                    .filter(|p| p.dimension == active_dimension)
+                    .cloned()
+                    .collect();
+                if let Some(dropped) = self.entities.get_dropped_item(item_id) {
+                    for out in self.tracker.track_item_and_scan(dropped, &players) {
+                        self.send_tracked(out.recipient_id, out.packet);
+                    }
+                }
             }
         }
     }
@@ -9811,22 +10008,89 @@ impl Server {
                 let cur_id = self.world.get_block(bx, by, bz);
 
                 if blocks::is_lava(cur_id) {
+                    // Java `EntityItem.m_()`: in the lava the item floats up,
+                    // the horizontal speed is spread and the item does not
+                    // take any damage.
                     item.mot_y = 0.2;
-                    item.health -= 4;
+                    item.mot_x = (self.entity_random.next_f32() - self.entity_random.next_f32())
+                        as f64
+                        * 0.2;
+                    item.mot_z = (self.entity_random.next_f32() - self.entity_random.next_f32())
+                        as f64
+                        * 0.2;
+                    // The pitch of the sound of the fizz is drawn from the
+                    // random of the entities, the sound itself never reaches
+                    // the client (the reference has no named sounds).
+                    let _ = self.entity_random.next_f32();
                 } else if cur_id == blocks::FIRE || cur_id == blocks::CACTUS {
                     item.health -= 1;
-                } else if blocks::is_opaque_cube(cur_id) {
-                    // Entity.g(x, y, z) (`Entity.java:1277-1353`): push item out of opaque block
-                    if !blocks::is_opaque_cube(self.world.get_block(bx, by + 1, bz)) {
-                        item.mot_y = 0.2;
-                    } else if !blocks::is_opaque_cube(self.world.get_block(bx - 1, by, bz)) {
-                        item.mot_x = -0.2;
-                    } else if !blocks::is_opaque_cube(self.world.get_block(bx + 1, by, bz)) {
-                        item.mot_x = 0.2;
-                    } else if !blocks::is_opaque_cube(self.world.get_block(bx, by, bz - 1)) {
-                        item.mot_z = -0.2;
-                    } else if !blocks::is_opaque_cube(self.world.get_block(bx, by, bz + 1)) {
-                        item.mot_z = 0.2;
+                }
+
+                // Java `Entity.g(x, y, z)`: the item is pushed out of the
+                // block it is in through the nearest free face, the impulse
+                // is random.
+                if blocks::is_opaque_full_cube(cur_id) {
+                    // The centre of the box of the item (`EntityItem`: the
+                    // length and the width are a quarter of a block).
+                    let d0 = item.x;
+                    let d1 = item.y + 0.125;
+                    let d2 = item.z;
+                    let ix = d0.floor() as i32;
+                    let iy = d1.floor() as i32;
+                    let iz = d2.floor() as i32;
+                    let fx = d0 - ix as f64;
+                    let fy = d1 - iy as f64;
+                    let fz = d2 - iz as f64;
+                    let free = [
+                        (
+                            0,
+                            !blocks::is_opaque_full_cube(self.world.get_block(ix - 1, iy, iz)),
+                            fx,
+                        ),
+                        (
+                            1,
+                            !blocks::is_opaque_full_cube(self.world.get_block(ix + 1, iy, iz)),
+                            1.0 - fx,
+                        ),
+                        (
+                            2,
+                            !blocks::is_opaque_full_cube(self.world.get_block(ix, iy - 1, iz)),
+                            fy,
+                        ),
+                        (
+                            3,
+                            !blocks::is_opaque_full_cube(self.world.get_block(ix, iy + 1, iz)),
+                            1.0 - fy,
+                        ),
+                        (
+                            4,
+                            !blocks::is_opaque_full_cube(self.world.get_block(ix, iy, iz - 1)),
+                            fz,
+                        ),
+                        (
+                            5,
+                            !blocks::is_opaque_full_cube(self.world.get_block(ix, iy, iz + 1)),
+                            1.0 - fz,
+                        ),
+                    ];
+                    let mut face = -1;
+                    let mut best = 9999.0;
+                    for (id, is_free, distance) in free {
+                        if is_free && distance < best {
+                            best = distance;
+                            face = id;
+                        }
+                    }
+                    // The number is drawn even when no face is free.
+                    let impulse = self.entity_random.next_f32() as f64 * 0.2 + 0.1;
+                    match face {
+                        0 => item.mot_x = -impulse,
+                        1 => item.mot_x = impulse,
+                        2 => item.mot_y = -impulse,
+                        3 => item.mot_y = impulse,
+                        4 => item.mot_z = -impulse,
+                        5 => item.mot_z = impulse,
+                        _ => {}
                     }
                 }
 
@@ -9860,7 +10124,6 @@ impl Server {
                         .get_block(item.x.floor() as i32, below_y, item.z.floor() as i32);
                 if item.mot_y < 0.0 && blocks::is_solid(below_id) {
                     item.y = (below_y + 1) as f64;
-                    item.mot_y = 0.0;
                     item.on_ground = true;
                 } else {
                     item.y = next_y;
@@ -9879,6 +10142,10 @@ impl Server {
                 item.mot_x *= friction;
                 item.mot_y *= 0.9800000190734863;
                 item.mot_z *= friction;
+                // Java `EntityItem.m_()`: the item bounces off the ground.
+                if item.on_ground {
+                    item.mot_y *= -0.5;
+                }
 
                 item.age += 1;
                 if item.age >= 6000 || item.health <= 0 || item.y < -64.0 {
@@ -13362,6 +13629,251 @@ mod tests {
             }
         }
         assert_eq!(kicks, 1, "the idle connection is disconnected");
+    }
+
+    /// The dropped item does not take damage in the lava.
+    ///
+    /// Java `EntityItem.m_()`: in the lava the item floats up, the
+    /// horizontal speed is spread and the item does not take any damage.
+    #[test]
+    fn the_dropped_item_does_not_take_damage_in_the_lava() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        // A pool of lava.
+        for x in 0..4 {
+            for z in 0..4 {
+                server.world.set_block(x, 63, z, blocks::LAVA);
+                server.world.set_block(x, 64, z, blocks::LAVA);
+            }
+        }
+        let item_id = server.entities.spawn_dropped_item(
+            ItemStack::new(items::APPLE, 1, 0),
+            1.5,
+            64.5,
+            1.5,
+            0.0,
+            0.0,
+            0.0,
+            0,
+        );
+        let health = server
+            .entities
+            .get_dropped_item(item_id)
+            .expect("the item")
+            .health;
+        for tick in 0..10 {
+            server.tick(tick);
+        }
+        let item = server
+            .entities
+            .get_dropped_item(item_id)
+            .expect("the item is still in the world");
+        assert_eq!(
+            item.health, health,
+            "the item does not take damage in the lava"
+        );
+        assert!(!item.dead, "the item is alive");
+    }
+
+    /// The dropped item bounces off the ground.
+    ///
+    /// Java `EntityItem.m_()`: `if (this.onGround) this.motY *= -0.5D`.
+    #[test]
+    fn the_dropped_item_bounces_off_the_ground() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let item_id = server.entities.spawn_dropped_item(
+            ItemStack::new(items::APPLE, 1, 0),
+            1.5,
+            64.5,
+            1.5,
+            0.0,
+            0.0,
+            0.0,
+            0,
+        );
+        // The item falls on the ground and bounces.
+        let mut bounced = false;
+        for tick in 0..20 {
+            server.tick(tick);
+            if let Some(item) = server.entities.get_dropped_item(item_id) {
+                if item.on_ground && item.mot_y > 0.0 {
+                    bounced = true;
+                }
+            }
+        }
+        assert!(bounced, "the item bounces off the ground");
+    }
+
+    /// The primed TNT explodes on the eighty-first tick.
+    ///
+    /// Java `EntityTNTPrimed.m_()`: `if (this.fuseTicks-- <= 0)` — the fuse
+    /// is checked before it is decreased.
+    #[test]
+    fn the_primed_tnt_explodes_on_the_eighty_first_tick() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.spawn_primed_tnt_at(2.5, 64.0, 2.5, 80);
+        assert_eq!(server.entities.iter_primed_tnts().count(), 1);
+        // The first eighty ticks: the TNT is alive.
+        for tick in 0..80 {
+            server.tick(tick);
+        }
+        assert_eq!(
+            server.entities.iter_primed_tnts().count(),
+            1,
+            "the primed TNT is still alive"
+        );
+        // The eighty-first tick: the TNT explodes.
+        server.tick(80);
+        assert_eq!(
+            server.entities.iter_primed_tnts().count(),
+            0,
+            "the primed TNT exploded"
+        );
+    }
+
+    /// The boat is placed above the ground.
+    ///
+    /// Java `EntityBoat(World, double, double, double)`: the boat is placed
+    /// at `y + 0.3` (`height = width / 2`).
+    #[test]
+    fn the_boat_is_placed_above_the_ground() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.spawn_boat_at(2.5, 64.0, 2.5);
+        let boat = server.entities.iter_boats().next().expect("the boat");
+        assert_eq!(boat.y, 64.0 + 0.30000001192092896);
+    }
+
+    /// The painting is checked every hundred ticks.
+    ///
+    /// Java `EntityPainting.m_()`: `if (this.f++ == 100)` — the painting
+    /// breaks on the hundred-and-first tick, not on the first one.
+    #[test]
+    fn the_painting_is_checked_every_hundred_ticks() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.spawn_painting_at("Kebab".to_string(), 2, 64, 2, 0);
+        let pid = server
+            .entities
+            .iter_paintings()
+            .next()
+            .expect("the painting")
+            .entity_id;
+        // The first hundred ticks: the painting is not checked.
+        for tick in 0..100 {
+            server.tick(tick);
+        }
+        assert!(
+            server.entities.get_painting(pid).is_some(),
+            "the painting is still on the wall"
+        );
+        // The hundred-and-first tick: the painting breaks, it has no wall.
+        server.tick(100);
+        assert!(
+            server.entities.get_painting(pid).is_none(),
+            "the painting broke"
+        );
+    }
+
+    /// The arrow that hit a block shakes for seven ticks.
+    ///
+    /// Java `EntityArrow.m_()`: `this.shake = 7` when the arrow hits a
+    /// block, the counter is decreased every tick.
+    #[test]
+    fn the_arrow_that_hit_a_block_shakes() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let pid = server.entities.spawn_projectile(
+            crate::entity::projectile::ProjectileKind::Arrow,
+            None,
+            false,
+            true,
+            2.5,
+            64.5,
+            2.5,
+            0.0,
+            -1.0,
+            0.0,
+        );
+        server.tick(0);
+        let arrow = server.entities.get_projectile(pid).expect("the arrow");
+        assert!(arrow.in_ground, "the arrow hit the ground");
+        assert_eq!(arrow.shake, 7, "the arrow shakes for seven ticks");
+        // The counter is decreased every tick.
+        server.tick(1);
+        let arrow = server.entities.get_projectile(pid).expect("the arrow");
+        assert_eq!(arrow.shake, 6, "the counter of the shake is decreased");
+    }
+
+    /// The arrow hits the mob it flies through.
+    ///
+    /// Java `EntityArrow.m_()`: the hit is checked along the segment of the
+    /// movement, a fast arrow does not pass through the mob.
+    #[test]
+    fn the_arrow_hits_the_mob_it_flies_through() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let mut rng = crate::util::rng::JavaRandom::new(12345);
+        let mob_id =
+            server
+                .entities
+                .spawn_mob(crate::entity::mob::MobType::Pig, 2.5, 64.0, 2.5, &mut rng);
+        let health = server.entities.get_mob(mob_id).expect("the mob").health;
+        // The arrow flies over the mob and would pass through it: the next
+        // position of the arrow is beyond the mob.
+        let pid = server.entities.spawn_projectile(
+            crate::entity::projectile::ProjectileKind::Arrow,
+            None,
+            false,
+            true,
+            0.5,
+            64.5,
+            2.5,
+            4.0,
+            0.0,
+            0.0,
+        );
+        server.tick(0);
+        let mob = server.entities.get_mob(mob_id).expect("the mob");
+        assert!(
+            mob.health < health,
+            "the arrow hit the mob: {} -> {}",
+            health,
+            mob.health
+        );
+        assert!(
+            server.entities.get_projectile(pid).is_none(),
+            "the arrow stuck in the mob"
+        );
+    }
+
+    /// The fireball does no direct damage.
+    ///
+    /// Java `EntityFireball`: the damage of the fireball comes from the
+    /// explosion, the direct hit does nothing.
+    #[test]
+    fn the_fireball_does_no_direct_damage() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let mut rng = crate::util::rng::JavaRandom::new(12345);
+        let mob_id =
+            server
+                .entities
+                .spawn_mob(crate::entity::mob::MobType::Pig, 2.5, 64.0, 2.5, &mut rng);
+        let health = server.entities.get_mob(mob_id).expect("the mob").health;
+        // The fireball hits the mob.
+        server.entities.spawn_projectile(
+            crate::entity::projectile::ProjectileKind::Fireball,
+            None,
+            false,
+            false,
+            1.5,
+            64.5,
+            2.5,
+            2.0,
+            0.0,
+            0.0,
+        );
+        server.tick(0);
+        let mob = server.entities.get_mob(mob_id).expect("the mob");
+        assert_eq!(
+            mob.health, health,
+            "the fireball does no direct damage, the explosion does"
+        );
     }
 
     /// The mobs push each other away.

@@ -45,6 +45,9 @@ pub struct Projectile {
     pub yaw: f32,
     pub pitch: f32,
     pub in_ground: bool,
+    /// Java `EntityArrow.shake`: the arrow that hit a block shakes for seven
+    /// ticks, it can only be picked up when the counter is zero.
+    pub shake: i32,
     pub ticks_in_ground: i32,
     pub ticks_in_air: i32,
     pub catch_ticks: i32,
@@ -349,6 +352,9 @@ pub struct Painting {
     pub y: i32,
     pub z: i32,
     pub direction: i32,
+    /// Java `EntityPainting.f`: the counter of the ticks between the checks
+    /// of the painting.
+    pub tick_count: i32,
     pub dead: bool,
 }
 

@@ -410,6 +410,12 @@ pub fn is_opaque(id: u8) -> bool {
     light_opacity(id) > 0
 }
 
+/// Java `World.e(int, int, int)`: the block is opaque (`Block.material.h()`)
+/// and it is a full cube (`Block.b()`).
+pub fn is_opaque_full_cube(id: u8) -> bool {
+    is_opaque(id) && is_opaque_cube(id)
+}
+
 /// Java `Block.o` (the `opaqueCubeLookup` table) — whitelist dumped from the
 /// reference runtime. Note the quirks: LEAVES and CHEST count as opaque,
 /// while DOUBLE_STEP/STEP, GLASS, BED, CACTUS, ICE etc. do not.

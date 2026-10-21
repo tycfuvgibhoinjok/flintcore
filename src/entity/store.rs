@@ -312,8 +312,12 @@ impl EntityStore {
     }
 
     /// Spawn a new `EntityBoat` at `(x, y, z)`.
+    ///
+    /// Java `EntityBoat(World, double, double, double)`: the boat is placed
+    /// at `y + 0.3` (`height = width / 2`).
     pub fn spawn_boat(&mut self, x: f64, y: f64, z: f64) -> i32 {
         let entity_id = self.allocate_id();
+        let y = y + 0.30000001192092896;
         let boat = Boat {
             entity_id,
             x,
@@ -480,6 +484,7 @@ impl EntityStore {
             yaw: 0.0,
             pitch: 0.0,
             in_ground: false,
+            shake: 0,
             ticks_in_ground: 0,
             ticks_in_air: 0,
             catch_ticks: 0,
@@ -513,9 +518,13 @@ impl EntityStore {
         self.projectiles.values_mut()
     }
 
-    pub fn spawn_primed_tnt(&mut self, x: f64, y: f64, z: f64, fuse: i32) -> i32 {
+    /// Spawns a new `EntityTNTPrimed`.
+    ///
+    /// Java `EntityTNTPrimed(World, double, double, double)`: the angle of
+    /// the hit comes from `Math.random()`, not from the shared stream of
+    /// the entities, so the caller passes it in.
+    pub fn spawn_primed_tnt(&mut self, x: f64, y: f64, z: f64, fuse: i32, angle: f64) -> i32 {
         let entity_id = self.allocate_id();
-        let angle = (entity_id as f64) * 1.1;
         let tnt = PrimedTnt {
             entity_id,
             x,
@@ -599,6 +608,7 @@ impl EntityStore {
             y,
             z,
             direction,
+            tick_count: 0,
             dead: false,
         };
         self.paintings.insert(entity_id, p);
@@ -608,6 +618,10 @@ impl EntityStore {
 
     pub fn get_painting(&self, entity_id: i32) -> Option<&Painting> {
         self.paintings.get(&entity_id)
+    }
+
+    pub fn get_painting_mut(&mut self, entity_id: i32) -> Option<&mut Painting> {
+        self.paintings.get_mut(&entity_id)
     }
 
     pub fn remove_painting(&mut self, entity_id: i32) -> Option<Painting> {

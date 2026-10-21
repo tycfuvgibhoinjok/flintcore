@@ -131,6 +131,147 @@ impl Aabb {
         )
     }
 
+    /// Java `AxisAlignedBB.a(Vec3D, Vec3D)`: the intersection of the segment
+    /// with the box.
+    ///
+    /// The method returns the point of the intersection and the side of the
+    /// box (0 — the minimum X, 1 — the maximum X, 2 — the minimum Y,
+    /// 3 — the maximum Y, 4 — the minimum Z, 5 — the maximum Z).
+    pub fn calculate_intercept(
+        &self,
+        start: (f64, f64, f64),
+        end: (f64, f64, f64),
+    ) -> Option<((f64, f64, f64), u8)> {
+        // Java `Vec3D.a(Vec3D, double)`: the point of the plane of X.
+        let intermediate_x = |plane: f64| -> Option<(f64, f64, f64)> {
+            let dx = end.0 - start.0;
+            if dx * dx < 1.0000000116860974E-7 {
+                return None;
+            }
+            let t = (plane - start.0) / dx;
+            if (0.0..=1.0).contains(&t) {
+                Some((
+                    plane,
+                    start.1 + (end.1 - start.1) * t,
+                    start.2 + (end.2 - start.2) * t,
+                ))
+            } else {
+                None
+            }
+        };
+        // Java `Vec3D.b(Vec3D, double)`: the point of the plane of Y.
+        let intermediate_y = |plane: f64| -> Option<(f64, f64, f64)> {
+            let dy = end.1 - start.1;
+            if dy * dy < 1.0000000116860974E-7 {
+                return None;
+            }
+            let t = (plane - start.1) / dy;
+            if (0.0..=1.0).contains(&t) {
+                Some((
+                    start.0 + (end.0 - start.0) * t,
+                    plane,
+                    start.2 + (end.2 - start.2) * t,
+                ))
+            } else {
+                None
+            }
+        };
+        // Java `Vec3D.c(Vec3D, double)`: the point of the plane of Z.
+        let intermediate_z = |plane: f64| -> Option<(f64, f64, f64)> {
+            let dz = end.2 - start.2;
+            if dz * dz < 1.0000000116860974E-7 {
+                return None;
+            }
+            let t = (plane - start.2) / dz;
+            if (0.0..=1.0).contains(&t) {
+                Some((
+                    start.0 + (end.0 - start.0) * t,
+                    start.1 + (end.1 - start.1) * t,
+                    plane,
+                ))
+            } else {
+                None
+            }
+        };
+
+        // The candidates: the planes of the box that the segment crosses.
+        let mut candidates: Vec<((f64, f64, f64), u8)> = Vec::new();
+        // Java `AxisAlignedBB.b(Vec3D)`: the point is on the side of Y and Z.
+        if let Some(point) = intermediate_x(self.min_x) {
+            if point.1 >= self.min_y
+                && point.1 <= self.max_y
+                && point.2 >= self.min_z
+                && point.2 <= self.max_z
+            {
+                candidates.push((point, 0));
+            }
+        }
+        if let Some(point) = intermediate_x(self.max_x) {
+            if point.1 >= self.min_y
+                && point.1 <= self.max_y
+                && point.2 >= self.min_z
+                && point.2 <= self.max_z
+            {
+                candidates.push((point, 1));
+            }
+        }
+        // Java `AxisAlignedBB.c(Vec3D)`: the point is on the side of X and Z.
+        if let Some(point) = intermediate_y(self.min_y) {
+            if point.0 >= self.min_x
+                && point.0 <= self.max_x
+                && point.2 >= self.min_z
+                && point.2 <= self.max_z
+            {
+                candidates.push((point, 2));
+            }
+        }
+        if let Some(point) = intermediate_y(self.max_y) {
+            if point.0 >= self.min_x
+                && point.0 <= self.max_x
+                && point.2 >= self.min_z
+                && point.2 <= self.max_z
+            {
+                candidates.push((point, 3));
+            }
+        }
+        // Java `AxisAlignedBB.d(Vec3D)`: the point is on the side of X and Y.
+        if let Some(point) = intermediate_z(self.min_z) {
+            if point.0 >= self.min_x
+                && point.0 <= self.max_x
+                && point.1 >= self.min_y
+                && point.1 <= self.max_y
+            {
+                candidates.push((point, 4));
+            }
+        }
+        if let Some(point) = intermediate_z(self.max_z) {
+            if point.0 >= self.min_x
+                && point.0 <= self.max_x
+                && point.1 >= self.min_y
+                && point.1 <= self.max_y
+            {
+                candidates.push((point, 5));
+            }
+        }
+
+        // The nearest point: the squared distance from the start.
+        let mut best: Option<((f64, f64, f64), u8, f64)> = None;
+        for (point, side) in candidates {
+            let dx = point.0 - start.0;
+            let dy = point.1 - start.1;
+            let dz = point.2 - start.2;
+            let distance = dx * dx + dy * dy + dz * dz;
+            match best {
+                None => best = Some((point, side, distance)),
+                Some((_, _, best_distance)) if distance < best_distance => {
+                    best = Some((point, side, distance));
+                }
+                _ => {}
+            }
+        }
+        best.map(|(point, side, _)| (point, side))
+    }
+
     /// Java `AxisAlignedBB.a(other)`: do the two boxes overlap?
     pub fn intersects(&self, other: &Aabb) -> bool {
         other.max_x > self.min_x
