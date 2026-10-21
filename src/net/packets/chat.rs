@@ -10,8 +10,10 @@ pub const MAX_CHAT_LENGTH: usize = 119;
 pub const ALLOWED_CHARS: &str =
     " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_'abcdefghijklmnopqrstuvwxyz{|}~⌂ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜø£Ø×ƒáíóúñÑªº¿®¬½¼¡«»";
 
+/// Java `FontAllowedCharacters.allowedCharacters`: the characters of the
+/// file `font.txt` of the reference. The colour character `§` is not in it.
 pub fn is_allowed_char(c: char) -> bool {
-    c == COLOR_CHAR || ALLOWED_CHARS.contains(c)
+    ALLOWED_CHARS.contains(c)
 }
 
 // Character widths per index (index = position in ALLOWED_CHARS + 32),
@@ -186,7 +188,9 @@ mod tests {
     }
 
     #[test]
-    fn is_allowed_char_section_allowed() {
-        assert!(is_allowed_char('§'));
+    fn is_allowed_char_section_is_not_allowed() {
+        // The colour character is not in the file `font.txt` of the
+        // reference.
+        assert!(!is_allowed_char('§'));
     }
 }

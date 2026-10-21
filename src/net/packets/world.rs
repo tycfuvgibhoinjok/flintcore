@@ -35,7 +35,7 @@ impl Sleep {
 pub struct MultiBlockChange {
     pub chunk_x: i32,
     pub chunk_z: i32,
-    pub coordinates: Vec<i16>,
+    pub coordinates: Vec<u16>,
     pub block_types: Vec<u8>,
     pub metadata: Vec<u8>,
 }
@@ -47,7 +47,9 @@ impl MultiBlockChange {
         let count = reader.read_i16()? as usize;
         let mut coordinates = Vec::with_capacity(count);
         for _ in 0..count {
-            coordinates.push(reader.read_i16()?);
+            // Java `Packet52MultiBlockChange`: the coordinates are read with
+            // the mask `& 0xffff`.
+            coordinates.push(u16::from_be_bytes([reader.read_u8()?, reader.read_u8()?]));
         }
         let block_types = reader.read_bytes(count)?.to_vec();
         let metadata = reader.read_bytes(count)?.to_vec();
@@ -65,7 +67,7 @@ impl MultiBlockChange {
         writer.write_i32(self.chunk_z);
         writer.write_i16(self.coordinates.len() as i16);
         for coord in &self.coordinates {
-            writer.write_i16(*coord);
+            writer.write_u16(*coord);
         }
         writer.write_bytes(&self.block_types);
         writer.write_bytes(&self.metadata);

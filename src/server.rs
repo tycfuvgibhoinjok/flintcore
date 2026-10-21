@@ -10040,7 +10040,9 @@ impl Server {
                     let y = (raw & 255) as i32;
                     let wx = pos.x * 16 + lx;
                     let wz = pos.z * 16 + lz;
-                    coordinates.push(raw as i16);
+                    // Java `Packet52MultiBlockChange`: the coordinates are
+                    // written with the mask `& 0xffff`.
+                    coordinates.push(raw);
                     block_types.push(self.world.get_block(wx, y, wz));
                     metadata.push(self.world.get_data(wx, y, wz));
                 }
@@ -10976,13 +10978,14 @@ impl Server {
             .and_then(|connection| connection.username.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let raw_message = chat.message.trim();
-
-        // Poseidon: length > 100 -> disconnect "Chat message too long"
-        if raw_message.len() > 100 {
+        // Poseidon: the length is checked before the trimming and it is the
+        // number of the characters (`String.length()`).
+        if chat.message.encode_utf16().count() > 100 {
             self.kick(id, "Chat message too long");
             return;
         }
+
+        let raw_message = chat.message.trim();
 
         // Poseidon: illegal characters -> disconnect "Illegal characters in chat"
         if !raw_message.chars().all(is_allowed_char) {
@@ -10990,7 +10993,8 @@ impl Server {
             return;
         }
 
-        let message = crate::net::packets::chat::translate_alternate_color_codes('&', raw_message);
+        // The reference does not translate the `&` into the colour character.
+        let message = raw_message.to_string();
 
         if message.is_empty() {
             return;
