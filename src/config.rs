@@ -564,8 +564,10 @@ impl Default for MobSpawnSettings {
             max_group: 4,
             biomes: vec!["*".to_string()],
             min_light: 0,
-            light_roll: 8,
-            sky_light_roll: 32,
+            // The rolls of the light are not in the reference (`mob.d()` ✓ —
+            // the curve of the light ✓), so they are off by default ✓.
+            light_roll: 0,
+            sky_light_roll: 0,
             min_y: 0,
             max_y: 127,
             spawn_chance: 100,

@@ -4111,11 +4111,28 @@ impl Server {
             return;
         }
         let (monsters, animals, water) = self.entities.count_mob_categories(active_dimension);
+        // The boxes of the entities of the world: the check of the spawn of
+        // the reference (`EntityLiving.d()`) asks the world for the entities of
+        // the box of the mob ✓.
+        let mut entity_boxes: Vec<Aabb> = Vec::new();
+        for other in self.entities.iter_mobs() {
+            if other.dead || self.entities.dimension_of(other.entity_id) != active_dimension {
+                continue;
+            }
+            entity_boxes.push(other.aabb());
+        }
+        for player in self.entities.iter_players() {
+            if player.dead || player.dimension != active_dimension {
+                continue;
+            }
+            entity_boxes.push(player.bounding_box());
+        }
         let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
         let specs = evaluate_natural_spawns(
             &self.world,
             &mut rng,
             &player_positions,
+            &entity_boxes,
             self.config.spawning.spawn_monsters,
             self.config.spawning.spawn_animals,
             monsters,

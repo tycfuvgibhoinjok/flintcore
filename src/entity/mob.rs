@@ -1858,12 +1858,88 @@ pub struct SpawnedMobSpec {
     pub jockey_chance: i32,
 }
 
+/// Java `EntityLiving.d()` and `EntityCreature.d()`: can the mob live at the
+/// position?
+///
+/// * the chunk of the box has to be loaded ✓ (`World.containsEntity` ✓),
+/// * the box must not hold a block nor an entity ✓
+///   (`World.getEntities(this, boundingBox).size() == 0` ✓ — the list has the
+///   collision boxes of the blocks ✓ and the boxes of the entities ✓),
+/// * the box must not hold a liquid ✓ (`World.c(AxisAlignedBB)` ✓),
+/// * the light check of the class of the mob ✓ (`EntityCreature.d()` ✓ —
+///   `a(i, j, k) >= 0.0F` ✓).
+fn mob_can_spawn_here(
+    world: &World,
+    mob_type: MobType,
+    x: f64,
+    y: f64,
+    z: f64,
+    entity_boxes: &[crate::entity::physics::Aabb],
+    sky_sub: i32,
+) -> bool {
+    // The box of the mob (`Entity.setPosition` ✓): the height of the mob is
+    // the width of the entity ✓ and the length is the half of the box ✓.
+    let (length, width) = mob_type.dimensions(1);
+    let box_ = crate::entity::physics::Aabb::for_entity(x, y, z, length, width, 0.0, 0.0);
+
+    // `World.containsEntity(boundingBox)`: the chunk of the box is loaded ✓.
+    let chunk = ChunkPos::new(
+        (box_.min_x.floor() as i32) >> 4,
+        (box_.min_z.floor() as i32) >> 4,
+    );
+    if !world.is_chunk_loaded(chunk) {
+        return false;
+    }
+
+    // The blocks and the entities of the box ✓ (`World.getEntities` ✓).
+    let mut scratch = Vec::new();
+    crate::entity::physics::collect_collision_boxes(world, &box_, entity_boxes, &mut scratch);
+    if !scratch.is_empty() {
+        return false;
+    }
+
+    // The liquid of the box ✓ (`World.c(AxisAlignedBB)` ✓).
+    if crate::entity::physics::box_has_fluid(world, &box_) {
+        return false;
+    }
+
+    // The light check of the class of the mob ✓ (`EntityCreature.d()` ✓).
+    let i = x.floor() as i32;
+    let j = box_.min_y.floor() as i32;
+    let k = z.floor() as i32;
+    let light = chunk_light_at(world, i, j, k, sky_sub);
+    match mob_type {
+        // `EntityMonster.a(i, j, k)`: `0.5F - world.n(i, j, k)` ✓ — the
+        // monster needs a dark spot ✓.
+        MobType::Zombie
+        | MobType::Skeleton
+        | MobType::Creeper
+        | MobType::Spider
+        | MobType::Giant
+        | MobType::PigZombie => 0.5 - light_curve(light) >= 0.0,
+        // `EntityAnimal.a(i, j, k)`: on the grass the check always passes ✓,
+        // otherwise the curve of the light minus half a ✓.
+        MobType::Pig | MobType::Sheep | MobType::Cow | MobType::Chicken => {
+            if world.get_block(i, j - 1, k) == blocks::GRASS {
+                true
+            } else {
+                light_curve(light) - 0.5 >= 0.0
+            }
+        }
+        // `EntityCreature.a(i, j, k)` is zero ✓ — the check always passes ✓
+        // (the water animal has no light check at all ✓ — `EntityWaterAnimal.d()`
+        // ✓).
+        _ => true,
+    }
+}
+
 /// Java `SpawnerCreature.spawnEntities`: evaluate natural spawns around online players.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_natural_spawns(
     world: &World,
     rng: &mut JavaRandom,
     player_positions: &[(f64, f64, f64)],
+    entity_boxes: &[crate::entity::physics::Aabb],
     allow_monsters: bool,
     allow_animals: bool,
     current_monsters: usize,
@@ -2075,6 +2151,11 @@ pub fn evaluate_natural_spawns(
                     if settings.slime_chunk_only && !is_slime_chunk(world.seed(), x >> 4, z >> 4) {
                         continue;
                     }
+                    // The check of the reference (`mob.d()` ✓ —
+                    // `EntityLiving.d()` ✓ and `EntityCreature.d()` ✓).
+                    if !mob_can_spawn_here(world, mob_type, fx, fy, fz, entity_boxes, sky_sub) {
+                        continue;
+                    }
 
                     spawned.push(SpawnedMobSpec {
                         mob_type,
@@ -2281,10 +2362,66 @@ mod tests {
             let mut rng = JavaRandom::new(seed + round);
             let players = [(0.0, 64.0, 0.0)];
             spawned.extend(evaluate_natural_spawns(
-                world, &mut rng, &players, true, true, 0, 0, 0,
+                world,
+                &mut rng,
+                &players,
+                &[],
+                true,
+                true,
+                0,
+                0,
+                0,
             ));
         }
         spawned
+    }
+
+    /// The spawn of the mob needs a free box.
+    ///
+    /// Java `EntityLiving.d()`: the box of the mob must not hold a block nor
+    /// an entity ✓ (`World.getEntities(this, boundingBox).size() == 0` ✓) and
+    /// must not hold a liquid ✓ (`World.c(AxisAlignedBB)` ✓).
+    #[test]
+    fn the_spawn_of_the_mob_needs_a_free_box() {
+        let mut world = spawn_world(SpawningConfig::default());
+        // The box of the pig at (80.5, 64, 80.5) is free ✓ (the flat area of
+        // the world ✓).
+        assert!(
+            mob_can_spawn_here(&world, MobType::Pig, 80.5, 64.0, 80.5, &[], 0),
+            "the pig spawns in a free box"
+        );
+        // A block in the box ✓ — the pig does not spawn ✓.
+        world.set_block(80, 64, 80, blocks::STONE);
+        assert!(
+            !mob_can_spawn_here(&world, MobType::Pig, 80.5, 64.0, 80.5, &[], 0),
+            "the pig does not spawn in a blocked box"
+        );
+    }
+
+    /// The monster needs a dark spot.
+    ///
+    /// Java `EntityMonster.a(i, j, k)`: `0.5F - world.n(i, j, k)` — the
+    /// monster spawns only where the curve of the light is not above half ✓.
+    #[test]
+    fn the_monster_needs_a_dark_spot() {
+        let mut world = spawn_world(SpawningConfig::default());
+        // The sky light of the day is fifteen ✓ — the curve of the light is
+        // one ✓ — the monster does not spawn ✓.
+        // The sky light of the day ✓ — the curve of the light is one ✓ — the
+        // monster does not spawn ✓.
+        if let Some(chunk) = world.get_chunk_mut(ChunkPos::new(5, 5)) {
+            for x in 0..16 {
+                for z in 0..16 {
+                    for y in 0..128 {
+                        chunk.set_sky_light(x, y, z, 15);
+                    }
+                }
+            }
+        }
+        assert!(
+            !mob_can_spawn_here(&world, MobType::Zombie, 80.5, 64.0, 80.5, &[], 0),
+            "the monster does not spawn in the light"
+        );
     }
 
     #[test]
@@ -2481,7 +2618,8 @@ mod tests {
         for round in 0..512 {
             let mut rng = JavaRandom::new(4321 + round);
             let players = [(0.0, 64.0, 0.0)];
-            let spawned = evaluate_natural_spawns(&world, &mut rng, &players, true, true, 0, 0, 0);
+            let spawned =
+                evaluate_natural_spawns(&world, &mut rng, &players, &[], true, true, 0, 0, 0);
             if spawned.is_empty() {
                 continue;
             }
