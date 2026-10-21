@@ -192,6 +192,34 @@ impl CommandMap {
         self.register(PoseidonCommand);
     }
 
+    /// The command is one of the commands that the reference does not have.
+    ///
+    /// Java `ConsoleCommandHandler.java:55-296`: the console of the
+    /// reference knows the commands of the vanilla server and nothing else ✓.
+    /// The port knows a few more ✓ — they are an extension of the port ✓.
+    pub fn is_extra_command(command_line: &str) -> bool {
+        let label = command_line
+            .strip_prefix('/')
+            .unwrap_or(command_line)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        matches!(
+            label.as_str(),
+            "kill"
+                | "me"
+                | "version"
+                | "ver"
+                | "about"
+                | "reload"
+                | "plugins"
+                | "tps"
+                | "poseidon"
+                | "projectposeidon"
+        )
+    }
+
     pub fn get_command(&self, label: &str) -> Option<&(dyn Command + Send)> {
         let lower = label.to_lowercase();
         let lower = lower.strip_prefix("bukkit:").unwrap_or(&lower);

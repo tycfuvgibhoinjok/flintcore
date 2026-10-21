@@ -11873,6 +11873,7 @@ impl Server {
     /// the listener differs — the console answers on the terminal, a player
     /// receives chat packets.
     fn run_command(&mut self, sender: CommandSender, command: &str) {
+        let is_console = matches!(sender, CommandSender::Console);
         let username = match sender {
             CommandSender::Player(id) => self
                 .connections
@@ -11891,6 +11892,19 @@ impl Server {
 
         // The console accepts commands with and without the leading slash.
         let cmd_body = command.strip_prefix('/').unwrap_or(command);
+        // The commands that the reference does not know are an extension of
+        // the port: without the option they are answered like the console
+        // of the reference answers them (`ConsoleCommandHandler.java:55-296`
+        // — `Unknown console command. Type "help" for help.` ✓).  The
+        // players of the reference know the commands of the Bukkit layer
+        // (§9 ✓), so the gate is only for the console ✓.
+        if is_console
+            && !self.config.server.extra_commands
+            && crate::gameplay::commands::CommandMap::is_extra_command(cmd_body)
+        {
+            self.reply(sender, "Unknown console command. Type \"help\" for help.");
+            return;
+        }
         if !self.config.server.enable_tps_command
             && cmd_body
                 .split_whitespace()
@@ -16390,6 +16404,33 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Unknown console command. Type \"help\" for help.")),
             "console output was {output:?}"
+        );
+    }
+
+    /// The commands that the reference does not have are answered like the
+    /// console of the reference answers them.
+    ///
+    /// Java `ConsoleCommandHandler.java:55-296`: the console of the
+    /// reference knows the commands of the vanilla server and nothing else,
+    /// so `kill` and `me` are answered with `Unknown console command. Type
+    /// "help" for help.` ✓.
+    #[test]
+    fn the_console_does_not_know_the_commands_that_the_reference_does_not_have() {
+        let (mut server, tx, output) = console_server();
+
+        for command in ["kill", "me", "version", "plugins", "tps", "poseidon"] {
+            tx.send(command.to_string()).unwrap();
+            server.process_console_commands();
+        }
+
+        let output = output.lock().unwrap();
+        let unknown = output
+            .iter()
+            .filter(|line| line.contains("Unknown console command. Type \"help\" for help."))
+            .count();
+        assert_eq!(
+            unknown, 6,
+            "every command that the reference does not have is unknown: {output:?}"
         );
     }
 

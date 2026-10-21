@@ -216,6 +216,21 @@ pub struct ServerConfig {
     pub autosave_interval_ticks: u64,
     pub time_speed_multiplier: i64,
     pub enable_tps_command: bool,
+    /// The commands that the reference does not have.
+    ///
+    /// Java `ConsoleCommandHandler.java:55-296`: the console of the
+    /// reference knows `help` ✓, `list` ✓, `stop` ✓, `save-all` ✓,
+    /// `save-off` ✓, `save-on` ✓, `op` ✓, `deop` ✓, `ban` ✓, `pardon` ✓,
+    /// `ban-ip` ✓, `pardon-ip` ✓, `kick` ✓, `tp` ✓, `give` ✓, `time` ✓,
+    /// `say` ✓, `tell` ✓ and `whitelist` ✓ — and nothing else ✓: a command
+    /// that it does not know is answered with `Unknown console command.
+    /// Type "help" for help.` ✓.
+    ///
+    /// The port knows the commands `kill` ✓, `me` ✓, `version` ✓,
+    /// `reload` ✓, `plugins` ✓, `tps` ✓ and `poseidon` ✓ — they are an
+    /// extension of the port ✓, so they are switched off by default ✓ and
+    /// the console of the port answers like the console of the reference ✓.
+    pub extra_commands: bool,
     /// Read server commands from the process' standard input (the vanilla
     /// server console). Only the `flintcore` binary starts the reader.
     pub console_enabled: bool,
@@ -247,6 +262,7 @@ impl Default for ServerConfig {
             autosave_interval_ticks: 40,
             time_speed_multiplier: 1,
             enable_tps_command: true,
+            extra_commands: false,
             console_enabled: true,
             console_name: "CONSOLE".to_string(),
         }
