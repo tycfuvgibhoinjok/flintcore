@@ -23,6 +23,9 @@ use flintcore::server::Server;
 use flintcore::util::bytes::Writer;
 use flintcore::world::storage::PlayerStore;
 
+mod common;
+use common::*;
+
 struct Harness {
     running: Arc<AtomicBool>,
     address: std::net::SocketAddr,
@@ -94,78 +97,6 @@ fn temp_world_dir() -> PathBuf {
     dir
 }
 
-async fn read_u8(stream: &mut TcpStream) -> u8 {
-    let mut byte = [0u8; 1];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut byte)).await {
-        Ok(Ok(_)) => byte[0],
-        _ => panic!("read_u8 timeout"),
-    }
-}
-
-async fn read_i32(stream: &mut TcpStream) -> i32 {
-    let mut bytes = [0u8; 4];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => i32::from_be_bytes(bytes),
-        _ => panic!("read_i32 timeout"),
-    }
-}
-
-async fn read_i16(stream: &mut TcpStream) -> i16 {
-    let mut bytes = [0u8; 2];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => i16::from_be_bytes(bytes),
-        _ => panic!("read_i16 timeout"),
-    }
-}
-
-async fn read_i64(stream: &mut TcpStream) -> i64 {
-    let mut bytes = [0u8; 8];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => i64::from_be_bytes(bytes),
-        _ => panic!("read_i64 timeout"),
-    }
-}
-
-async fn read_f64(stream: &mut TcpStream) -> f64 {
-    let mut bytes = [0u8; 8];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => f64::from_be_bytes(bytes),
-        _ => panic!("read_f64 timeout"),
-    }
-}
-
-async fn read_f32(stream: &mut TcpStream) -> f32 {
-    let mut bytes = [0u8; 4];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => f32::from_be_bytes(bytes),
-        _ => panic!("read_f32 timeout"),
-    }
-}
-
-async fn read_bool(stream: &mut TcpStream) -> bool {
-    read_u8(stream).await != 0
-}
-
-async fn read_string(stream: &mut TcpStream) -> String {
-    let mut length = [0u8; 2];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut length)).await {
-        Ok(Ok(_)) => {}
-        _ => panic!("read_string length timeout"),
-    }
-    let length = i16::from_be_bytes(length) as usize;
-    let mut bytes = vec![0u8; length * 2];
-    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => {}
-        _ => panic!("read_string body timeout"),
-    }
-    let units = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
-    char::decode_utf16(units)
-        .map(|unit| unit.unwrap_or('\u{FFFD}'))
-        .collect()
-}
-
 fn handshake(username: &str) -> Vec<u8> {
     let mut writer = Writer::new();
     writer.write_u8(2);
@@ -228,51 +159,41 @@ async fn player_saved_in_nether_logs_into_the_nether() {
         // The spawn area is streamed from the Nether: collect the chunk
         // payloads and check that they are Nether terrain (bedrock at the
         // bottom, netherrack above it) instead of overworld stone/dirt.
+        // The data of the chunks has a low priority (`Packet.k`), so it comes
+        // after the packet of the position of the player.
         let mut payloads = Vec::new();
         let mut teleported = false;
-        while !teleported {
-            let id = read_u8(&mut client).await;
-            match id {
-                50 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_bool(&mut client).await,
-                    );
-                }
-                51 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i32(&mut client).await,
-                    );
-                    let _ = (
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                    let len = read_i32(&mut client).await as usize;
-                    let mut comp = vec![0u8; len];
-                    client.read_exact(&mut comp).await.unwrap();
-                    let payload = flintcore::util::compress::inflate_zlib(&comp, 81920).unwrap();
-                    payloads.push(payload);
-                }
-                13 => {
-                    let x = read_f64(&mut client).await;
-                    let y = read_f64(&mut client).await;
-                    let stance = read_f64(&mut client).await;
-                    let z = read_f64(&mut client).await;
-                    let _ = (read_f32(&mut client).await, read_f32(&mut client).await);
-                    let _on_ground = read_bool(&mut client).await;
-                    assert_eq!(x, 8.5);
-                    assert_eq!(z, 8.5);
-                    assert!((y - (stance + 1.62)).abs() < 1e-4);
-                    teleported = true;
-                }
-                _ => {}
+        while !teleported || payloads.is_empty() {
+            let id = read_packet_id(&mut client, &[13, 51]).await;
+            if id == 13 {
+                let x = read_f64(&mut client).await;
+                let y = read_f64(&mut client).await;
+                let stance = read_f64(&mut client).await;
+                let z = read_f64(&mut client).await;
+                let _ = (read_f32(&mut client).await, read_f32(&mut client).await);
+                let _on_ground = read_bool(&mut client).await;
+                assert_eq!(x, 8.5);
+                assert_eq!(z, 8.5);
+                assert!((y - (stance + 1.62)).abs() < 1e-4);
+                teleported = true;
+            } else {
+                let _ = (
+                    read_i32(&mut client).await,
+                    read_i16(&mut client).await,
+                    read_i32(&mut client).await,
+                );
+                let _ = (
+                    read_u8(&mut client).await,
+                    read_u8(&mut client).await,
+                    read_u8(&mut client).await,
+                );
+                let len = read_i32(&mut client).await as usize;
+                let mut comp = vec![0u8; len];
+                client.read_exact(&mut comp).await.unwrap();
+                let payload = flintcore::util::compress::inflate_zlib(&comp, 81920).unwrap();
+                payloads.push(payload);
             }
         }
-        assert!(!payloads.is_empty(), "no chunk was streamed");
 
         // Wire layout: (x << 11) | (z << 7) | y
         let wire_index = |x: usize, y: usize, z: usize| (x << 11) | (z << 7) | y;

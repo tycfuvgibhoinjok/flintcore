@@ -1158,37 +1158,39 @@ impl Server {
                 }
                 let (yaw, pitch) = rot.unwrap_or((player.yaw, player.pitch));
 
-                if x.is_nan()
-                    || y.is_nan()
-                    || z.is_nan()
-                    || stance.is_nan()
-                    || x.is_infinite()
-                    || y.is_infinite()
-                    || z.is_infinite()
-                    || stance.is_infinite()
-                    || yaw.is_infinite()
-                    || pitch.is_infinite()
-                {
+                // Java `NetServerHandler.java:264-269`: the position that is
+                // not a number is an attempt to crash the server.
+                if x.is_nan() || y.is_nan() || z.is_nan() || stance.is_nan() {
                     self.kick(id, "Nope!");
                     return;
                 }
-                if self.config.fixes.head_rotation_patch_enabled
-                    && rot.is_some()
-                    && !(-90.0..=90.0).contains(&pitch)
-                {
-                    self.kick(id, "Illegal stance");
+                // Java `Entity.c(float, float)`: the rotation that is not
+                // finite is an attempt to crash the server too.
+                if rot.is_some() && (yaw.is_infinite() || pitch.is_infinite()) {
+                    self.kick(id, "Nope");
                     return;
                 }
-                // Java `NetServerHandler`: the stance is the height of the
-                // eyes above the feet, it must be in `[0.1, 1.65]`.
-                let eye_height = stance - y;
-                if !player.sleeping && (eye_height > 1.65 || eye_height < 0.1) {
-                    self.kick(id, "Illegal stance");
+                // The position that is not finite would break the world (the
+                // reference does not check it — a bug of the reference, the
+                // port deviates deliberately).
+                if x.is_infinite() || y.is_infinite() || z.is_infinite() || stance.is_infinite() {
+                    self.kick(id, "Nope!");
                     return;
                 }
-                if x.abs() > 3.2e7 || z.abs() > 3.2e7 {
-                    self.kick(id, "Illegal position");
-                    return;
+                // Java `NetServerHandler.java:349-362`: the stance is the
+                // height of the eyes above the feet, it must be in
+                // `[0.1, 1.65]`.  The check is done only when the packet
+                // carries the position (`Packet10Flying.h`).
+                if pos.is_some() {
+                    let eye_height = stance - y;
+                    if !player.sleeping && (eye_height > 1.65 || eye_height < 0.1) {
+                        self.kick(id, "Illegal stance");
+                        return;
+                    }
+                    if x.abs() > 3.2e7 || z.abs() > 3.2e7 {
+                        self.kick(id, "Illegal position");
+                        return;
+                    }
                 }
 
                 // Poseidon / NetServerHandler.java:385-394 — reject stale pre-teleport / >max_distance single-packet jump
@@ -11695,7 +11697,7 @@ impl Server {
                             s.dismount_player(veid);
                             if let Some(vp) = s.entities.get_player_mut(veid) {
                                 let old_c = vp.chunk_pos();
-                                vp.update_position(tx, ty, ty, tz, tyaw, tpitch, false);
+                                vp.update_position(tx, ty, ty + 1.62, tz, tyaw, tpitch, false);
                                 vp.fall_distance = 0.0;
                                 let new_c = vp.chunk_pos();
                                 s.entities.update_player_chunk(veid, old_c, new_c);
@@ -11714,7 +11716,7 @@ impl Server {
                             );
                             s.handle_movement(
                                 vconn,
-                                Some((tx, ty, ty, tz)),
+                                Some((tx, ty, ty + 1.62, tz)),
                                 Some((tyaw, tpitch)),
                                 false,
                             );
@@ -11733,7 +11735,7 @@ impl Server {
                         s.dismount_player(veid);
                         if let Some(vp) = s.entities.get_player_mut(veid) {
                             let old_c = vp.chunk_pos();
-                            vp.update_position(x, y, y, z, vyaw, vpitch, false);
+                            vp.update_position(x, y, y + 1.62, z, vyaw, vpitch, false);
                             vp.fall_distance = 0.0;
                             let new_c = vp.chunk_pos();
                             s.entities.update_player_chunk(veid, old_c, new_c);
@@ -11750,7 +11752,12 @@ impl Server {
                                 on_ground: false,
                             }),
                         );
-                        s.handle_movement(vconn, Some((x, y, y, z)), Some((vyaw, vpitch)), false);
+                        s.handle_movement(
+                            vconn,
+                            Some((x, y, y + 1.62, z)),
+                            Some((vyaw, vpitch)),
+                            false,
+                        );
                     });
                 }
             }
@@ -13428,6 +13435,121 @@ mod tests {
             }
         }
         assert_eq!(times, 1, "the time is sent on the twentieth tick");
+    }
+
+    /// The packet with the rotation only does not check the stance.
+    ///
+    /// Java `NetServerHandler.java:349-362`: the stance is checked only when
+    /// the packet carries the position (`Packet10Flying.h`), so the packet
+    /// with the rotation only (`Packet12PlayerLook`) never disconnects the
+    /// player.
+    #[test]
+    fn the_packet_with_the_rotation_only_does_not_check_the_stance() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.connections.insert(
+            7,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().expect("the address"),
+                state: ConnectionState::Playing,
+                username: Some("Tester".to_string()),
+                entity_id: 1,
+                idle_ticks: 0,
+            },
+        );
+        server.handle_packet(
+            7,
+            Serverbound::Login(crate::net::packets::Login {
+                protocol: crate::net::protocol::PROTOCOL_VERSION,
+                username: "Tester".to_string(),
+                map_seed: 0,
+                dimension: 0,
+            }),
+        );
+        while rx.try_recv().is_ok() {}
+
+        // The rotation only.
+        server.handle_packet(
+            7,
+            Serverbound::PlayerLook(crate::net::packets::PlayerLook {
+                yaw: -45.0,
+                pitch: -30.0,
+                on_ground: true,
+            }),
+        );
+
+        let mut kicks = 0;
+        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            if matches!(packet, Clientbound::KickDisconnect(_)) {
+                kicks += 1;
+            }
+        }
+        assert_eq!(kicks, 0, "the player is not disconnected");
+        let player = server.entities.get_by_conn(7).expect("the player");
+        assert_eq!(player.yaw, -45.0, "the yaw of the player");
+        assert_eq!(player.pitch, -30.0, "the pitch of the player");
+    }
+
+    /// The teleport of the command does not disconnect the player.
+    ///
+    /// The teleported player is moved by the server itself, the check of
+    /// the stance (`NetServerHandler.java:349-362`) must not disconnect it.
+    #[test]
+    fn the_teleport_of_the_command_does_not_disconnect_the_player() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let mut receivers = Vec::new();
+        for (id, name) in [(7u64, "Tester"), (8u64, "Other")] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            server.connections.insert(
+                id,
+                Connection {
+                    sender: tx,
+                    address: "127.0.0.1:25565".parse().expect("the address"),
+                    state: ConnectionState::Playing,
+                    username: Some(name.to_string()),
+                    entity_id: id as i32,
+                    idle_ticks: 0,
+                },
+            );
+            receivers.push(rx);
+            server.handle_packet(
+                id,
+                Serverbound::Login(crate::net::packets::Login {
+                    protocol: crate::net::protocol::PROTOCOL_VERSION,
+                    username: name.to_string(),
+                    map_seed: 0,
+                    dimension: 0,
+                }),
+            );
+        }
+
+        // The second player is away from the spawn.
+        let target_entity = server
+            .connections
+            .get(&8)
+            .map(|connection| connection.entity_id)
+            .unwrap_or_default();
+        if let Some(player) = server.entities.get_player_mut(target_entity) {
+            player.x = 10.0;
+            player.z = 10.0;
+        }
+
+        // The teleport of the first player to the second one.
+        server.run_command(CommandSender::Player(7), "tp Tester Other");
+
+        let player = server.entities.get_by_conn(7).expect("the player");
+        assert_eq!(player.x, 10.0, "the player is teleported");
+
+        let mut kicks = 0;
+        for rx in &mut receivers {
+            while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+                if matches!(packet, Clientbound::KickDisconnect(_)) {
+                    kicks += 1;
+                }
+            }
+        }
+        assert_eq!(kicks, 0, "the player is not disconnected by the teleport");
     }
 
     /// The explosion throws the mob away.

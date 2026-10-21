@@ -14,6 +14,16 @@ pub struct DiggingState {
     pub start_tick: u64,
 }
 
+/// Java `Entity.c(float, float)`: the angle is taken modulo 360, the `NaN`
+/// is replaced with zero.
+pub fn normalise_angle(angle: f32) -> f32 {
+    if angle.is_nan() {
+        0.0
+    } else {
+        angle % 360.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Player {
     pub entity_id: i32,
@@ -209,8 +219,10 @@ impl Player {
         self.y = y;
         self.stance = stance;
         self.z = z;
-        self.yaw = yaw;
-        self.pitch = pitch;
+        // Java `Entity.c(float, float)`: the angles are taken modulo 360,
+        // the `NaN` is replaced with zero.
+        self.yaw = normalise_angle(yaw);
+        self.pitch = normalise_angle(pitch);
         self.on_ground = on_ground;
     }
 
@@ -408,6 +420,31 @@ mod tests {
             player.spawn_protect_ticks, 59,
             "the counter of the protection"
         );
+    }
+
+    /// The angles are taken modulo 360, the `NaN` is zero.
+    ///
+    /// Java `Entity.c(float, float)`: the yaw and the pitch of the entity
+    /// are taken modulo 360, the `NaN` is replaced with zero.
+    #[test]
+    fn the_angles_are_taken_modulo_three_hundred_and_sixty() {
+        assert_eq!(normalise_angle(0.0), 0.0);
+        assert_eq!(normalise_angle(-45.0), -45.0);
+        assert_eq!(normalise_angle(400.0), 40.0);
+        assert_eq!(normalise_angle(-400.0), -40.0);
+        assert_eq!(normalise_angle(f32::NAN), 0.0);
+    }
+
+    /// The rotation of the player is normalised.
+    ///
+    /// Java `Entity.setLocation` calls `Entity.c(float, float)`, so the yaw
+    /// and the pitch of the player are taken modulo 360.
+    #[test]
+    fn the_rotation_of_the_player_is_normalised() {
+        let mut player = Player::new(1, 1, "Player".to_string(), 0.0, 64.0, 0.0);
+        player.update_position(0.0, 64.0, 65.62, 0.0, 400.0, -30.0, true);
+        assert_eq!(player.yaw, 40.0, "the yaw of the player");
+        assert_eq!(player.pitch, -30.0, "the pitch of the player");
     }
 
     /// The armour of the player reduces any damage.

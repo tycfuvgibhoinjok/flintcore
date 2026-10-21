@@ -12,6 +12,9 @@ use flintcore::net::{listener, packets::chat::MAX_CHAT_LENGTH, NetEvent};
 use flintcore::server::Server;
 use flintcore::util::bytes::Writer;
 
+mod common;
+use common::*;
+
 struct Harness {
     running: Arc<AtomicBool>,
     address: std::net::SocketAddr,
@@ -57,446 +60,6 @@ impl Harness {
         self.running.store(false, Ordering::Relaxed);
         if let Some(sim) = self.sim.take() {
             let _ = sim.await;
-        }
-    }
-}
-
-async fn read_u8(stream: &mut TcpStream) -> u8 {
-    let mut byte = [0u8; 1];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut byte)).await {
-        Ok(Ok(_)) => byte[0],
-        _ => panic!("read_u8 timeout"),
-    }
-}
-
-async fn read_i32(stream: &mut TcpStream) -> i32 {
-    let mut bytes = [0u8; 4];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => i32::from_be_bytes(bytes),
-        _ => panic!("read_i32 timeout"),
-    }
-}
-
-async fn read_i64(stream: &mut TcpStream) -> i64 {
-    let mut bytes = [0u8; 8];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => i64::from_be_bytes(bytes),
-        _ => panic!("read_i64 timeout"),
-    }
-}
-
-async fn read_i16(stream: &mut TcpStream) -> i16 {
-    let mut bytes = [0u8; 2];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => i16::from_be_bytes(bytes),
-        _ => panic!("read_i16 timeout"),
-    }
-}
-
-async fn read_f64(stream: &mut TcpStream) -> f64 {
-    let mut bytes = [0u8; 8];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => f64::from_be_bytes(bytes),
-        _ => panic!("read_f64 timeout"),
-    }
-}
-
-async fn read_f32(stream: &mut TcpStream) -> f32 {
-    let mut bytes = [0u8; 4];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => f32::from_be_bytes(bytes),
-        _ => panic!("read_f32 timeout"),
-    }
-}
-
-async fn read_bool(stream: &mut TcpStream) -> bool {
-    read_u8(stream).await != 0
-}
-
-async fn read_string(stream: &mut TcpStream) -> String {
-    let mut length = [0u8; 2];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut length)).await {
-        Ok(Ok(_)) => {}
-        _ => panic!("read_string length timeout"),
-    }
-    let length = i16::from_be_bytes(length) as usize;
-    let mut bytes = vec![0u8; length * 2];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut bytes)).await {
-        Ok(Ok(_)) => {}
-        _ => panic!("read_string body timeout"),
-    }
-    let units = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
-    char::decode_utf16(units)
-        .map(|unit| unit.unwrap_or('\u{FFFD}'))
-        .collect()
-}
-
-/// Reads the metadata of an entity: the types of the values.
-async fn read_metadata(stream: &mut TcpStream) {
-    loop {
-        let header = read_u8(stream).await;
-        if header == 127 {
-            break;
-        }
-        match (header >> 5) & 7 {
-            0 => {
-                let _ = read_u8(stream).await;
-            }
-            1 => {
-                let _ = read_i16(stream).await;
-            }
-            2 | 3 => {
-                let _ = read_i32(stream).await;
-            }
-            4 => {
-                let len = read_i16(stream).await as usize;
-                for _ in 0..len {
-                    let _ = read_i16(stream).await;
-                }
-            }
-            5 => {
-                let item_id = read_i16(stream).await;
-                if item_id >= 0 {
-                    let _ = read_u8(stream).await;
-                    let _ = read_i16(stream).await;
-                }
-            }
-            6 => {
-                for _ in 0..6 {
-                    let _ = read_i32(stream).await;
-                }
-            }
-            _ => break,
-        }
-    }
-}
-
-/// Skips the payload of a packet of the world.
-///
-/// Returns `true` when the packet is known and its payload is consumed.
-async fn skip_packet_payload(stream: &mut TcpStream, id: u8) -> bool {
-    match id {
-        0 => {}
-        3 => {
-            let _ = read_string(stream).await;
-        }
-        4 => {
-            let _ = read_i64(stream).await;
-        }
-        5 | 28 => {
-            let _ = (
-                read_i32(stream).await,
-                read_i16(stream).await,
-                read_i16(stream).await,
-                read_i16(stream).await,
-            );
-        }
-        8 => {
-            let _ = read_i16(stream).await;
-        }
-        13 => {
-            let _ = (
-                read_f64(stream).await,
-                read_f64(stream).await,
-                read_f64(stream).await,
-                read_f64(stream).await,
-            );
-            let _ = (read_f32(stream).await, read_f32(stream).await);
-            let _ = read_bool(stream).await;
-        }
-        20 => {
-            let _ = read_i32(stream).await;
-            let _ = read_string(stream).await;
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (
-                read_u8(stream).await,
-                read_u8(stream).await,
-                read_i16(stream).await,
-            );
-        }
-        29 | 30 => {
-            let _ = read_i32(stream).await;
-        }
-        31 => {
-            let _ = read_i32(stream).await;
-            let _ = (
-                read_u8(stream).await,
-                read_u8(stream).await,
-                read_u8(stream).await,
-            );
-        }
-        34 => {
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (read_u8(stream).await, read_u8(stream).await);
-        }
-        38 => {
-            let _ = (read_i32(stream).await, read_u8(stream).await);
-        }
-        18 => {
-            let _ = (read_i32(stream).await, read_u8(stream).await);
-        }
-        19 => {
-            let _ = (read_i32(stream).await, read_u8(stream).await);
-        }
-        21 => {
-            let _ = read_i32(stream).await;
-            let _ = (
-                read_i16(stream).await,
-                read_u8(stream).await,
-                read_i16(stream).await,
-            );
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (
-                read_u8(stream).await,
-                read_u8(stream).await,
-                read_u8(stream).await,
-            );
-        }
-        22 => {
-            let _ = (read_i32(stream).await, read_i32(stream).await);
-        }
-        23 => {
-            let _ = read_i32(stream).await;
-            let _ = read_u8(stream).await;
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-            let thrower = read_i32(stream).await;
-            if thrower > 0 {
-                let _ = (
-                    read_i16(stream).await,
-                    read_i16(stream).await,
-                    read_i16(stream).await,
-                );
-            }
-        }
-        24 => {
-            // The spawn of a mob: the metadata follows.
-            let _ = read_i32(stream).await;
-            let _ = read_u8(stream).await;
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (read_u8(stream).await, read_u8(stream).await);
-            read_metadata(stream).await;
-        }
-        25 => {
-            let _ = read_i32(stream).await;
-            let _ = read_u8(stream).await;
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-        }
-        33 => {
-            let _ = read_i32(stream).await;
-            let _ = (
-                read_i16(stream).await,
-                read_i16(stream).await,
-                read_i16(stream).await,
-            );
-            let _ = (read_u8(stream).await, read_u8(stream).await);
-            let _ = read_bool(stream).await;
-        }
-        35 => {
-            let _ = read_i32(stream).await;
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (read_u8(stream).await, read_u8(stream).await);
-            let _ = read_bool(stream).await;
-        }
-        39 => {
-            let _ = (read_i32(stream).await, read_i32(stream).await);
-        }
-        40 => {
-            // The metadata of the entity: the types of the values.
-            let _ = read_i32(stream).await;
-            read_metadata(stream).await;
-        }
-        50 => {
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_bool(stream).await,
-            );
-        }
-        51 => {
-            let _ = (
-                read_i32(stream).await,
-                read_i16(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (
-                read_u8(stream).await,
-                read_u8(stream).await,
-                read_u8(stream).await,
-            );
-            let len = read_i32(stream).await as usize;
-            let mut comp = vec![0u8; len];
-            stream.read_exact(&mut comp).await.unwrap();
-        }
-        103 => {
-            let _ = read_u8(stream).await;
-            let _ = read_i16(stream).await;
-            let item_id = read_i16(stream).await;
-            if item_id >= 0 {
-                let _ = (read_u8(stream).await, read_i16(stream).await);
-            }
-        }
-        104 => {
-            let _ = read_u8(stream).await;
-            let count = read_i16(stream).await;
-            for _ in 0..count {
-                let item_id = read_i16(stream).await;
-                if item_id >= 0 {
-                    let _ = (read_u8(stream).await, read_i16(stream).await);
-                }
-            }
-        }
-        130 => {
-            // The sign: the four lines of the text.
-            let _ = (
-                read_i32(stream).await,
-                read_i16(stream).await,
-                read_i32(stream).await,
-            );
-            for _ in 0..4 {
-                let _ = read_string(stream).await;
-            }
-        }
-        _ => return false,
-    }
-    true
-}
-
-/// Reads the next packet of the client that is not in the list of the
-/// ignored packets.
-///
-/// The payload of the ignored packets is consumed, so the stream of the
-/// packets stays in sync.
-async fn read_next_packet_id(stream: &mut TcpStream, ignore: &[u8]) -> u8 {
-    loop {
-        let id = read_u8(stream).await;
-        if ignore.contains(&id) {
-            let _ = skip_packet_payload(stream, id).await;
-            continue;
-        }
-        return id;
-    }
-}
-
-async fn read_next_non_chunk_packet_id(stream: &mut TcpStream) -> u8 {
-    loop {
-        let id = read_u8(stream).await;
-        if id == 0 {
-            continue;
-        } else if id == 5 || id == 28 {
-            let _ = (
-                read_i32(stream).await,
-                read_i16(stream).await,
-                read_i16(stream).await,
-                read_i16(stream).await,
-            );
-            continue;
-        } else if id == 4 {
-            // The time of the world (`Packet4UpdateTime`).
-            let _ = read_i64(stream).await;
-            continue;
-        } else if id == 8 {
-            let _ = read_i16(stream).await;
-            continue;
-        } else if id == 20 {
-            let _ = read_i32(stream).await;
-            let _ = read_string(stream).await;
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (
-                read_u8(stream).await,
-                read_u8(stream).await,
-                read_i16(stream).await,
-            );
-            continue;
-        } else if id == 29 || id == 30 {
-            let _ = read_i32(stream).await;
-            continue;
-        } else if id == 34 {
-            let _ = read_i32(stream).await;
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (read_u8(stream).await, read_u8(stream).await);
-            continue;
-        } else if id == 38 {
-            let _ = (read_i32(stream).await, read_u8(stream).await);
-            continue;
-        } else if id == 103 {
-            let _ = (read_u8(stream).await, read_i16(stream).await);
-            let item_id = read_i16(stream).await;
-            if item_id >= 0 {
-                let _ = (read_u8(stream).await, read_i16(stream).await);
-            }
-            continue;
-        } else if id == 104 {
-            let _ = read_u8(stream).await;
-            let count = read_i16(stream).await;
-            for _ in 0..count {
-                let item_id = read_i16(stream).await;
-                if item_id >= 0 {
-                    let _ = (read_u8(stream).await, read_i16(stream).await);
-                }
-            }
-            continue;
-        } else if id == 50 {
-            let _ = (
-                read_i32(stream).await,
-                read_i32(stream).await,
-                read_u8(stream).await,
-            );
-            continue;
-        } else if id == 51 {
-            let _ = (
-                read_i32(stream).await,
-                read_i16(stream).await,
-                read_i32(stream).await,
-            );
-            let _ = (
-                read_u8(stream).await,
-                read_u8(stream).await,
-                read_u8(stream).await,
-            );
-            let len = read_i32(stream).await as usize;
-            let mut comp = vec![0u8; len];
-            stream.read_exact(&mut comp).await.unwrap();
-            continue;
-        } else {
-            return id;
         }
     }
 }
@@ -884,7 +447,7 @@ async fn chat_too_long_gets_kicked() {
             .unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 255);
+        assert_eq!(read_packet_id(&mut client, &[255]).await, 255);
         let reason = read_string(&mut client).await;
         assert_eq!(reason, "Chat message too long");
     };
@@ -905,7 +468,7 @@ async fn chat_illegal_characters_gets_kicked() {
         writer.write_string("hello \u{1F600} world", 100).unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 255);
+        assert_eq!(read_packet_id(&mut client, &[255]).await, 255);
         let reason = read_string(&mut client).await;
         assert_eq!(reason, "Illegal characters in chat");
     };
@@ -947,7 +510,7 @@ async fn chat_normal_broadcast_format() {
         writer.write_string("hello world", 100).unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        assert_eq!(read_packet_id(&mut client, &[3]).await, 3);
         let msg = read_string(&mut client).await;
         assert_eq!(msg, "<ChatNormal> hello world");
     };
@@ -968,7 +531,7 @@ async fn chat_command_unknown() {
         writer.write_string("/nonexistent", 100).unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        assert_eq!(read_packet_id(&mut client, &[3]).await, 3);
         let msg = read_string(&mut client).await;
         // Java `ConsoleCommandHandler.java:288`.
         assert_eq!(msg, "Unknown console command. Type \"help\" for help.");
@@ -994,7 +557,7 @@ async fn chat_command_help() {
         // of the reference is a separate message.
         let mut lines: Vec<String> = Vec::new();
         for _ in 0..20 {
-            assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+            assert_eq!(read_packet_id(&mut client, &[3]).await, 3);
             lines.push(read_string(&mut client).await);
         }
         let help = lines.join("\n");
@@ -1019,7 +582,7 @@ async fn chat_command_say() {
         writer.write_string("/say hello from server", 100).unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        assert_eq!(read_packet_id(&mut client, &[3]).await, 3);
         let msg = read_string(&mut client).await;
         assert!(msg.contains("hello from server"));
     };
@@ -1040,7 +603,7 @@ async fn chat_command_me() {
         writer.write_string("/me dances", 100).unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 3);
+        assert_eq!(read_packet_id(&mut client, &[3]).await, 3);
         let msg = read_string(&mut client).await;
         assert!(msg.contains("* ChatMe dances"));
     };
@@ -1061,7 +624,7 @@ async fn join_message_broadcast() {
 
         // Player1 (already online) should receive join message when Player2 joins
         loop {
-            let id = read_next_non_chunk_packet_id(&mut client1).await;
+            let id = read_packet_id(&mut client1, &[3]).await;
             if id == 3 {
                 break;
             }
@@ -1092,7 +655,7 @@ async fn leave_message_broadcast() {
 
         // Player2 should receive leave message about Player1
         loop {
-            let id = read_next_non_chunk_packet_id(&mut client2).await;
+            let id = read_packet_id(&mut client2, &[3]).await;
             if id == 3 {
                 break;
             }
@@ -1118,53 +681,13 @@ async fn player_tracking_spawns_other_player() {
         // Give the tracker tick a moment to scan proximity
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // Watcher should receive NamedEntitySpawn (id 20) for Spawnee
-        let mut found_spawn = false;
-        for _ in 0..30 {
-            let id = read_next_packet_id(
-                &mut client1,
-                &[
-                    0, 3, 4, 8, 13, 18, 19, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            if id == 20 {
-                let entity_id = read_i32(&mut client1).await;
-                assert!(entity_id > 0);
-                let name = read_string(&mut client1).await;
-                assert_eq!(name, "Spawnee");
-                found_spawn = true;
-                break;
-            } else if id == 0 {
-                continue;
-            } else if id == 3 {
-                let _ = read_string(&mut client1).await;
-            } else if id == 50 {
-                let _ = (
-                    read_i32(&mut client1).await,
-                    read_i32(&mut client1).await,
-                    read_u8(&mut client1).await,
-                );
-            } else if id == 51 {
-                let _ = (
-                    read_i32(&mut client1).await,
-                    read_i16(&mut client1).await,
-                    read_i32(&mut client1).await,
-                );
-                let _ = (
-                    read_u8(&mut client1).await,
-                    read_u8(&mut client1).await,
-                    read_u8(&mut client1).await,
-                );
-                let len = read_i32(&mut client1).await as usize;
-                let mut comp = vec![0u8; len];
-                client1.read_exact(&mut comp).await.unwrap();
-            }
-        }
-        assert!(
-            found_spawn,
-            "Watcher should receive NamedEntitySpawn for Spawnee"
-        );
+        // The watcher receives the spawn of the other player.
+        let id = read_packet_id(&mut client1, &[20]).await;
+        assert_eq!(id, 20);
+        let entity_id = read_i32(&mut client1).await;
+        assert!(entity_id > 0);
+        let name = read_string(&mut client1).await;
+        assert_eq!(name, "Spawnee");
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -1189,56 +712,15 @@ async fn inventory_click_transaction() {
         click_writer.write_i16(-1); // item_id (empty)
         client.write_all(click_writer.as_slice()).await.unwrap();
 
-        // Should receive Transaction (id 106)
-        let mut found_trans = false;
-        for _ in 0..30 {
-            let id = read_next_packet_id(
-                &mut client,
-                &[
-                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            if id == 106 {
-                let window_id = read_u8(&mut client).await;
-                assert_eq!(window_id, 0);
-                let action = read_i16(&mut client).await;
-                assert_eq!(action, 1);
-                let accepted = read_bool(&mut client).await;
-                assert!(accepted);
-                found_trans = true;
-                break;
-            } else if id == 0 {
-                continue;
-            } else if id == 103 {
-                let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
-                let item = read_i16(&mut client).await;
-                if item >= 0 {
-                    let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
-                }
-            } else if id == 50 {
-                let _ = (
-                    read_i32(&mut client).await,
-                    read_i32(&mut client).await,
-                    read_u8(&mut client).await,
-                );
-            } else if id == 51 {
-                let _ = (
-                    read_i32(&mut client).await,
-                    read_i16(&mut client).await,
-                    read_i32(&mut client).await,
-                );
-                let _ = (
-                    read_u8(&mut client).await,
-                    read_u8(&mut client).await,
-                    read_u8(&mut client).await,
-                );
-                let len = read_i32(&mut client).await as usize;
-                let mut comp = vec![0u8; len];
-                client.read_exact(&mut comp).await.unwrap();
-            }
-        }
-        assert!(found_trans, "Should receive Transaction confirmation");
+        // The transaction of the window.
+        let id = read_packet_id(&mut client, &[106]).await;
+        assert_eq!(id, 106);
+        let window_id = read_u8(&mut client).await;
+        assert_eq!(window_id, 0);
+        let action = read_i16(&mut client).await;
+        assert_eq!(action, 1);
+        let accepted = read_bool(&mut client).await;
+        assert!(accepted);
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -1258,46 +740,12 @@ async fn respawn_double_packet_sequence() {
         respawn_writer.write_i8(0);
         client.write_all(respawn_writer.as_slice()).await.unwrap();
 
-        // Poseidon double-respawn: skip chunks and find first Respawn(-1)
-        let mut found_respawn1 = false;
-        for _ in 0..30 {
-            let id = read_next_packet_id(
-                &mut client,
-                &[
-                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            if id == 9 {
-                let dim = read_u8(&mut client).await as i8;
-                assert_eq!(dim, -1);
-                found_respawn1 = true;
-                break;
-            } else if id == 0 {
-                continue;
-            } else if id == 50 {
-                let _ = (
-                    read_i32(&mut client).await,
-                    read_i32(&mut client).await,
-                    read_u8(&mut client).await,
-                );
-            } else if id == 51 {
-                let _ = (
-                    read_i32(&mut client).await,
-                    read_i16(&mut client).await,
-                    read_i32(&mut client).await,
-                );
-                let _ = (
-                    read_u8(&mut client).await,
-                    read_u8(&mut client).await,
-                    read_u8(&mut client).await,
-                );
-                let len = read_i32(&mut client).await as usize;
-                let mut comp = vec![0u8; len];
-                client.read_exact(&mut comp).await.unwrap();
-            }
-        }
-        assert!(found_respawn1, "Should receive first Respawn packet (-1)");
+        // The first packet of the respawn is the packet of the Nether
+        // (`Packet9Respawn`).
+        let id = read_packet_id(&mut client, &[9]).await;
+        assert_eq!(id, 9);
+        let dim = read_u8(&mut client).await as i8;
+        assert_eq!(dim, -1);
 
         // Expect second Respawn (0)
         assert_eq!(read_u8(&mut client).await, 9);
@@ -1369,7 +817,7 @@ async fn chat_color_codes_and_section_sign() {
         writer.write_string("&cRed message", 100).unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        let id = read_next_non_chunk_packet_id(&mut client).await;
+        let id = read_packet_id(&mut client, &[3]).await;
         assert_eq!(id, 3);
         let msg = read_string(&mut client).await;
         assert_eq!(msg, "<ColorUser> &cRed message");
@@ -1383,7 +831,7 @@ async fn chat_color_codes_and_section_sign() {
         writer2.write_string("§aGreen message", 100).unwrap();
         client.write_all(writer2.as_slice()).await.unwrap();
 
-        let id2 = read_next_non_chunk_packet_id(&mut client).await;
+        let id2 = read_packet_id(&mut client, &[255]).await;
         assert_eq!(id2, 255, "the character of the colour is not allowed");
         let reason = read_string(&mut client).await;
         assert_eq!(reason, "Illegal characters in chat");
@@ -1438,7 +886,7 @@ async fn fall_damage_on_player_position() {
         // The sixty ticks of the protection of the spawn
         // (`EntityPlayer.bM`): the damage of the fall is not applied while
         // the player is protected.
-        tokio::time::sleep(Duration::from_millis(10_000)).await;
+        wait_for_time_packets(&mut client, 4).await;
 
         // First sync position on ground
         let mut writer0 = Writer::new();
@@ -1470,54 +918,17 @@ async fn fall_damage_on_player_position() {
         writer2.write_bool(true);
         client.write_all(writer2.as_slice()).await.unwrap();
 
-        // Should receive EntityStatus (38, status 2) and UpdateHealth (8) with health == 18
-        let mut got_hurt_animation = false;
-        let mut got_damaged_health = false;
+        // The animation of the damage and the packet of the health.
+        let id = read_packet_id(&mut client, &[38]).await;
+        assert_eq!(id, 38, "the animation of the damage");
+        let _ent = read_i32(&mut client).await;
+        let status = read_u8(&mut client).await;
+        assert_eq!(status, 2, "the animation of the damage");
 
-        while !got_hurt_animation || !got_damaged_health {
-            let id = read_next_packet_id(
-                &mut client,
-                &[0, 3, 4, 13, 20, 21, 31, 32, 34, 40, 50, 51, 103, 104],
-            )
-            .await;
-            if id == 0 {
-                continue;
-            } else if id == 50 {
-                let _ = (
-                    read_i32(&mut client).await,
-                    read_i32(&mut client).await,
-                    read_u8(&mut client).await,
-                );
-            } else if id == 51 {
-                let _ = (
-                    read_i32(&mut client).await,
-                    read_i16(&mut client).await,
-                    read_i32(&mut client).await,
-                );
-                let _ = (
-                    read_u8(&mut client).await,
-                    read_u8(&mut client).await,
-                    read_u8(&mut client).await,
-                );
-                let len = read_i32(&mut client).await as usize;
-                let mut comp = vec![0u8; len];
-                client.read_exact(&mut comp).await.unwrap();
-            } else if id == 38 {
-                let _ent = read_i32(&mut client).await;
-                let status = read_u8(&mut client).await;
-                assert_eq!(status, 2); // hurt animation!
-                got_hurt_animation = true;
-            } else if id == 8 {
-                let health = read_i16(&mut client).await;
-                if health == 20 {
-                    // The health of the player at the login: the reference
-                    // sends it in the first tick (`EntityPlayer.bL`).
-                    continue;
-                }
-                assert_eq!(health, 18, "Health should be 18 after 5 block fall");
-                got_damaged_health = true;
-            }
-        }
+        let id = read_packet_id(&mut client, &[8]).await;
+        assert_eq!(id, 8, "the health of the player");
+        let health = read_i16(&mut client).await;
+        assert_eq!(health, 18, "the health after the fall of five blocks");
     };
 
     timeout(Duration::from_secs(40), exchange).await.unwrap();
@@ -1534,6 +945,11 @@ async fn pvp_attack_deals_damage_and_velocity() {
         let mut victim = TcpStream::connect(harness.address).await.unwrap();
         login_and_consume_spawn(&mut victim, "Victim").await;
 
+        // The sixty ticks of the protection of the spawn
+        // (`EntityPlayer.bM`): the damage of the player is not applied while
+        // the player is protected.
+        wait_for_time_packets(&mut victim, 4).await;
+
         // Attacker entity_id is 1, Victim is 2
         // Attacker attacks Victim (entity 2) with Packet 7 (UseEntity)
         let mut writer = Writer::new();
@@ -1543,82 +959,21 @@ async fn pvp_attack_deals_damage_and_velocity() {
         writer.write_bool(true); // attack
         attacker.write_all(writer.as_slice()).await.unwrap();
 
-        // Victim should receive UpdateHealth (health < 20)
-        let mut got_hurt = false;
-        let mut got_health = false;
-        while !got_hurt || !got_health {
-            let id = read_next_packet_id(
-                &mut victim,
-                &[
-                    0, 3, 4, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            if id == 0 {
-                continue;
-            } else if id == 38 {
-                let _ent = read_i32(&mut victim).await;
-                let status = read_u8(&mut victim).await;
-                assert_eq!(status, 2);
-                got_hurt = true;
-            } else if id == 8 {
-                let health = read_i16(&mut victim).await;
-                if health == 20 {
-                    // The health of the player at the login.
-                    continue;
-                }
-                assert!(health < 20, "Victim health should be reduced, got {health}");
-                got_health = true;
-            } else if id == 50 {
-                let _ = (
-                    read_i32(&mut victim).await,
-                    read_i32(&mut victim).await,
-                    read_u8(&mut victim).await,
-                );
-            } else if id == 51 {
-                let _ = (
-                    read_i32(&mut victim).await,
-                    read_i16(&mut victim).await,
-                    read_i32(&mut victim).await,
-                );
-                let _ = (
-                    read_u8(&mut victim).await,
-                    read_u8(&mut victim).await,
-                    read_u8(&mut victim).await,
-                );
-                let len = read_i32(&mut victim).await as usize;
-                let mut comp = vec![0u8; len];
-                victim.read_exact(&mut comp).await.unwrap();
-            } else if id == 3 {
-                let _ = read_string(&mut victim).await;
-            } else if id == 20 {
-                let _ = read_i32(&mut victim).await;
-                let _ = read_string(&mut victim).await;
-                let _ = (
-                    read_i32(&mut victim).await,
-                    read_i32(&mut victim).await,
-                    read_i32(&mut victim).await,
-                );
-                let _ = (
-                    read_u8(&mut victim).await,
-                    read_u8(&mut victim).await,
-                    read_i16(&mut victim).await,
-                );
-            } else if id == 18 {
-                let _ = (read_i32(&mut victim).await, read_u8(&mut victim).await);
-            } else if id == 5 {
-                let _ = (
-                    read_i32(&mut victim).await,
-                    read_i16(&mut victim).await,
-                    read_i16(&mut victim).await,
-                    read_i16(&mut victim).await,
-                );
-            } else if id == 40 {
-                let _ = read_i32(&mut victim).await;
-                let mut meta = [0u8; 3];
-                victim.read_exact(&mut meta).await.unwrap();
-            }
-        }
+        // The victim receives the animation of the damage.
+        let id = read_packet_id(&mut victim, &[38]).await;
+        assert_eq!(id, 38, "the animation of the damage");
+        let _ent = read_i32(&mut victim).await;
+        let status = read_u8(&mut victim).await;
+        assert_eq!(status, 2, "the animation of the damage");
+
+        // And the packet of the health.
+        let id = read_packet_id(&mut victim, &[8]).await;
+        assert_eq!(id, 8, "the health of the victim");
+        let health = read_i16(&mut victim).await;
+        assert!(
+            health < 20,
+            "the health of the victim is reduced, got {health}"
+        );
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -1645,62 +1000,20 @@ async fn negative_yaw_camera_rotation_tracked() {
         writer.write_bool(true);
         client2.write_all(writer.as_slice()).await.unwrap();
 
-        // Observer should receive packet 32 (EntityLook) with non-zero yaw (around 224)
-        let mut got_look = false;
-        for _ in 0..60 {
-            let id = read_next_packet_id(
-                &mut client1,
-                &[
-                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            if id == 32 {
-                let ent = read_i32(&mut client1).await;
-                assert_eq!(ent, 2);
-                let yaw = read_u8(&mut client1).await;
-                let pitch = read_u8(&mut client1).await;
-                assert_eq!(yaw, 224, "Negative yaw -45 deg must pack to 224, not 0");
-                assert_eq!(pitch, 234, "Negative pitch -30 deg must pack to 234, not 0");
-                got_look = true;
+        // The observer receives the rotation of the entity: the yaw of -45
+        // degrees is packed to 224, the pitch of -30 degrees to 234.
+        loop {
+            let id = read_packet_id(&mut client1, &[32]).await;
+            assert_eq!(id, 32);
+            let ent = read_i32(&mut client1).await;
+            let yaw = read_u8(&mut client1).await;
+            let pitch = read_u8(&mut client1).await;
+            if ent == 2 {
+                assert_eq!(yaw, 224, "the yaw of -45 degrees is packed to 224");
+                assert_eq!(pitch, 234, "the pitch of -30 degrees is packed to 234");
                 break;
-            } else if id == 50 {
-                let _ = (
-                    read_i32(&mut client1).await,
-                    read_i32(&mut client1).await,
-                    read_u8(&mut client1).await,
-                );
-            } else if id == 51 {
-                let _ = (
-                    read_i32(&mut client1).await,
-                    read_i16(&mut client1).await,
-                    read_i32(&mut client1).await,
-                );
-                let _ = (
-                    read_u8(&mut client1).await,
-                    read_u8(&mut client1).await,
-                    read_u8(&mut client1).await,
-                );
-                let len = read_i32(&mut client1).await as usize;
-                let mut comp = vec![0u8; len];
-                client1.read_exact(&mut comp).await.unwrap();
-            } else if id == 40 {
-                let _ = read_i32(&mut client1).await;
-                let mut meta = [0u8; 3];
-                client1.read_exact(&mut meta).await.unwrap();
-            } else if id == 5 {
-                let _ = (
-                    read_i32(&mut client1).await,
-                    read_i16(&mut client1).await,
-                    read_i16(&mut client1).await,
-                    read_i16(&mut client1).await,
-                );
             }
         }
-        assert!(
-            got_look,
-            "Observer should receive EntityLook with negative yaw packed"
-        );
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -1730,116 +1043,31 @@ async fn block_mining_spawns_pickup_and_collects() {
         chat_writer.write_string("/give Miner 3 1", 100).unwrap();
         client.write_all(chat_writer.as_slice()).await.unwrap();
 
-        let mut got_pickup = false;
-        let mut got_collect = false;
-        for _ in 0..80 {
-            let id = read_next_packet_id(
-                &mut client,
-                &[
-                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            match id {
-                0 => {}
-                3 => {
-                    let _ = read_string(&mut client).await;
-                }
-                21 => {
-                    // PickupSpawn!
-                    let _eid = read_i32(&mut client).await;
-                    let item_id = read_i16(&mut client).await;
-                    let count = read_u8(&mut client).await;
-                    let _damage = read_i16(&mut client).await;
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                    );
-                    let _ = (
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                    assert_eq!(item_id, 3);
-                    assert_eq!(count, 1);
-                    got_pickup = true;
-                }
-                22 => {
-                    // Collect!
-                    let _collected = read_i32(&mut client).await;
-                    let _collector = read_i32(&mut client).await;
-                    got_collect = true;
-                }
-                28 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i16(&mut client).await,
-                    );
-                }
-                29 => {
-                    let _ = read_i32(&mut client).await;
-                }
-                31 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                34 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                50 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                51 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i32(&mut client).await,
-                    );
-                    let _ = (
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                    let len = read_i32(&mut client).await as usize;
-                    let mut comp = vec![0u8; len];
-                    client.read_exact(&mut comp).await.unwrap();
-                }
-                104 => {
-                    let _ = read_u8(&mut client).await;
-                    let count = read_i16(&mut client).await;
-                    for _ in 0..count {
-                        let item = read_i16(&mut client).await;
-                        if item >= 0 {
-                            let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if got_pickup && got_collect {
-                break;
-            }
-        }
-        assert!(got_pickup, "Should receive PickupSpawn (21)");
-        assert!(got_collect, "Should receive Collect (22)");
+        // The item on the ground.
+        let id = read_packet_id(&mut client, &[21]).await;
+        assert_eq!(id, 21, "the item on the ground");
+        let _eid = read_i32(&mut client).await;
+        let item_id = read_i16(&mut client).await;
+        let count = read_u8(&mut client).await;
+        let _damage = read_i16(&mut client).await;
+        let _ = (
+            read_i32(&mut client).await,
+            read_i32(&mut client).await,
+            read_i32(&mut client).await,
+        );
+        let _ = (
+            read_u8(&mut client).await,
+            read_u8(&mut client).await,
+            read_u8(&mut client).await,
+        );
+        assert_eq!(item_id, 3, "the block of the dirt");
+        assert_eq!(count, 1, "the count of the item");
+
+        // And its collect.
+        let id = read_packet_id(&mut client, &[22]).await;
+        assert_eq!(id, 22, "the collect of the item");
+        let _collected = read_i32(&mut client).await;
+        let _collector = read_i32(&mut client).await;
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -1861,23 +1089,16 @@ async fn list_command_shows_online_players() {
         writer.write_string("/list", 100).unwrap();
         client1.write_all(writer.as_slice()).await.unwrap();
 
-        let mut got_list = false;
-        for _ in 0..40 {
-            let id = read_next_non_chunk_packet_id(&mut client1).await;
-            if id == 3 {
-                let msg = read_string(&mut client1).await;
-                if msg.starts_with("Connected players:") {
-                    assert_eq!(msg, "Connected players: Alice, Bob");
-                    got_list = true;
-                    break;
-                }
-            } else if id == 40 {
-                let _ = read_i32(&mut client1).await;
-                let mut meta = [0u8; 3];
-                client1.read_exact(&mut meta).await.unwrap();
+        // The list of the players.
+        loop {
+            let id = read_packet_id(&mut client1, &[3]).await;
+            assert_eq!(id, 3);
+            let msg = read_string(&mut client1).await;
+            if msg.starts_with("Connected players:") {
+                assert_eq!(msg, "Connected players: Alice, Bob");
+                break;
             }
         }
-        assert!(got_list, "Should receive /list response with Alice and Bob");
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -1926,7 +1147,7 @@ async fn kicked_player_can_reconnect_with_the_same_name() {
             .unwrap();
         client.write_all(writer.as_slice()).await.unwrap();
 
-        assert_eq!(read_next_non_chunk_packet_id(&mut client).await, 255);
+        assert_eq!(read_packet_id(&mut client, &[255]).await, 255);
         let reason = read_string(&mut client).await;
         assert_eq!(reason, "Chat message too long");
 
@@ -1965,87 +1186,31 @@ async fn respawn_re_spawns_players_for_each_other() {
         respawn_writer.write_i8(0);
         client1.write_all(respawn_writer.as_slice()).await.unwrap();
 
-        // Hero2 must receive DestroyEntity(1) AND a fresh NamedEntitySpawn(1, "Hero1")!
+        // The second player sees the destroy of the entity and its spawn.
         let mut saw_destroy = false;
-        let mut saw_respawn_entity = false;
-        for _ in 0..80 {
-            let id = read_next_packet_id(
-                &mut client2,
-                &[
-                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            match id {
-                0 => {}
-                3 => {
-                    let _ = read_string(&mut client2).await;
+        loop {
+            let id = read_packet_id(&mut client2, &[29, 20]).await;
+            if id == 29 {
+                let eid = read_i32(&mut client2).await;
+                if eid == 1 {
+                    saw_destroy = true;
                 }
-                5 => {
-                    let _ = (
-                        read_i32(&mut client2).await,
-                        read_i16(&mut client2).await,
-                        read_i16(&mut client2).await,
-                        read_i16(&mut client2).await,
-                    );
+            } else {
+                let eid = read_i32(&mut client2).await;
+                let name = read_string(&mut client2).await;
+                let _ = (
+                    read_i32(&mut client2).await,
+                    read_i32(&mut client2).await,
+                    read_i32(&mut client2).await,
+                    read_u8(&mut client2).await,
+                    read_u8(&mut client2).await,
+                    read_i16(&mut client2).await,
+                );
+                if eid == 1 && name == "Hero1" && saw_destroy {
+                    break;
                 }
-                20 => {
-                    let eid = read_i32(&mut client2).await;
-                    let name = read_string(&mut client2).await;
-                    let _ = (
-                        read_i32(&mut client2).await,
-                        read_i32(&mut client2).await,
-                        read_i32(&mut client2).await,
-                        read_u8(&mut client2).await,
-                        read_u8(&mut client2).await,
-                        read_i16(&mut client2).await,
-                    );
-                    if eid == 1 && name == "Hero1" && saw_destroy {
-                        saw_respawn_entity = true;
-                        break;
-                    }
-                }
-                29 => {
-                    let eid = read_i32(&mut client2).await;
-                    if eid == 1 {
-                        saw_destroy = true;
-                    }
-                }
-                38 => {
-                    let _ = (read_i32(&mut client2).await, read_u8(&mut client2).await);
-                }
-                40 => {
-                    let _ = read_i32(&mut client2).await;
-                    let mut meta = [0u8; 3];
-                    client2.read_exact(&mut meta).await.unwrap();
-                }
-                50 => {
-                    let _ = (
-                        read_i32(&mut client2).await,
-                        read_i32(&mut client2).await,
-                        read_u8(&mut client2).await,
-                    );
-                }
-                51 => {
-                    let _ = (
-                        read_i32(&mut client2).await,
-                        read_i16(&mut client2).await,
-                        read_i32(&mut client2).await,
-                        read_u8(&mut client2).await,
-                        read_u8(&mut client2).await,
-                        read_u8(&mut client2).await,
-                    );
-                    let len = read_i32(&mut client2).await as usize;
-                    let mut comp = vec![0u8; len];
-                    client2.read_exact(&mut comp).await.unwrap();
-                }
-                _ => {}
             }
         }
-        assert!(
-            saw_destroy && saw_respawn_entity,
-            "Hero2 must see Hero1 DestroyEntity followed by NamedEntitySpawn on respawn"
-        );
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();
@@ -2081,86 +1246,25 @@ async fn boat_placement_and_mounting() {
         place_writer.write_i16(0);
         client.write_all(place_writer.as_slice()).await.unwrap();
 
-        let mut boat_entity_id = None;
-        for _ in 0..80 {
-            let id = read_next_packet_id(
-                &mut client,
-                &[
-                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 39, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            match id {
-                0 => {}
-                23 => {
-                    // VehicleSpawn!
-                    let eid = read_i32(&mut client).await;
-                    let vtype = read_u8(&mut client).await;
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                    );
-                    let thrower = read_i32(&mut client).await;
-                    if thrower > 0 {
-                        let _ = (
-                            read_i16(&mut client).await,
-                            read_i16(&mut client).await,
-                            read_i16(&mut client).await,
-                        );
-                    }
-                    assert_eq!(vtype, 1, "Boat VehicleSpawn type must be 1");
-                    boat_entity_id = Some(eid);
-                    break;
-                }
-                28 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i16(&mut client).await,
-                    );
-                }
-                50 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                51 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                    let len = read_i32(&mut client).await as usize;
-                    let mut comp = vec![0u8; len];
-                    client.read_exact(&mut comp).await.unwrap();
-                }
-                53 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                103 => {
-                    let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
-                    let item = read_i16(&mut client).await;
-                    if item >= 0 {
-                        let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
-                    }
-                }
-                _ => {}
-            }
+        // The boat on the ground.
+        let id = read_packet_id(&mut client, &[23]).await;
+        assert_eq!(id, 23, "the spawn of the boat");
+        let boat_id = read_i32(&mut client).await;
+        let vtype = read_u8(&mut client).await;
+        let _ = (
+            read_i32(&mut client).await,
+            read_i32(&mut client).await,
+            read_i32(&mut client).await,
+        );
+        let thrower = read_i32(&mut client).await;
+        if thrower > 0 {
+            let _ = (
+                read_i16(&mut client).await,
+                read_i16(&mut client).await,
+                read_i16(&mut client).await,
+            );
         }
-        let boat_id = boat_entity_id.expect("Should receive VehicleSpawn (23) for placed boat");
+        assert_eq!(vtype, 1, "the type of the boat");
 
         // Right-click boat (UseEntity 7, attack = false) to mount it
         let mut use_writer = Writer::new();
@@ -2170,125 +1274,13 @@ async fn boat_placement_and_mounting() {
         use_writer.write_bool(false);
         client.write_all(use_writer.as_slice()).await.unwrap();
 
-        let mut got_attach = false;
-        for _ in 0..80 {
-            let id = read_next_packet_id(
-                &mut client,
-                &[
-                    0, 3, 4, 8, 13, 18, 19, 20, 24, 25, 30, 31, 33, 35, 40, 50, 51, 103, 104,
-                ],
-            )
-            .await;
-            match id {
-                0 => {}
-                13 => {
-                    let _ = (
-                        read_f64(&mut client).await,
-                        read_f64(&mut client).await,
-                        read_f64(&mut client).await,
-                        read_f64(&mut client).await,
-                        read_f32(&mut client).await,
-                        read_f32(&mut client).await,
-                        read_bool(&mut client).await,
-                    );
-                }
-                18 => {
-                    let _ = (read_i32(&mut client).await, read_u8(&mut client).await);
-                }
-                28 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i16(&mut client).await,
-                    );
-                }
-                31 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                32 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                33 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                34 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                39 => {
-                    let rider = read_i32(&mut client).await;
-                    let vehicle = read_i32(&mut client).await;
-                    assert_eq!(rider, 1);
-                    assert_eq!(vehicle, boat_id);
-                    got_attach = true;
-                    break;
-                }
-                50 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                51 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_i16(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                    let len = read_i32(&mut client).await as usize;
-                    let mut comp = vec![0u8; len];
-                    client.read_exact(&mut comp).await.unwrap();
-                }
-                53 => {
-                    let _ = (
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_i32(&mut client).await,
-                        read_u8(&mut client).await,
-                        read_u8(&mut client).await,
-                    );
-                }
-                103 => {
-                    let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
-                    let item = read_i16(&mut client).await;
-                    if item >= 0 {
-                        let _ = (read_u8(&mut client).await, read_i16(&mut client).await);
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            got_attach,
-            "Should receive AttachEntity (39) when mounting boat"
-        );
+        // The mount of the boat.
+        let id = read_packet_id(&mut client, &[39]).await;
+        assert_eq!(id, 39, "the attach of the entity");
+        let rider = read_i32(&mut client).await;
+        let vehicle = read_i32(&mut client).await;
+        assert_eq!(rider, 1);
+        assert_eq!(vehicle, boat_id);
     };
 
     timeout(Duration::from_secs(5), exchange).await.unwrap();

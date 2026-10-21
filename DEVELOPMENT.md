@@ -155,6 +155,12 @@ Layers, from cheapest to strongest:
 Rules:
 
 - A gameplay change without a test is incomplete.
+- The live protocol tests (`tests/login.rs`, `tests/nether_login.rs`) read the
+  packets with the shared helpers of `tests/common/mod.rs`: `read_packet_id`
+  returns the packets a test wants to inspect and consumes the payload of all
+  the others, so the stream never desynchronizes. Every packet the server
+  sends must be known to `skip_packet_payload` — a new packet needs an entry
+  there.
 - New block/item behaviors need at least a drop/placement/use test.
 - New worldgen features need a fixed-seed golden-chunk comparison.
 - Never weaken or delete an existing parity test to make a change pass. If a test

@@ -981,7 +981,6 @@ pub struct FixesConfig {
     pub container_interaction_check_enabled: bool,
     pub container_interaction_max_distance: i32,
     pub container_interaction_log: bool,
-    pub head_rotation_patch_enabled: bool,
     pub prevent_vehicle_chest_open: bool,
 }
 
@@ -998,7 +997,6 @@ impl Default for FixesConfig {
             container_interaction_check_enabled: true,
             container_interaction_max_distance: 4,
             container_interaction_log: false,
-            head_rotation_patch_enabled: true,
             prevent_vehicle_chest_open: true,
         }
     }
