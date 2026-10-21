@@ -191,6 +191,29 @@ Worldgen parity harness (Overworld):
   trace (`A4`/`A5`/`B`/`G`/... lines) that can be diffed against a patched
   reference run for byte-level staged comparison.
 
+Block behavior parity harness:
+
+- Ground truth: `tools/poseidon_blocks/PoseidonBlockTrace.java` runs scripted
+  block scenarios in the reference (Project-Poseidon, Beta 1.7.3) and prints a
+  trace of every block write. The reference is instrumented by
+  `tools/poseidon_trace/reference-trace.patch` (13 probes: `A4`, `A5`, `B`, `G`,
+  `PHYS`, `FA`, `CONV`, `RNG`, `RNG2`, `RNG3`, `J`, `FLOW`, `DOWN`); the port
+  prints the same lines from its own write pipeline (`src/world/world.rs`).
+- The world of the scenarios is the world of the dump generator
+  (`PoseidonGenerator.SimpleChunkProvider`, so the terrain is the terrain of
+  the port) plus the CraftBukkit server (`PoseidonMobTrace.createWorldWithGeneratorProvider`),
+  which the events of the reference need (the items that drop, the leaves that
+  decay). The server provider of CraftBukkit generates the terrain in another
+  order, so its trees differ — the scenarios must not use it.
+- The golden traces are `tests/golden/poseidon_block_traces/*.txt`; the test
+  `tests/block_trace_scenarios.rs` reproduces the scenarios and compares the
+  traces event by event. `tests/block_trace.rs` does the same for the
+  generation of the world.
+- Regenerate the golden files only with the reference script:
+  `sh tools/poseidon_blocks/regenerate_golden.sh` (it rebuilds the patched
+  reference into `/tmp/pos_patch` and runs the scenarios). Never hand-edit a
+  golden trace.
+
 Mob movement parity harness:
 
 - Ground truth: `tools/poseidon_mobs/PoseidonMobTrace.java` runs a single mob

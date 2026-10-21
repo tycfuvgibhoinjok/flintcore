@@ -44,6 +44,9 @@ pub(crate) fn trace_region() -> Option<TraceBox> {
 }
 
 fn trace_in(x: i32, y: i32, z: i32) -> bool {
+    if !trace_armed() {
+        return false;
+    }
     trace_region()
         .map(|(x0, y0, z0, x1, y1, z1)| {
             x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1
@@ -51,16 +54,75 @@ fn trace_in(x: i32, y: i32, z: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the trace prints the events ✓.
+///
+/// The reference arms the trace by hand (`Trace.armed` ✓): the trace of the
+/// scenario starts after the generation of the world ✓.
+static TRACE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn trace_armed() -> bool {
+    TRACE_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Arms or disarms the trace of the block writes ✓.
+pub fn set_trace_armed(armed: bool) {
+    TRACE_ARMED.store(armed, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn trace_g_in(x: i32, z: i32) -> bool {
+    if !trace_armed() {
+        return false;
+    }
     trace_region()
         .map(|(x0, _, z0, x1, _, z1)| x >= x0 && x <= x1 && z >= z0 && z <= z1)
         .unwrap_or(false)
 }
 
+/// The file the trace is written to (`FLINTCORE_TRACE_OUT`).
+///
+/// The trace is printed to the standard output and, when the variable is set,
+/// appended to the file ✓ — so a test can compare the trace of the port with
+/// the trace of the reference without capturing the output of the process ✓.
+fn trace_sink() -> &'static std::sync::Mutex<Option<(String, std::fs::File)>> {
+    static SINK: std::sync::OnceLock<std::sync::Mutex<Option<(String, std::fs::File)>>> =
+        std::sync::OnceLock::new();
+    SINK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Writes one line of the trace to the standard output and to the file of the
+/// trace ✓.
+fn trace_emit(line: String) {
+    println!("{line}");
+    let Ok(path) = std::env::var("FLINTCORE_TRACE_OUT") else {
+        return;
+    };
+    let Ok(mut guard) = trace_sink().lock() else {
+        return;
+    };
+    let slot: &mut Option<(String, std::fs::File)> = &mut guard;
+    let reopen = match &*slot {
+        Some((current, _)) => current != &path,
+        None => true,
+    };
+    if reopen {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            *slot = Some((path, file));
+        }
+    }
+    if let Some((_, file)) = slot.as_mut() {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 macro_rules! trace_a4 {
     ($x:expr, $y:expr, $z:expr, $old:expr, $new:expr) => {
         if trace_in($x, $y, $z) {
-            println!("A4 {} {} {} {}->{}", $x, $y, $z, $old, $new);
+            trace_emit(format!("A4 {} {} {} {}->{}", $x, $y, $z, $old, $new));
         }
     };
 }
@@ -68,10 +130,10 @@ macro_rules! trace_a4 {
 macro_rules! trace_a5 {
     ($x:expr, $y:expr, $z:expr, $old:expr, $oldd:expr, $new:expr, $newd:expr) => {
         if trace_in($x, $y, $z) {
-            println!(
+            trace_emit(format!(
                 "A5 {} {} {} {}.{}->{}.{}",
                 $x, $y, $z, $old, $oldd, $new, $newd
-            );
+            ));
         }
     };
 }
@@ -79,7 +141,7 @@ macro_rules! trace_a5 {
 macro_rules! trace_b {
     ($x:expr, $y:expr, $z:expr, $oldd:expr, $newd:expr) => {
         if trace_in($x, $y, $z) {
-            println!("B {} {} {} {}->{}", $x, $y, $z, $oldd, $newd);
+            trace_emit(format!("B {} {} {} {}->{}", $x, $y, $z, $oldd, $newd));
         }
     };
 }
@@ -87,7 +149,7 @@ macro_rules! trace_b {
 macro_rules! trace_g {
     ($x:expr, $z:expr, $oldh:expr, $newh:expr) => {
         if trace_g_in($x, $z) {
-            println!("G {} {} {}->{}", $x, $z, $oldh, $newh);
+            trace_emit(format!("G {} {} {}->{}", $x, $z, $oldh, $newh));
         }
     };
 }
@@ -95,7 +157,7 @@ macro_rules! trace_g {
 macro_rules! trace_phys {
     ($x:expr, $y:expr, $z:expr, $l:expr, $id:expr) => {
         if trace_in($x, $y, $z) {
-            println!("PHYS {} {} {} l={} id={}", $x, $y, $z, $l, $id);
+            trace_emit(format!("PHYS {} {} {} l={} id={}", $x, $y, $z, $l, $id));
         }
     };
 }
@@ -103,7 +165,7 @@ macro_rules! trace_phys {
 macro_rules! trace_fa {
     ($x:expr, $y:expr, $z:expr, $id:expr, $data:expr) => {
         if trace_in($x, $y, $z) {
-            println!("FA {} {} {} id={} d={}", $x, $y, $z, $id, $data);
+            trace_emit(format!("FA {} {} {} id={} d={}", $x, $y, $z, $id, $data));
         }
     };
 }
@@ -111,7 +173,15 @@ macro_rules! trace_fa {
 macro_rules! trace_conv {
     ($x:expr, $y:expr, $z:expr, $oldd:expr, $new:expr) => {
         if trace_in($x, $y, $z) {
-            println!("CONV {} {} {} d={} ->{}", $x, $y, $z, $oldd, $new);
+            trace_emit(format!("CONV {} {} {} d={} ->{}", $x, $y, $z, $oldd, $new));
+        }
+    };
+}
+
+macro_rules! trace_rng2 {
+    ($x:expr, $y:expr, $z:expr) => {
+        if trace_in($x, $y, $z) {
+            trace_emit(format!("RNG2 {} {} {}", $x, $y, $z));
         }
     };
 }
@@ -119,7 +189,7 @@ macro_rules! trace_conv {
 macro_rules! trace_rng {
     ($x:expr, $y:expr, $z:expr) => {
         if trace_in($x, $y, $z) {
-            println!("RNG {} {} {}", $x, $y, $z);
+            trace_emit(format!("RNG {} {} {}", $x, $y, $z));
         }
     };
 }
@@ -127,7 +197,7 @@ macro_rules! trace_rng {
 macro_rules! trace_rng3 {
     ($x:expr, $y:expr, $z:expr) => {
         if trace_in($x, $y, $z) {
-            println!("RNG3 {} {} {}", $x, $y, $z);
+            trace_emit(format!("RNG3 {} {} {}", $x, $y, $z));
         }
     };
 }
@@ -135,7 +205,7 @@ macro_rules! trace_rng3 {
 macro_rules! trace_j {
     ($x:expr, $y:expr, $z:expr, $c:expr, $b:expr) => {
         if trace_in($x, $y, $z) {
-            println!(
+            trace_emit(format!(
                 "J {} {} {} c={},{},{},{} b={}{}{}{}",
                 $x,
                 $y,
@@ -148,7 +218,7 @@ macro_rules! trace_j {
                 $b[1] as i32,
                 $b[2] as i32,
                 $b[3] as i32
-            );
+            ));
         }
     };
 }
@@ -156,7 +226,7 @@ macro_rules! trace_j {
 macro_rules! trace_flow {
     ($x:expr, $y:expr, $z:expr, $l:expr) => {
         if trace_in($x, $y, $z) {
-            println!("FLOW {} {} {} l={}", $x, $y, $z, $l);
+            trace_emit(format!("FLOW {} {} {} l={}", $x, $y, $z, $l));
         }
     };
 }
@@ -164,7 +234,7 @@ macro_rules! trace_flow {
 macro_rules! trace_down {
     ($x:expr, $y:expr, $z:expr) => {
         if trace_in($x, $y, $z) {
-            println!("DOWN {} {} {}", $x, $y, $z);
+            trace_emit(format!("DOWN {} {} {}", $x, $y, $z));
         }
     };
 }
@@ -1723,8 +1793,7 @@ impl World {
             return;
         }
         let b0 = 32;
-        if self.live.active
-            && !self.insta_tick
+        if !self.insta_tick
             && self.chunks_area_loaded(x - b0, y - b0, z - b0, x + b0, y + b0, z + b0)
         {
             if self.fixes.piston_sand_gravel_duping_fix {
@@ -1880,6 +1949,7 @@ impl World {
             self.java_set_type_id(x, y, z, blocks::COBBLESTONE);
         }
         // BlockFluids.h plays the fizz sound, consuming `world.random` twice.
+        trace_rng2!(x, y, z);
         let _ = self.world_random.next_f32();
         let _ = self.world_random.next_f32();
     }
@@ -2990,6 +3060,14 @@ impl World {
         }
     }
 
+    /// Suppresses or allows the physics of the neighbours ✓.
+    ///
+    /// Java `World.suppressPhysics` ✓: the blocks that are placed while the
+    /// physics is suppressed do not notify their neighbours ✓.
+    pub fn set_suppress_physics(&mut self, suppress: bool) {
+        self.suppress_physics = suppress;
+    }
+
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, id: u8) {
         self.java_set_raw_type_id(x, y, z, id);
     }
@@ -3946,6 +4024,39 @@ impl LightingWorld for World {
 mod tests {
     use super::*;
 
+    /// The sand that falls becomes an entity.
+    ///
+    /// Java `BlockSand.g` (`BlockSand.java:27-50`): the block of sand is
+    /// removed and an `EntityFallingSand` is put in the world ✓.  The entity
+    /// falls in the tick of the entities ✓ (`World.tickEntities` ✓), not in
+    /// the tick of the scheduled blocks ✓ — the block of sand does not fall
+    /// down by itself ✓.
+    #[test]
+    fn the_sand_that_falls_becomes_an_entity() {
+        let config = WorldConfig {
+            seed: 42,
+            save_enabled: false,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        world.populate_chunk(ChunkPos::new(0, 0));
+        // The floor, the hole above it and the sand above the hole.
+        world.java_set_type_id_and_data(8, 63, 8, blocks::STONE, 0);
+        world.java_set_type_id_and_data(8, 64, 8, 0, 0);
+        world.java_set_type_id_and_data(8, 65, 8, blocks::SAND, 0);
+        // The tick of the sand: the block below it is air ✓.
+        world.java_process_scheduled(true);
+        // The block of sand is gone and the entity of the sand is in the
+        // world ✓.
+        assert_eq!(world.get_block(8, 65, 8), 0);
+        let entity = world
+            .falling_sands()
+            .iter()
+            .find(|sand| sand.x == 8 && sand.z == 8)
+            .expect("the entity of the sand");
+        assert_eq!(entity.id, blocks::SAND);
+    }
+
     /// The random of the world is reproducible by default.
     ///
     /// Java `World.java:51` takes the seed from the system clock, so the
@@ -4095,9 +4206,6 @@ mod tests {
         assert_eq!(world.world_random.next_i32(), reference.next_i32());
     }
 
-    /// The height of the spawn is the height of the highest solid block of the
-    /// column of the spawn.
-    ///
     /// Java `World.f(int, int)` (`World.java:1026-1041`): the highest block
     /// with a solid material plus one — the liquids are not solid — and an
     /// empty column gives −1 (there is no fallback to the height of the

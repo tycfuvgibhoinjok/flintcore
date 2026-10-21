@@ -244,8 +244,97 @@ public class PoseidonMobTrace {
         return world;
     }
 
+    /**
+     * A world with the terrain of the generator of the harness of the dumps
+     * and with the server of CraftBukkit.
+     *
+     * The terrain of the generator of the dumps is the terrain of the port ✓
+     * (the harness of the dumps and the port print the same trace of the
+     * generation ✓).  The server of CraftBukkit is needed by the events of
+     * CraftBukkit ✓: the items that drop call the event of the spawn ✓ and
+     * the leaves that decay call the event of the decay ✓.
+     *
+     * The chunks of the world of the server are the chunks of the generator
+     * ✓: the world of CraftBukkit looks its chunks up in the provider of the
+     * server ✓ and it has to find the chunks of the generator ✓.
+     */
+    public static WorldServer createWorldWithGeneratorProvider(long seed, File worldDir)
+            throws Exception {
+        // The world of the generator of the dumps: the provider of the chunks
+        // is the provider of the harness of the dumps ✓.
+        WorldServer world = (WorldServer) PoseidonGenerator.createWorld(seed);
+        // The fields that the harness of the dumps does not create: the list
+        // of the entities ✓ (the items that drop are put in it ✓).
+        initObjectFields(world, WorldServer.class);
+        // The random of the world: the seed of the world ✓ (the ticks of the
+        // scheduled blocks use it ✓).
+        world.random = new Random(seed);
+
+        MinecraftServer ms = (MinecraftServer) unsafe.allocateInstance(MinecraftServer.class);
+        initObjectFields(ms, MinecraftServer.class);
+        ms.worlds = new ArrayList<WorldServer>();
+        setupBukkitServer(ms);
+        ms.worlds.add(world);
+
+        Field serverField = WorldServer.class.getDeclaredField("server");
+        serverField.setAccessible(true);
+        serverField.set(world, ms);
+
+        // The provider of the server: it hands the chunks of the generator to
+        // the world of CraftBukkit ✓.
+        ServerNBTManager nbt = new ServerNBTManager(worldDir, "world", true);
+        Field nbtField = World.class.getDeclaredField("w");
+        nbtField.setAccessible(true);
+        nbtField.set(world, nbt);
+        world.worldMaps = new WorldMapCollection(nbt);
+        IChunkLoader loader = nbt.a(world.worldProvider);
+        PoseidonGenerator.SimpleChunkProvider simple =
+                (PoseidonGenerator.SimpleChunkProvider) world.chunkProvider;
+        ChunkProviderServer provider =
+                new ChunkProviderServer(world, loader, new SimpleGenerator(world, seed, simple));
+        world.chunkProviderServer = provider;
+
+        // The CraftWorld of the entities ✓.
+        CraftWorld craftWorld = (CraftWorld) unsafe.allocateInstance(CraftWorld.class);
+        initObjectFields(craftWorld, CraftWorld.class);
+        Field worldField = World.class.getDeclaredField("world");
+        worldField.setAccessible(true);
+        worldField.set(world, craftWorld);
+        Field craftWorldField = CraftWorld.class.getDeclaredField("world");
+        craftWorldField.setAccessible(true);
+        craftWorldField.set(craftWorld, world);
+        return world;
+    }
+
+    /**
+     * The generator of the chunks of the world of the generator of the dumps.
+     *
+     * The provider of the server asks its generator for the chunks ✓: the
+     * generator of the dumps answers with its own chunks ✓, so the world of
+     * CraftBukkit and the world of the port see the same chunks ✓.
+     */
+    public static class SimpleGenerator extends NormalChunkGenerator {
+        private final PoseidonGenerator.SimpleChunkProvider simple;
+
+        public SimpleGenerator(World world, long seed,
+                PoseidonGenerator.SimpleChunkProvider simple) {
+            super(world, seed);
+            this.simple = simple;
+        }
+
+        @Override
+        public Chunk getOrCreateChunk(int i, int j) {
+            return this.simple.getOrCreateChunk(i, j);
+        }
+
+        @Override
+        public void getChunkAt(IChunkProvider provider, int i, int j) {
+            this.simple.getChunkAt(provider, i, j);
+        }
+    }
+
     /** A player that stands still and is the target of the mob. */
-    private static EntityPlayer createPlayer(WorldServer world, double x, double y, double z) throws Exception {
+    public static EntityPlayer createPlayer(WorldServer world, double x, double y, double z) throws Exception {
         ItemInWorldManager im = new ItemInWorldManager(world);
         EntityPlayer player = (EntityPlayer) unsafe.allocateInstance(EntityPlayer.class);
         initObjectFields(player, EntityPlayer.class);

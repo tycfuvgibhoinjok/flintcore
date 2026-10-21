@@ -649,6 +649,15 @@ impl World {
     pub fn live_time(&self) -> i64 {
         self.live_time
     }
+
+    /// Advances the time of the world by one tick ✓.
+    ///
+    /// Java `World.doTick()`: `this.worldData.a(this.worldData.f() + 1L)` ✓ —
+    /// the time of the world decides which scheduled ticks are due ✓.
+    pub fn advance_live_time(&mut self) {
+        self.live_time += 1;
+        self.level_data.borrow_mut().time = self.live_time;
+    }
 }
 
 #[cfg(test)]
