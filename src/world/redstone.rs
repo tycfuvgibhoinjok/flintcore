@@ -1,7 +1,7 @@
 //! 1:1 port of Minecraft Beta 1.7.3 Redstone, Pistons, Dispensers, Rails, and Random Block Ticks
 //! from `.references/Project-Poseidon`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use crate::gameplay::blocks;
 use crate::gameplay::items::{self, ItemStack};
@@ -299,9 +299,16 @@ impl World {
     }
 
     /// Java `BlockRedstoneWire.g(World, i, j, k)`.
+    ///
+    /// The set of the positions to notify is the **shared** field of the
+    /// singleton of the reference ✓ (`BlockRedstoneWire.b` ✓,
+    /// `BlockRedstoneWire.java:12` ✓): the update copies it and clears it ✓
+    /// (`BlockRedstoneWire.java:40-51` ✓) — a nested update fills the same set
+    /// ✓.
     pub fn update_redstone_wire(&mut self, x: i32, y: i32, z: i32) {
-        let mut to_notify = HashSet::new();
-        self.calculate_wire_changes(x, y, z, x, y, z, &mut to_notify);
+        self.calculate_wire_changes(x, y, z, x, y, z);
+        let to_notify: Vec<(i32, i32, i32)> = self.redstone_wire_notify.iter().copied().collect();
+        self.redstone_wire_notify.clear();
         for (nx, ny, nz) in to_notify {
             self.java_apply_physics(nx, ny, nz, blocks::REDSTONE_WIRE as i32);
         }
@@ -309,16 +316,7 @@ impl World {
 
     /// Java `BlockRedstoneWire.a(World, i, j, k, l, i1, j1)`.
     #[allow(clippy::too_many_arguments)]
-    fn calculate_wire_changes(
-        &mut self,
-        x: i32,
-        y: i32,
-        z: i32,
-        sx: i32,
-        sy: i32,
-        sz: i32,
-        to_notify: &mut HashSet<(i32, i32, i32)>,
-    ) {
+    fn calculate_wire_changes(&mut self, x: i32, y: i32, z: i32, sx: i32, sy: i32, sz: i32) {
         let old_power = self.get_data(x, y, z) as i32;
         let mut new_power = 0i32;
 
@@ -381,24 +379,26 @@ impl World {
                 let adj_power = self.wire_power_at(nx, y, nz, -1);
                 let cur = (self.get_data(x, y, z) as i32).saturating_sub(1);
                 if adj_power >= 0 && adj_power != cur {
-                    self.calculate_wire_changes(nx, y, nz, x, y, z, to_notify);
+                    self.calculate_wire_changes(nx, y, nz, x, y, z);
                 }
 
                 let diag_power = self.wire_power_at(nx, ny, nz, -1);
                 let cur2 = (self.get_data(x, y, z) as i32).saturating_sub(1);
                 if diag_power >= 0 && diag_power != cur2 {
-                    self.calculate_wire_changes(nx, ny, nz, x, y, z, to_notify);
+                    self.calculate_wire_changes(nx, ny, nz, x, y, z);
                 }
             }
 
             if old_power == 0 || new_power == 0 {
-                to_notify.insert((x, y, z));
-                to_notify.insert((x - 1, y, z));
-                to_notify.insert((x + 1, y, z));
-                to_notify.insert((x, y - 1, z));
-                to_notify.insert((x, y + 1, z));
-                to_notify.insert((x, y, z - 1));
-                to_notify.insert((x, y, z + 1));
+                // Java `BlockRedstoneWire.b`: the shared set of the singleton
+                // ✓ (`BlockRedstoneWire.java:175-181` ✓).
+                self.redstone_wire_notify.insert((x, y, z));
+                self.redstone_wire_notify.insert((x - 1, y, z));
+                self.redstone_wire_notify.insert((x + 1, y, z));
+                self.redstone_wire_notify.insert((x, y - 1, z));
+                self.redstone_wire_notify.insert((x, y + 1, z));
+                self.redstone_wire_notify.insert((x, y, z - 1));
+                self.redstone_wire_notify.insert((x, y, z + 1));
             }
         }
     }
@@ -3562,6 +3562,31 @@ mod tests {
             world.get_data(3, 64, 0) & 4,
             0,
             "Iron door should close when unpowered"
+        );
+    }
+
+    /// The set of the positions to notify of the redstone wire is the shared
+    /// set of the singleton of the reference.
+    ///
+    /// Java `BlockRedstoneWire.b` (`BlockRedstoneWire.java:12` ✓) — the field
+    /// of the shared block ✓; the update copies it and clears it ✓
+    /// (`BlockRedstoneWire.java:40-51` ✓).
+    #[test]
+    fn the_set_of_the_wire_to_notify_is_shared_and_cleared() {
+        let mut world = make_flat_world();
+        world.java_set_type_id_and_data(0, 64, 0, blocks::LEVER, 5);
+        world.java_set_type_id(1, 64, 0, blocks::REDSTONE_WIRE);
+        // The lever is on (the bit 8 of the data).
+        world.java_set_data(0, 64, 0, 13);
+        world.notify_attachment_neighbors(0, 64, 0, blocks::LEVER, 5);
+
+        // The wire is powered by the lever ✓.
+        assert_eq!(world.get_data(1, 64, 0), 15);
+        // The shared set of the singleton is cleared at the end of the update
+        // ✓ (`this.b.clear()` ✓).
+        assert!(
+            world.redstone_wire_notify.is_empty(),
+            "the shared set of the positions to notify is cleared"
         );
     }
 

@@ -222,6 +222,12 @@ pub struct World {
     /// nested cascade ticks call `j()` again and overwrite it, and the outer
     /// flow loop then reads the clobbered flags. Indexed by [lava][direction].
     fluid_sides: [[bool; 4]; 2],
+    /// `BlockRedstoneWire.b` — the set of the positions of the redstone wire
+    /// to notify.  In Java this is a mutable field of the shared
+    /// `BlockRedstoneWire` singleton: the nested update fills the same set and
+    /// the outer update copies it and clears it (`BlockRedstoneWire.java:12,
+    /// 40-51`).
+    pub(crate) redstone_wire_notify: HashSet<(i32, i32, i32)>,
     /// Live/server choreography state (spawn search, populate triggers,
     /// player framing, unloads) — see `world::live`.
     pub(crate) live: crate::world::live::LiveState,
@@ -535,6 +541,7 @@ impl World {
             rain_intensity: std::cell::Cell::new(0.0),
             thunder_intensity: std::cell::Cell::new(0.0),
             fluid_sides: [[false; 4]; 2],
+            redstone_wire_notify: HashSet::new(),
             live,
             fresh_world,
             live_time: initial_time,
