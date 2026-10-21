@@ -230,6 +230,9 @@ pub struct MessagesConfig {
     pub join: String,
     pub leave: String,
     pub kick_banned: String,
+    /// Java `disconnect.timeout`: the message of the connection that
+    /// received nothing for twelve hundred ticks.
+    pub kick_timeout: String,
     pub kick_ip_banned: String,
     pub kick_not_whitelisted: String,
     pub kick_full: String,
@@ -244,6 +247,7 @@ impl Default for MessagesConfig {
             join: "\u{00A7}e%player% joined the game.".to_string(),
             leave: "\u{00A7}e%player% left the game.".to_string(),
             kick_banned: "You are banned from this server!".to_string(),
+            kick_timeout: "Timed out".to_string(),
             kick_ip_banned: "Your IP address is banned from this server!".to_string(),
             kick_not_whitelisted: "You are not white-listed on this server!".to_string(),
             kick_full: "The server is full!".to_string(),
@@ -291,7 +295,9 @@ impl Default for NetworkConfig {
             max_read_buffer: 1024 * 1024,
             max_packets_per_tick: 2048,
             packet_spam_detection: true,
-            packet_spam_threshold: 10000,
+            // Java `NetworkManager.b()`: the limit of the queue of the
+            // packets is a thousand.
+            packet_spam_threshold: 1000,
             allowed_protocols: vec![14],
             release2beta_ip_passthrough: false,
             release2beta_proxy_ip: "127.0.0.1".to_string(),

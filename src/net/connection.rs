@@ -46,8 +46,11 @@ pub async fn serve(
     let _ = stream.set_nodelay(config.network.tcp_nodelay);
     let (read_half, write_half) = stream.into_split();
     let faster = config.network.faster_packets;
-    let writer = tokio::spawn(write_loop(write_half, outbound, faster));
-    if let Err(error) = read_loop(id, read_half, &inbound, &config).await {
+    // The channel of the kick: the packet of the disconnection is sent
+    // before the connection is closed (`NetworkManager.b()`).
+    let (kick_tx, kick_rx) = mpsc::unbounded_channel();
+    let writer = tokio::spawn(write_loop(write_half, outbound, kick_rx, faster));
+    if let Err(error) = read_loop(id, read_half, &inbound, &config, &kick_tx).await {
         log::warn(&format!("connection {id} closed: {error}"));
     }
     let _ = inbound.send(NetEvent::Disconnected { id }).await;
@@ -59,6 +62,7 @@ async fn read_loop(
     mut read: OwnedReadHalf,
     inbound: &mpsc::Sender<NetEvent>,
     config: &Config,
+    kicks: &mpsc::UnboundedSender<crate::net::packets::Clientbound>,
 ) -> Result<()> {
     let mut state = ConnectionState::Handshaking;
     let mut buffer: Vec<u8> = Vec::with_capacity(8192);
@@ -118,6 +122,14 @@ async fn read_loop(
                         }
                         packets_in_window += 1;
                         if packets_in_window > config.network.packet_spam_threshold {
+                            // Java `NetworkManager.b()`: the player is
+                            // disconnected with a message.
+                            let _ = kicks.send(crate::net::packets::Clientbound::KickDisconnect(
+                                crate::net::packets::KickDisconnect {
+                                    reason: "\u{00A7}c[Poseidon] You have been kicked for packet spamming."
+                                        .to_string(),
+                                },
+                            ));
                             return Err(Error::Network("Packet spam detected".to_string()));
                         }
                     }
@@ -135,10 +147,24 @@ async fn read_loop(
 async fn write_loop(
     mut write: OwnedWriteHalf,
     mut outbound: mpsc::UnboundedReceiver<Outbound>,
+    mut kicks: mpsc::UnboundedReceiver<crate::net::packets::Clientbound>,
     faster_packets: bool,
 ) {
     let mut encoder = Writer::with_capacity(65536);
-    while let Some(first) = outbound.recv().await {
+    loop {
+        // The kick of the connection: the packet is sent and the
+        // connection is closed.
+        if let Ok(packet) = kicks.try_recv() {
+            encoder.clear();
+            if packet.encode(&mut encoder).is_ok() {
+                let _ = write.write_all(encoder.as_slice()).await;
+                let _ = write.flush().await;
+            }
+            break;
+        }
+        let Some(first) = outbound.recv().await else {
+            break;
+        };
         encoder.clear();
         let mut should_close = false;
         match first {

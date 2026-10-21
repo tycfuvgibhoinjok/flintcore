@@ -47,6 +47,8 @@ struct Connection {
     state: ConnectionState,
     username: Option<String>,
     entity_id: i32,
+    /// Java `NetworkManager.w`: the counter of the ticks without a packet.
+    idle_ticks: u32,
 }
 
 /// Who issued a server command.
@@ -382,6 +384,29 @@ impl Server {
 
         self.drain_inbound();
 
+        // The counter of the idle ticks (`NetworkManager.w`) grows every
+        // tick, it is reset when a packet arrives.
+        for conn in self.connections.values_mut() {
+            conn.idle_ticks = conn.idle_ticks.saturating_add(1);
+        }
+
+        // The timeout of the idle connection (`NetworkManager.b()`): the
+        // connection that received nothing for twelve hundred ticks is
+        // disconnected.
+        {
+            let message = self.config.messages.kick_timeout.clone();
+            let idle: Vec<ConnId> = self
+                .connections
+                .iter()
+                .filter(|(_, conn)| conn.state == ConnectionState::Playing)
+                .filter(|(_, conn)| conn.idle_ticks >= 1200)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in idle {
+                self.kick(id, &message);
+            }
+        }
+
         // The saving of the world (`World.tick()`): when the time of the
         // world is divisible by forty, the world is saved
         // (`World.save(false, null)`): the data of the level, the data of
@@ -692,6 +717,7 @@ impl Server {
                         state: ConnectionState::Handshaking,
                         username: None,
                         entity_id: 0,
+                        idle_ticks: 0,
                     },
                 );
             }
@@ -858,6 +884,11 @@ impl Server {
     }
 
     fn handle_packet(&mut self, id: ConnId, packet: Serverbound) {
+        // Java `NetworkManager.b()`: the counter of the idle ticks is reset
+        // when a packet arrives.
+        if let Some(connection) = self.connections.get_mut(&id) {
+            connection.idle_ticks = 0;
+        }
         let dimension = self
             .entities
             .get_by_conn(id)
@@ -11029,12 +11060,15 @@ impl Server {
             self.reply(sender, "Unknown console command. Type \"help\" for help.");
             return;
         }
-        let mut online_players: Vec<String> = self
+        // The players are listed in the order of their connections
+        // (`ServerConfigurationManager.c()`), the list is not sorted.
+        let mut online: Vec<(u64, String)> = self
             .entities
             .iter_players()
-            .map(|p| p.username.clone())
+            .map(|p| (p.conn_id, p.username.clone()))
             .collect();
-        online_players.sort();
+        online.sort_by_key(|(id, _)| *id);
+        let online_players: Vec<String> = online.into_iter().map(|(_, name)| name).collect();
         let mut whitelisted_players: Vec<String> = self.whitelist.iter().cloned().collect();
         whitelisted_players.sort();
 
@@ -12899,6 +12933,7 @@ mod tests {
                 state: ConnectionState::Playing,
                 username: Some("Player".to_string()),
                 entity_id: 1,
+                idle_ticks: 0,
             },
         );
         let _player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
@@ -13053,6 +13088,7 @@ mod tests {
                 state: ConnectionState::Playing,
                 username: Some("Player".to_string()),
                 entity_id: 1,
+                idle_ticks: 0,
             },
         );
         let _player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
@@ -13209,6 +13245,7 @@ mod tests {
                 state: ConnectionState::Playing,
                 username: Some("Player".to_string()),
                 entity_id: 1,
+                idle_ticks: 0,
             },
         );
         let _player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
@@ -13251,6 +13288,7 @@ mod tests {
                 state: ConnectionState::Playing,
                 username: Some("Tester".to_string()),
                 entity_id: 1,
+                idle_ticks: 0,
             },
         );
         server.handle_packet(
@@ -13286,6 +13324,40 @@ mod tests {
         assert!(ids.contains(&104), "the items of the inventory are sent");
         assert_eq!(slots, vec![(-1, -1)], "the item in hand");
         assert_eq!(health, 0, "the health is not sent at the login");
+    }
+
+    /// The connection that received nothing is disconnected.
+    ///
+    /// Java `NetworkManager.b()`: the counter of the ticks without a packet
+    /// is reset when a packet arrives, the connection is disconnected when
+    /// the counter reaches twelve hundred.
+    #[test]
+    fn the_idle_connection_is_disconnected() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.connections.insert(
+            7,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().expect("the address"),
+                state: ConnectionState::Playing,
+                username: Some("Player".to_string()),
+                entity_id: 1,
+                idle_ticks: 0,
+            },
+        );
+        // The connection received nothing for a long time.
+        if let Some(connection) = server.connections.get_mut(&7) {
+            connection.idle_ticks = 1199;
+        }
+        server.tick(0);
+        let mut kicks = 0;
+        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            if matches!(packet, Clientbound::KickDisconnect(_)) {
+                kicks += 1;
+            }
+        }
+        assert_eq!(kicks, 1, "the idle connection is disconnected");
     }
 
     /// The mobs push each other away.
@@ -14093,6 +14165,7 @@ mod tests {
                 state: ConnectionState::Playing,
                 username: Some("Ghost".to_string()),
                 entity_id,
+                idle_ticks: 0,
             },
         );
         assert_eq!(server.entities.player_count(), 1);
@@ -14119,6 +14192,7 @@ mod tests {
                 state: ConnectionState::Playing,
                 username: Some("Alive".to_string()),
                 entity_id,
+                idle_ticks: 0,
             },
         );
 
@@ -14184,6 +14258,7 @@ mod tests {
                     state: ConnectionState::Playing,
                     username: Some(format!("Player{conn_id}")),
                     entity_id: conn_id as i32,
+                    idle_ticks: 0,
                 },
             );
         }
@@ -14293,6 +14368,7 @@ mod tests {
                 state: ConnectionState::Playing,
                 username: Some("Tester".to_string()),
                 entity_id: 0,
+                idle_ticks: 0,
             },
         );
         server
