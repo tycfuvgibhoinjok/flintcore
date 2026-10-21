@@ -409,7 +409,21 @@ pub struct Mob {
     /// Java `Entity.justCreated`: the mob was just created.
     pub just_created: bool,
     /// Java `EntityLiving.K`: the yaw the mob looks at.
+    /// Java `EntityLiving.K`: the yaw the mob looks at ✓.
     pub look_yaw: f32,
+    /// Java `EntityLiving.O`: the tilt of the head ✓ (the angle of the head
+    /// of the mob while it walks ✓).
+    pub look_pitch: f32,
+    /// Java `EntityLiving.P`: the previous tilt of the head ✓.
+    pub prev_look_pitch: f32,
+    /// Java `EntityLiving.N`: the swing of the arm ✓.
+    pub swing: f32,
+    /// Java `EntityLiving.M`: the previous swing of the arm ✓.
+    pub prev_swing: f32,
+    /// Java `EntityLiving.aa`: the override of the direction of the look ✓ —
+    /// the mob looks at its own yaw when the value is above zero ✓ (only the
+    /// player sets it ✓, `EntityHuman.java:178` ✓).
+    pub look_override: f32,
     /// Java `Entity.lastX`: the position of the mob in the previous tick.
     pub last_x: f64,
     /// Java `Entity.lastZ`: the position of the mob in the previous tick.
@@ -547,6 +561,11 @@ impl Mob {
             squid_squash: 0.0,
             squid_yaw: 0.0,
             look_yaw: 0.0,
+            look_pitch: 0.0,
+            prev_look_pitch: 0.0,
+            swing: 0.0,
+            prev_swing: 0.0,
+            look_override: 0.0,
             last_x: x,
             last_z: z,
             was_in_water: false,
@@ -1033,6 +1052,69 @@ impl Mob {
     }
 
     /// Encode Beta 1.7.3 `DataWatcher` metadata bytes (terminated with `127`).
+    /// Java `EntityLiving.m_()`: the look of the mob.
+    ///
+    /// The yaw the mob looks at follows the direction of the movement ✓, the
+    /// head is tilted by the movement ✓ (`O` ✓) and the arm swings ✓
+    /// (`M` and `N` ✓).
+    pub fn update_look(&mut self) {
+        let dx = self.x - self.last_x;
+        let dz = self.z - self.last_z;
+        let moved = crate::util::math::math_helper_a(dx * dx + dz * dz);
+        let mut look = self.look_yaw;
+        // The tilt of the head (`EntityLiving.f2` ✓).
+        let mut tilt = 0.0f32;
+        // The target of the swing (`EntityLiving.f3` ✓).
+        let mut swing_target = 0.0f32;
+        if moved > 0.05 {
+            swing_target = 1.0;
+            tilt = moved * 3.0;
+            // The reference uses its own `TrigMath.atan2` here and the whole
+            // expression is a single precision one.
+            look = (crate::util::math::trig::atan2(dz, dx) as f32) * 180.0f32 / JAVA_PI - 90.0f32;
+        }
+        // The override of the direction of the look (`EntityLiving.aa` ✓).
+        if self.look_override > 0.0 {
+            look = self.yaw;
+        }
+        if !self.on_ground {
+            swing_target = 0.0;
+        }
+        // The swing of the arm (`EntityLiving.M` and `N` ✓).
+        self.prev_swing = self.swing;
+        self.swing += (swing_target - self.swing) * 0.3;
+
+        let mut diff = look - self.look_yaw;
+        while diff < -180.0 {
+            diff += 360.0;
+        }
+        while diff >= 180.0 {
+            diff -= 360.0;
+        }
+        self.look_yaw += diff * 0.3;
+        let mut diff = self.yaw - self.look_yaw;
+        while diff < -180.0 {
+            diff += 360.0;
+        }
+        while diff >= 180.0 {
+            diff -= 360.0;
+        }
+        // The mob looks back (`EntityLiving.flag` ✓): the tilt of the head
+        // changes its sign ✓.
+        let looking_back = diff < -90.0 || diff >= 90.0;
+        diff = diff.clamp(-75.0, 75.0);
+        self.look_yaw = self.yaw - diff;
+        if diff * diff > 2500.0 {
+            self.look_yaw += diff * 0.2;
+        }
+        if looking_back {
+            tilt *= -1.0;
+        }
+        // The tilt of the head (`EntityLiving.O` ✓).
+        self.prev_look_pitch = self.look_pitch;
+        self.look_pitch += tilt;
+    }
+
     pub fn encode_metadata(&self) -> Vec<u8> {
         let mut w = Writer::new();
         // Index 0 (byte): entity flags (bit 0 = burning, bit 2 = riding)
@@ -2422,6 +2504,37 @@ mod tests {
             !mob_can_spawn_here(&world, MobType::Zombie, 80.5, 64.0, 80.5, &[], 0),
             "the monster does not spawn in the light"
         );
+    }
+
+    /// The head of the mob is tilted by the movement and the arm swings.
+    ///
+    /// Java `EntityLiving.m_()`: the tilt of the head (`O`) grows by the
+    /// distance of the movement times three ✓ (`f2` ✓) and the swing of the
+    /// arm (`N`) goes to one while the mob walks on the ground ✓ (`f3` ✓) and
+    /// to zero while it is in the air ✓.
+    #[test]
+    fn the_head_of_the_mob_is_tilted_by_the_movement() {
+        let mut mob = Mob::new(1, MobType::Pig, 0.0, 64.0, 0.0, &mut JavaRandom::new(0));
+        mob.on_ground = true;
+        // The mob walks to the east ✓ — the tilt of the head grows ✓.
+        mob.last_x = mob.x;
+        mob.last_z = mob.z;
+        mob.x += 1.0;
+        mob.update_look();
+        assert!(mob.look_pitch > 0.0, "the head is tilted by the movement");
+        assert!(mob.swing > 0.0, "the arm swings while the mob walks");
+        // The previous values are the ones of the last tick ✓.
+        assert_eq!(mob.prev_swing, 0.0, "the previous swing is kept");
+        assert_eq!(mob.prev_look_pitch, 0.0, "the previous tilt is kept");
+
+        // The mob in the air does not swing ✓.
+        let mut mob = Mob::new(1, MobType::Pig, 0.0, 64.0, 0.0, &mut JavaRandom::new(0));
+        mob.on_ground = false;
+        mob.last_x = mob.x;
+        mob.last_z = mob.z;
+        mob.x += 1.0;
+        mob.update_look();
+        assert_eq!(mob.swing, 0.0, "the arm does not swing in the air");
     }
 
     #[test]

@@ -6417,40 +6417,9 @@ impl Server {
                 }
 
                 // The look of the mob (`EntityLiving.m_()`): the yaw the mob
-                // looks at follows the direction of the movement.
-                {
-                    let dx = mob.x - mob.last_x;
-                    let dz = mob.z - mob.last_z;
-                    let moved = crate::util::math::math_helper_a(dx * dx + dz * dz);
-                    let mut look = mob.look_yaw;
-                    if moved > 0.05 {
-                        // The reference uses its own `TrigMath.atan2` here and
-                        // the whole expression is a single precision one.
-                        look = (crate::util::math::trig::atan2(dz, dx) as f32) * 180.0f32
-                            / crate::entity::mob::JAVA_PI
-                            - 90.0f32;
-                    }
-                    let mut diff = look - mob.look_yaw;
-                    while diff < -180.0 {
-                        diff += 360.0;
-                    }
-                    while diff >= 180.0 {
-                        diff -= 360.0;
-                    }
-                    mob.look_yaw += diff * 0.3;
-                    let mut diff = mob.yaw - mob.look_yaw;
-                    while diff < -180.0 {
-                        diff += 360.0;
-                    }
-                    while diff >= 180.0 {
-                        diff -= 360.0;
-                    }
-                    diff = diff.clamp(-75.0, 75.0);
-                    mob.look_yaw = mob.yaw - diff;
-                    if diff * diff > 2500.0 {
-                        mob.look_yaw += diff * 0.2;
-                    }
-                }
+                // looks at follows the direction of the movement, the head is
+                // tilted by the movement and the arm swings.
+                mob.update_look();
 
                 // The fall damage of the mob (`EntityLiving.a(float)`): the
                 // reference hits the mob once with all the damage. The
