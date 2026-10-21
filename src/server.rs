@@ -4227,8 +4227,9 @@ impl Server {
 
             // 2. Head-level checks: in-wall suffocation (`EntityLiving.java:121-130`) &
             //    drowning (`EntityLiving.java:138-166`).
-            //    The height of the checks of the reference is `EntityHuman.t()`
-            //    (0.12), not the height of the eyes of the player (1.62).
+            //    The height of the checks of the reference is `t()` of the player
+            //    (`EntityPlayer.t()` = 1.62, `EntityHuman.t()` = 0.12 but the
+            //    player overrides it).
             if !sleeping && self.mob_suffocates(px, py + PLAYER_EYE_HEIGHT, pz, 0.6) {
                 damages.push((pid, 1, "suffocated in a wall"));
             }
