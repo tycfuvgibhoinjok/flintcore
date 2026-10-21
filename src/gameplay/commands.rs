@@ -48,6 +48,8 @@ pub enum CommandAction {
 #[derive(Debug, Clone, Default)]
 pub struct CommandContext {
     pub online_players: Vec<String>,
+    /// The dimension of every online player (the name and the dimension).
+    pub player_dimensions: Vec<(String, i32)>,
     pub whitelisted_players: Vec<String>,
     pub tps_records: Vec<f64>,
     pub plugins: Vec<(String, String, bool)>,
@@ -717,26 +719,13 @@ impl Command for TeleportCommand {
         "bukkit.command.teleport"
     }
 
-    fn execute(&self, sender: &str, args: &[&str], ctx: &CommandContext) -> CommandResult {
-        if args.len() == 3 {
-            if let (Ok(x), Ok(y), Ok(z)) = (
-                args[0].parse::<f64>(),
-                args[1].parse::<f64>(),
-                args[2].parse::<f64>(),
-            ) {
-                return CommandResult::handled()
-                    .with_broadcast(format!("Teleporting {sender} to {x:.1}, {y:.1}, {z:.1}"))
-                    .with_action(CommandAction::TeleportToCoords {
-                        victim: sender.to_string(),
-                        x,
-                        y,
-                        z,
-                    });
-            }
-        }
+    fn execute(&self, _sender: &str, args: &[&str], ctx: &CommandContext) -> CommandResult {
+        // Java `ConsoleCommandHandler`: the command takes the name of the
+        // player and the name of the target.
         if args.len() != 2 {
-            return CommandResult::handled()
-                .with_sender_message("\u{00A7}cUsage: /tp <player> <target>".to_string());
+            return CommandResult::handled().with_sender_message(
+                "Syntax error, please provice a source and a target.".to_string(),
+            );
         }
         let victim = args[0];
         let target = args[1];
@@ -757,9 +746,25 @@ impl Command for TeleportCommand {
                 return CommandResult::handled()
                     .with_sender_message(format!("Can't find user {target}. No tp."));
             }
+            // The players must be in the same dimension.
+            let dimension_of = |name: &str| {
+                ctx.player_dimensions
+                    .iter()
+                    .find(|(player, _)| player.eq_ignore_ascii_case(name))
+                    .map(|(_, dimension)| *dimension)
+            };
+            if let (Some(v_dimension), Some(t_dimension)) =
+                (dimension_of(victim), dimension_of(target))
+            {
+                if v_dimension != t_dimension {
+                    return CommandResult::handled().with_sender_message(format!(
+                        "User {victim} and {target} are in different dimensions. No tp."
+                    ));
+                }
+            }
         }
         CommandResult::handled()
-            .with_broadcast(format!("Teleporting {victim} to {target}"))
+            .with_broadcast(format!("Teleporting {victim} to {target}."))
             .with_action(CommandAction::TeleportToPlayer {
                 victim: victim.to_string(),
                 target: target.to_string(),
@@ -838,37 +843,15 @@ impl Command for TimeCommand {
     }
 
     fn execute(&self, _sender: &str, args: &[&str], _ctx: &CommandContext) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::handled().with_sender_message(
-                "\u{00A7}cIncorrect usage. Correct usage:\n/time set <value>\n/time add <value>"
-                    .to_string(),
-            );
+        // Java `ConsoleCommandHandler`: the command takes the method and the
+        // value; the wrong number of the arguments is ignored silently.
+        if args.len() != 2 {
+            return CommandResult::handled();
         }
-        if args.len() == 1 {
-            let val = match args[0].to_lowercase().as_str() {
-                "day" => Some(0i64),
-                "night" => Some(12500i64),
-                other => other.parse::<i64>().ok(),
-            };
-            if let Some(v) = val {
-                return CommandResult::handled()
-                    .with_broadcast(format!("Set time to {v}"))
-                    .with_action(CommandAction::SetTime(v));
-            }
-            return CommandResult::handled()
-                .with_sender_message(format!("Unable to convert time value, {}", args[0]));
-        }
-
-        let val = match args[1].to_lowercase().as_str() {
-            "day" => Some(0i64),
-            "night" => Some(12500i64),
-            other => other.parse::<i64>().ok(),
-        };
-        let Some(v) = val else {
+        let Ok(v) = args[1].parse::<i64>() else {
             return CommandResult::handled()
                 .with_sender_message(format!("Unable to convert time value, {}", args[1]));
         };
-
         if args[0].eq_ignore_ascii_case("add") {
             CommandResult::handled()
                 .with_broadcast(format!("Added {v} to time"))
@@ -1537,6 +1520,84 @@ mod tests {
             result.sender_messages,
             expected.to_vec(),
             "the text of the help"
+        );
+    }
+
+    /// The texts of the command `tp` are the texts of the reference.
+    ///
+    /// Java `ConsoleCommandHandler`: "Can't find user <name>. No tp.", "User
+    /// <a> and <b> are in different dimensions. No tp.", "Teleporting <a> to
+    /// <b>." and "Syntax error, please provice a source and a target." (the
+    /// typo of the reference).
+    #[test]
+    fn the_texts_of_the_command_tp_are_the_texts_of_the_reference() {
+        let map = CommandMap::new();
+        let ctx = CommandContext {
+            online_players: vec!["Hero".to_string(), "Villain".to_string()],
+            player_dimensions: vec![("Hero".to_string(), 0), ("Villain".to_string(), 0)],
+            ..Default::default()
+        };
+        // The success.
+        let result = map.dispatch_with_context("Hero", "tp Hero Villain", &ctx);
+        assert_eq!(
+            result.broadcast_messages,
+            vec!["Teleporting Hero to Villain."]
+        );
+        // The wrong number of the arguments.
+        let result = map.dispatch_with_context("Hero", "tp Hero", &ctx);
+        assert_eq!(
+            result.sender_messages,
+            vec!["Syntax error, please provice a source and a target."]
+        );
+        // The unknown player.
+        let result = map.dispatch_with_context("Hero", "tp Hero Nobody", &ctx);
+        assert_eq!(
+            result.sender_messages,
+            vec!["Can't find user Nobody. No tp."]
+        );
+        // The different dimensions.
+        let mut ctx = ctx;
+        ctx.player_dimensions = vec![("Hero".to_string(), 0), ("Villain".to_string(), -1)];
+        let result = map.dispatch_with_context("Hero", "tp Hero Villain", &ctx);
+        assert_eq!(
+            result.sender_messages,
+            vec!["User Hero and Villain are in different dimensions. No tp."]
+        );
+    }
+
+    /// The command `time` of the reference.
+    ///
+    /// Java `ConsoleCommandHandler`: only `time add|set <value>`, the wrong
+    /// number of the arguments is ignored silently, "Added <v> to time",
+    /// "Set time to <v>", "Unknown method, use either \"add\" or \"set\""
+    /// and "Unable to convert time value, <v>".
+    #[test]
+    fn the_command_time_is_the_command_of_the_reference() {
+        let map = CommandMap::new();
+        let ctx = CommandContext::default();
+        // The method and the value.
+        let result = map.dispatch_with_context("Hero", "time set 100", &ctx);
+        assert_eq!(result.broadcast_messages, vec!["Set time to 100"]);
+        let result = map.dispatch_with_context("Hero", "time add 5", &ctx);
+        assert_eq!(result.broadcast_messages, vec!["Added 5 to time"]);
+        // The unknown method.
+        let result = map.dispatch_with_context("Hero", "time foo 5", &ctx);
+        assert_eq!(
+            result.sender_messages,
+            vec!["Unknown method, use either \"add\" or \"set\""]
+        );
+        // The value that is not a number.
+        let result = map.dispatch_with_context("Hero", "time set x", &ctx);
+        assert_eq!(
+            result.sender_messages,
+            vec!["Unable to convert time value, x"]
+        );
+        // The wrong number of the arguments is ignored silently.
+        let result = map.dispatch_with_context("Hero", "time 100", &ctx);
+        assert!(result.sender_messages.is_empty(), "the command is silent");
+        assert!(
+            result.broadcast_messages.is_empty(),
+            "the command is silent"
         );
     }
 

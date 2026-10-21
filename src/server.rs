@@ -11026,7 +11026,7 @@ impl Server {
                 .next()
                 .is_some_and(|c| c.eq_ignore_ascii_case("tps"))
         {
-            self.reply(sender, "Unknown command. Type \"help\" for help.");
+            self.reply(sender, "Unknown console command. Type \"help\" for help.");
             return;
         }
         let mut online_players: Vec<String> = self
@@ -11040,6 +11040,11 @@ impl Server {
 
         let ctx = CommandContext {
             online_players,
+            player_dimensions: self
+                .entities
+                .iter_players()
+                .map(|p| (p.username.clone(), p.dimension))
+                .collect(),
             whitelisted_players,
             tps_records: self.tps_records.iter().copied().collect(),
             plugins: Vec::new(),
@@ -11050,7 +11055,7 @@ impl Server {
             .dispatch_with_context(&username, cmd_body, &ctx);
 
         if !result.handled {
-            self.reply(sender, "Unknown command. Type \"help\" for help.");
+            self.reply(sender, "Unknown console command. Type \"help\" for help.");
             return;
         }
 
@@ -11299,8 +11304,9 @@ impl Server {
                     .find(|p| p.username.eq_ignore_ascii_case(&target))
                     .map(|p| p.conn_id);
                 if let Some(conn_id) = target_conn {
-                    let msg = self.config.messages.kick_banned.clone();
-                    self.kick(conn_id, &msg);
+                    // Java `ConsoleCommandHandler`: the reason of the ban of
+                    // the player.
+                    self.kick(conn_id, "Banned by admin");
                 }
             }
             CommandAction::Pardon(target) => {
@@ -11311,21 +11317,8 @@ impl Server {
                 let lower = ip.to_lowercase();
                 self.banned_ips.insert(lower.clone());
                 Self::save_list_file("banned-ips.txt", &self.banned_ips);
-                let matching_conns: Vec<ConnId> = self
-                    .connections
-                    .iter()
-                    .filter_map(|(&cid, c)| {
-                        if c.address.ip().to_string().eq_ignore_ascii_case(&lower) {
-                            Some(cid)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let msg = self.config.messages.kick_ip_banned.clone();
-                for cid in matching_conns {
-                    self.kick(cid, &msg);
-                }
+                // Java `ConsoleCommandHandler`: the command `ban-ip` does
+                // not disconnect anybody.
             }
             CommandAction::PardonIp(ip) => {
                 self.banned_ips.remove(&ip.to_lowercase());
@@ -14153,7 +14146,7 @@ mod tests {
         assert!(
             output
                 .iter()
-                .any(|line| line.contains("Unknown command. Type \"help\" for help.")),
+                .any(|line| line.contains("Unknown console command. Type \"help\" for help.")),
             "console output was {output:?}"
         );
     }
