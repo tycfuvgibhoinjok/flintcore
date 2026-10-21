@@ -7941,6 +7941,33 @@ impl Server {
         }
     }
 
+    /// Java `Block.d(World, i, j, k)`: the hook of the block destroyed by the
+    /// explosion ✓ (`Explosion.java:283` ✓).
+    ///
+    /// The base implementation of the reference is empty ✓ (`Block.java:448-449`
+    /// ✓) and only the TNT overrides it ✓ (`BlockTNT.java:34-39` ✓) — it
+    /// creates the primed TNT ✓.
+    fn block_destroyed_by_explosion(
+        &mut self,
+        id: u8,
+        x: i32,
+        y: i32,
+        z: i32,
+        rng: &mut JavaRandom,
+    ) {
+        if id != blocks::TNT {
+            return;
+        }
+        // Java `BlockTNT.d`: the primed TNT is created at once ✓ and its fuse
+        // is drawn from the random of the world ✓
+        // (`world.random.nextInt(fuse / 4) + fuse / 8` ✓ — the fuse of the
+        // entity is eighty ticks ✓).
+        let fuse = 80;
+        let fuse = rng.next_i32_bound(fuse / 4) + fuse / 8;
+        self.send_block_change_to_observers(x, y, z);
+        self.spawn_primed_tnt_at(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5, fuse);
+    }
+
     fn tick_primed_tnts(&mut self) {
         let active_dimension = self.active_dimension;
         let tnt_ids: Vec<i32> = self
@@ -9241,8 +9268,6 @@ impl Server {
         let base_x = ex as i32;
         let base_y = ey as i32;
         let base_z = ez as i32;
-        let mut drops_to_spawn = Vec::new();
-        let mut chain_tnts = Vec::new();
 
         for &(bx, by, bz) in destroyed_blocks.iter().rev() {
             // The particles of the explosion: the position of the particle
@@ -9256,29 +9281,31 @@ impl Server {
             let id = self.world.get_block(bx, by, bz);
             let meta = self.world.get_data(bx, by, bz);
             if id != blocks::AIR {
-                if id == blocks::TNT {
-                    chain_tnts.push((bx, by, bz));
-                } else {
-                    // The drops of the block (`Block.dropNaturally`): the
-                    // number of the drops is drawn, then the yield of the
-                    // explosion (one, so the block always drops) and then
-                    // the item itself.
-                    let count = blocks::drop_count(id, &mut rng);
-                    for _ in 0..count {
-                        if rng.next_f32() < 1.0 {
-                            let item_id = blocks::drop_item_id(id, meta, &mut rng);
-                            if item_id > 0 {
-                                drops_to_spawn.push((
-                                    bx as f64,
-                                    by as f64,
-                                    bz as f64,
-                                    ItemStack::new(item_id, 1, blocks::drop_damage(id, meta)),
-                                ));
-                            }
+                // The drops of the block (`Block.dropNaturally`): the
+                // number of the drops is drawn, then the yield of the
+                // explosion (one, so the block always drops) and then
+                // the item itself.  The item is created at once ✓ — the
+                // reference drops it inside the loop ✓.
+                let count = blocks::drop_count(id, &mut rng);
+                for _ in 0..count {
+                    if rng.next_f32() < 1.0 {
+                        let item_id = blocks::drop_item_id(id, meta, &mut rng);
+                        if item_id > 0 {
+                            self.spawn_dropped_item_at(
+                                bx as f64,
+                                by as f64,
+                                bz as f64,
+                                ItemStack::new(item_id, 1, blocks::drop_damage(id, meta)),
+                                10,
+                            );
                         }
                     }
                 }
                 self.world.java_set_type_id(bx, by, bz, blocks::AIR);
+                // Java `Block.d(World, i, j, k)`: the hook of the destroyed
+                // block ✓ (`Explosion.java:283` ✓) — the primed TNT of the
+                // TNT ✓ (`BlockTNT.java:34-39` ✓).
+                self.block_destroyed_by_explosion(id, bx, by, bz, &mut rng);
             }
             records.push((
                 (bx - base_x).clamp(-128, 127) as i8,
@@ -9288,12 +9315,6 @@ impl Server {
         }
         self.world.world_random = rng;
 
-        for (tx, ty, tz) in chain_tnts {
-            self.world.ignite_tnt(tx, ty, tz, true);
-        }
-        for (dx, dy, dz, item) in drops_to_spawn {
-            self.spawn_dropped_item_at(dx, dy, dz, item, 10);
-        }
         self.process_world_events();
 
         self.broadcast(Clientbound::Explosion(Explosion {
@@ -14082,6 +14103,33 @@ mod tests {
         assert_ne!(
             fuses[0], fuses[1],
             "the fuses are drawn from the random of the world"
+        );
+    }
+
+    /// The hook of the destroyed block is called for every block of the
+    /// explosion.
+    ///
+    /// Java `Block.d(World, i, j, k)` (`Explosion.java:283` ✓): the base
+    /// implementation is empty ✓ (`Block.java:448-449` ✓) and only the TNT
+    /// overrides it ✓ (`BlockTNT.java:34-39` ✓) — it creates the primed TNT
+    /// ✓.
+    #[test]
+    fn the_hook_of_the_destroyed_block_creates_the_primed_tnt() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.world.set_block(0, 64, 0, blocks::TNT);
+        server.block_destroyed_by_explosion(blocks::TNT, 0, 64, 0, &mut JavaRandom::new(1));
+        assert_eq!(
+            server.entities.iter_primed_tnts().count(),
+            1,
+            "the TNT is primed at once"
+        );
+
+        // The other blocks have no hook ✓.
+        server.block_destroyed_by_explosion(blocks::STONE, 1, 64, 0, &mut JavaRandom::new(1));
+        assert_eq!(
+            server.entities.iter_primed_tnts().count(),
+            1,
+            "the stone has no hook"
         );
     }
 
