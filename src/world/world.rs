@@ -829,9 +829,18 @@ impl World {
                 }
             }
             storage.borrow_mut().flush_all()?;
-            if self.dimension == 0 {
-                self.level_data.borrow_mut().save_to_dir(&self.world_dir)?;
-            }
+            self.save_level_data()?;
+        }
+        Ok(())
+    }
+
+    /// Java `PlayerNBTManager.save`: the file `level.dat` is written.
+    ///
+    /// The reference writes it into `level.dat_new`, moves the old file to
+    /// `level.dat_old` and renames the new one.
+    pub fn save_level_data(&mut self) -> Result<()> {
+        if self.dimension == 0 {
+            self.level_data.borrow_mut().save_to_dir(&self.world_dir)?;
         }
         Ok(())
     }
@@ -3866,6 +3875,32 @@ mod tests {
         // The middle of the night: the factor of the sky is eleven.
         world.level_data.borrow_mut().time = 18000;
         assert_eq!(world.light_at(0, 100, 0), 4, "the light of the midnight");
+    }
+
+    /// The saving of the world writes the file of the level data.
+    ///
+    /// Java `PlayerNBTManager.save`: the file `level.dat` is written when
+    /// the world is saved (`World.save(false, null)`), which happens every
+    /// forty ticks (`World.tick()`).
+    #[test]
+    fn the_saving_of_the_world_writes_the_level_data() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("flintcore_level_data_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let config = WorldConfig {
+            seed: 1,
+            level_name: temp_dir.to_string_lossy().to_string(),
+            save_enabled: true,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        world.save_level_data().expect("the level data is saved");
+        assert!(
+            temp_dir.join("level.dat").exists(),
+            "the file of the level data is written"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// The incremental save does not write the file of the level data.

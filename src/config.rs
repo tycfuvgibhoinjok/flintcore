@@ -213,7 +213,8 @@ impl Default for ServerConfig {
             username_regex: "[a-zA-Z0-9_.]*".to_string(),
             cracked_username_prefix: false,
             save_playerdata: true,
-            autosave_interval_ticks: 6000,
+            // Java `World.p`: the world is saved every forty ticks.
+            autosave_interval_ticks: 40,
             time_speed_multiplier: 1,
             enable_tps_command: true,
             console_enabled: true,

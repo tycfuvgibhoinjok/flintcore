@@ -24,9 +24,9 @@ use crate::net::packets::chat::{is_allowed_char, wrap_text};
 use crate::net::packets::{
     ArmAnimation, AttachEntity, Bed, BlockChange, Chat, Clientbound, CloseWindow, Collect,
     CraftProgressBar, EntityMetadata, EntityStatus, EntityVelocity, Explosion, Handshake,
-    KeepAlive, KickDisconnect, LevelSound, Login, MapData, MultiBlockChange, OpenWindow,
-    PlayNoteBlock, PlayerLookMove, PreChunk, Respawn, Serverbound, SetSlot, Sleep, SpawnPosition,
-    Transaction, UpdateHealth, UpdateSign, UpdateTime, Weather, WindowItems,
+    KickDisconnect, LevelSound, Login, MapData, MultiBlockChange, OpenWindow, PlayNoteBlock,
+    PlayerLookMove, PreChunk, Respawn, Serverbound, SetSlot, Sleep, SpawnPosition, Transaction,
+    UpdateHealth, UpdateSign, UpdateTime, Weather, WindowItems,
 };
 use crate::net::protocol::PROTOCOL_VERSION;
 use crate::net::{ConnId, NetEvent, Outbound};
@@ -382,21 +382,25 @@ impl Server {
 
         self.drain_inbound();
 
-        // Incremental auto-save (`ChunkProviderServer.saveChunks(false, null)` — up to 24 dirty chunks)
+        // The saving of the world (`World.tick()`): when the time of the
+        // world is divisible by forty, the world is saved
+        // (`World.save(false, null)`): the data of the level, the data of
+        // the players and (up to twenty four) the chunks.
         let autosave_ticks = self.config.server.autosave_interval_ticks;
-        if ticks > 0 && self.config.world.save_enabled && autosave_ticks > 0 {
-            if ticks % 100 == 0 {
+        if self.config.world.save_enabled && autosave_ticks > 0 {
+            let world_time = self.world.world_time();
+            if world_time.rem_euclid(autosave_ticks as i64) == 0 {
+                if self.config.server.save_playerdata {
+                    for player in self.entities.iter_players() {
+                        let _ = self.player_store.save_player(player);
+                    }
+                }
+                let _ = self.world.save_level_data();
                 let _ = self.world.save_chunks_incremental(24);
                 if self.nether.is_some() {
                     self.with_dimension(-1, |s| {
                         let _ = s.world.save_chunks_incremental(24);
                     });
-                }
-            }
-            let player_save_every = autosave_ticks.min(1200);
-            if self.config.server.save_playerdata && ticks % player_save_every == 0 {
-                for player in self.entities.iter_players() {
-                    let _ = self.player_store.save_player(player);
                 }
             }
         }
@@ -540,9 +544,11 @@ impl Server {
         }
 
         if ticks % 20 == 0 {
-            self.broadcast_keep_alive();
             // The time of the world is sent to the players every twenty
-            // ticks (`MinecraftServer.tick`).
+            // ticks (`MinecraftServer.tick`): it keeps the connection of
+            // the client alive, the reference does not send the keep-alive
+            // (`NetServerHandler.a()`: the counter of the ticks is never
+            // incremented).
             let time = self.world.world_time();
             self.broadcast(Clientbound::UpdateTime(UpdateTime { time }));
         }
@@ -657,14 +663,6 @@ impl Server {
         if let Some(target) = self.entities.get_player(recipient_id) {
             if target.dimension == active_dimension {
                 self.send(target.conn_id, packet);
-            }
-        }
-    }
-
-    fn broadcast_keep_alive(&self) {
-        for (&id, conn) in &self.connections {
-            if conn.state == ConnectionState::Playing {
-                self.send(id, Clientbound::KeepAlive(KeepAlive));
             }
         }
     }
@@ -13155,6 +13153,46 @@ mod tests {
         assert!(
             server.world.thunder_intensity.get() > 0.0,
             "the intensity of the thunder rises"
+        );
+    }
+
+    /// The server does not send the keep-alive.
+    ///
+    /// Java `NetServerHandler.a()`: the condition of the keep-alive is
+    /// `this.f - this.g > 20`, but the counter of the ticks is never
+    /// incremented — the reference never sends it. The connection of the
+    /// client is kept alive by the packet of the time.
+    #[test]
+    fn the_server_does_not_send_the_keep_alive() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.connections.insert(
+            7,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().expect("the address"),
+                state: ConnectionState::Playing,
+                username: Some("Player".to_string()),
+                entity_id: 1,
+            },
+        );
+        let _player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        for tick in 0..60 {
+            server.tick(tick);
+        }
+        let mut keep_alives = 0;
+        let mut times = 0;
+        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            match packet {
+                Clientbound::KeepAlive(_) => keep_alives += 1,
+                Clientbound::UpdateTime(_) => times += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(keep_alives, 0, "the keep-alive is not sent");
+        assert!(
+            times > 0,
+            "the packet of the time keeps the connection of the client alive"
         );
     }
 
