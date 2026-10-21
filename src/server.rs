@@ -392,11 +392,11 @@ impl Server {
                 s.world.live_time = overworld_time;
                 s.world.level_data.borrow_mut().time = overworld_time;
                 s.world.tick_furnaces();
-                let nether_players: Vec<(f64, f64)> = s
+                let nether_players: Vec<(f64, f64, f64)> = s
                     .entities
                     .iter_players()
                     .filter(|p| p.dimension == -1 && !p.dead)
-                    .map(|p| (p.x, p.z))
+                    .map(|p| (p.x, p.y, p.z))
                     .collect();
                 if !nether_players.is_empty() {
                     let mut entity_random =
@@ -505,11 +505,11 @@ impl Server {
         }
 
         // Random block ticks (grass, crops, saplings, reeds, leaves, ice/snow) when players online
-        let player_xz: Vec<(f64, f64)> = self
+        let player_xz: Vec<(f64, f64, f64)> = self
             .entities
             .iter_players()
             .filter(|p| !p.dead && p.dimension == 0)
-            .map(|p| (p.x, p.z))
+            .map(|p| (p.x, p.y, p.z))
             .collect();
         if !player_xz.is_empty() {
             let mut entity_random = std::mem::replace(&mut self.entity_random, JavaRandom::new(0));

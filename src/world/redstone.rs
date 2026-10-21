@@ -2903,7 +2903,7 @@ impl World {
 
     pub fn tick_random_blocks(
         &mut self,
-        player_positions: &[(f64, f64)],
+        player_positions: &[(f64, f64, f64)],
         entity_random: &mut JavaRandom,
     ) {
         if player_positions.is_empty() {
@@ -2914,7 +2914,7 @@ impl World {
         // the random of the world, and the order of a hash table of Rust is
         // random for every process.
         let mut active_chunks = BTreeSet::new();
-        for &(px, pz) in player_positions {
+        for &(px, _py, pz) in player_positions {
             let cx = (px.floor() as i32) >> 4;
             let cz = (pz.floor() as i32) >> 4;
             for dx in -9..=9 {
@@ -2930,9 +2930,81 @@ impl World {
         let mut lcg = self.random_tick_lcg;
         let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
 
+        // Java `World.java:1892-1893`: the timer of the sound of the cave is
+        // counted down once per tick ✓.
+        if self.cave_sound_timer > 0 {
+            self.cave_sound_timer -= 1;
+        }
+
         for pos in active_chunks {
             let base_x = pos.x * 16;
             let base_z = pos.z * 16;
+
+            // 0. The sound of the cave (`World.java:1908-1924`).
+            //
+            // The reference plays the sound through `WorldManager.a(String,
+            // double, double, double, float, float)` ✓, which does nothing ✓
+            // (`WorldManager.java:23` ✓) — the sound is not audible in the
+            // reference ✓.  The numbers are drawn anyway ✓, so the stream of
+            // the world has to be the same ✓.
+            if self.cave_sound_timer == 0 {
+                lcg = lcg.wrapping_mul(3).wrapping_add(1_013_904_223);
+                let k = lcg >> 2;
+                let lx = (k & 15) as usize;
+                let lz = ((k >> 8) & 15) as usize;
+                let wy = (k >> 16) & 127;
+                let wx = base_x + lx as i32;
+                let wz = base_z + lz as i32;
+                let block = self.get_block(wx, wy, wz);
+                if block == blocks::AIR {
+                    // Java `World.k(i, j, k)`: the light of the block is the
+                    // bigger of the light of the block and the light of the
+                    // sky ✓.
+                    let block_light = self.java_get_saved_light(
+                        crate::world::lighting::LightType::Block,
+                        wx,
+                        wy,
+                        wz,
+                    );
+                    let sky_light = self.java_get_saved_light(
+                        crate::world::lighting::LightType::Sky,
+                        wx,
+                        wy,
+                        wz,
+                    );
+                    let light = block_light.max(sky_light);
+                    if light <= rng.next_i32_bound(8) && sky_light <= 0 {
+                        // The nearest player within eight blocks
+                        // (`World.a(double, double, double, double)`) and its
+                        // distance to the sound (`Entity.e(double, double,
+                        // double)`).
+                        let sound_x = wx as f64 + 0.5;
+                        let sound_y = wy as f64 + 0.5;
+                        let sound_z = wz as f64 + 0.5;
+                        // Java `Entity.e(double, double, double)` returns the
+                        // **squared** distance ✓, so the radius of eight
+                        // blocks is `64` ✓ and the distance of four is `4` ✓.
+                        let mut nearest: Option<f64> = None;
+                        for &(px, py, pz) in player_positions {
+                            let dx = px - sound_x;
+                            let dy = py - sound_y;
+                            let dz = pz - sound_z;
+                            let distance = dx * dx + dy * dy + dz * dz;
+                            if distance < 64.0 && nearest.map_or(true, |best| distance < best) {
+                                nearest = Some(distance);
+                            }
+                        }
+                        if let Some(distance) = nearest {
+                            if distance > 4.0 {
+                                // The tone of the sound and the new timer
+                                // (`World.java:1921-1922`).
+                                let _pitch = 0.8f32 + rng.next_f32() * 0.2f32;
+                                self.cave_sound_timer = rng.next_i32_bound(12000) + 6000;
+                            }
+                        }
+                    }
+                }
+            }
 
             // 1. Thunderstorm lightning strike (1/100000 per chunk per tick, World.java:1927-1937)
             if rng.next_i32_bound(100_000) == 0 && self.is_raining() && self.is_thundering() {
@@ -3469,7 +3541,7 @@ mod tests {
         let mut world = make_flat_world();
         // The button is pressed: the bit 8 of the data.
         world.java_set_type_id_and_data(0, 64, 0, blocks::STONE_BUTTON, 1 | 8);
-        world.tick_random_blocks(&[(0.0, 0.0)], &mut entity_random);
+        world.tick_random_blocks(&[(0.0, 64.0, 0.0)], &mut entity_random);
         // The random tick picks the blocks of the chunk by their position,
         // so the tick of the button is done by hand.
         world.tick_button(0, 64, 0);
@@ -3499,7 +3571,7 @@ mod tests {
         let mut entity_random = JavaRandom::new(0);
         let mut world = make_flat_world();
         world.java_set_type_id(0, 64, 0, blocks::LOCKED_CHEST);
-        world.tick_random_blocks(&[(0.0, 0.0)], &mut entity_random);
+        world.tick_random_blocks(&[(0.0, 64.0, 0.0)], &mut entity_random);
         // The random tick picks the blocks of the chunk by their position,
         // so the tick of the chest is done by hand.
         world.java_set_type_id(0, 64, 0, blocks::LOCKED_CHEST);
@@ -3517,7 +3589,7 @@ mod tests {
         // The world without the blocks of the reference.
         let mut entity_random = JavaRandom::new(0);
         let mut plain = make_flat_world();
-        plain.tick_random_blocks(&[(0.0, 0.0)], &mut entity_random);
+        plain.tick_random_blocks(&[(0.0, 64.0, 0.0)], &mut entity_random);
         let plain_draws = plain.world_random.draws;
 
         // The world with the pumpkin, the lit pumpkin and the cake.
@@ -3526,7 +3598,7 @@ mod tests {
         world.java_set_type_id(0, 64, 0, blocks::PUMPKIN);
         world.java_set_type_id(1, 64, 0, blocks::JACK_O_LANTERN);
         world.java_set_type_id(2, 64, 0, blocks::CAKE);
-        world.tick_random_blocks(&[(0.0, 0.0)], &mut entity_random);
+        world.tick_random_blocks(&[(0.0, 64.0, 0.0)], &mut entity_random);
 
         // The three blocks do not override the method of the base class, so
         // the random tick draws nothing for them and leaves them alone.

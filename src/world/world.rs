@@ -212,6 +212,12 @@ pub struct World {
     /// instant-tick cascades (lava flow randomness). Kept here so the port
     /// mirrors the reference implementation.
     pub(crate) world_random: JavaRandom,
+    /// Java `World.Q`: the timer of the sound of the cave ✓.
+    ///
+    /// The reference draws it in the constructor of the world ✓
+    /// (`World.java:115` ✓) and counts it down once per tick ✓
+    /// (`World.java:1892-1893` ✓).
+    pub(crate) cave_sound_timer: i32,
     /// The seed of `world_random` (`world.random_seed` of the configuration).
     ///
     /// Java `World.java:51` takes the seed from the system clock; the port
@@ -510,6 +516,10 @@ impl World {
         let world_random_seed = crate::config::WorldRandomSeed::parse(&config.random_seed)
             .unwrap_or(crate::config::WorldRandomSeed::Fixed(0))
             .resolve();
+        // Java `World.java:115`: `this.Q = this.random.nextInt(12000);` — the
+        // timer of the sound of the cave ✓.
+        let mut world_random = JavaRandom::new(world_random_seed);
+        let cave_sound_timer = world_random.next_i32_bound(12000);
         let hell_generator = if is_hell {
             Some(HellGenerator::new(world_seed))
         } else {
@@ -551,8 +561,9 @@ impl World {
             _session_lock: lock,
             suppress_physics: false,
             insta_tick: false,
-            world_random: JavaRandom::new(world_random_seed),
+            world_random,
             world_random_seed,
+            cave_sound_timer,
             rain_intensity: std::cell::Cell::new(0.0),
             thunder_intensity: std::cell::Cell::new(0.0),
             fluid_sides: [[false; 4]; 2],
@@ -3997,6 +4008,16 @@ mod tests {
             });
         };
 
+        // Java `World.java:115`: the constructor of the world draws the
+        // timer of the sound of the cave ✓.  The trace of the port starts
+        // after the constructor ✓, so the draw is written by hand ✓ — the
+        // steps that follow show that the stream of the port is at the same
+        // place as the stream of the reference ✓.
+        let mut constructor = JavaRandom::new(12345);
+        constructor.trace = true;
+        let _timer = constructor.next_i32_bound(12000);
+        let raw = constructor.trace_values[0];
+        trace.push(format!("constructor 31:{raw}"));
         step("start", &mut world, &mut trace);
         for (id, metadata, name) in [
             (blocks::STONE, 0u8, "drop_stone"),
@@ -4044,10 +4065,34 @@ mod tests {
         };
         let mut world = World::new(config);
         assert_eq!(world.world_random_seed, 4242);
+        // The constructor of the world draws the timer of the sound of the
+        // cave (`World.java:115` ✓).
         let mut reference = JavaRandom::new(4242);
+        reference.next_i32_bound(12000);
         for _ in 0..8 {
             assert_eq!(world.world_random.next_i32(), reference.next_i32());
         }
+    }
+
+    /// The constructor of the world draws the timer of the sound of the cave.
+    ///
+    /// Java `World.java:115`: `this.Q = this.random.nextInt(12000);` — the
+    /// timer is drawn from the random of the world ✓, so the stream of the
+    /// world starts one number later ✓.
+    #[test]
+    fn the_world_draws_the_timer_of_the_sound_of_the_cave() {
+        let config = WorldConfig {
+            seed: 12345,
+            save_enabled: false,
+            random_seed: "fixed:12345".to_string(),
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        let mut reference = JavaRandom::new(12345);
+        // The timer is the first number of the stream of the world ✓, so the
+        // stream of the world is one number ahead of a fresh one ✓.
+        let _timer = reference.next_i32_bound(12000);
+        assert_eq!(world.world_random.next_i32(), reference.next_i32());
     }
 
     /// The height of the spawn is the height of the highest solid block of the

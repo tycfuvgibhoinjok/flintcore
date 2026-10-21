@@ -54,6 +54,11 @@ public class PoseidonWorldRandomTrace {
         out.printf("# world random trace, seed=%d%n", seed);
         out.printf("# step draws (bits:value)%n");
 
+        // Java `World.java:115`: the constructor of the world draws the
+        // timer of the sound of the cave ✓.
+        world.random.nextInt(12000);
+        step(out, "constructor");
+
         step(out, "start");
 
         // Java `Block.dropNaturally(World, int, int, int, int, float)`: the
