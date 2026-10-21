@@ -670,7 +670,7 @@ fn replay_poseidon_live() {
     let mut last_anchor = world.live_anchor(1);
     for p in &walk {
         world.live_player_move(1, p.0, p.1);
-        world.live_tick_ex(!no_unload);
+        world.live_tick_ex(!no_unload, &mut |_pos| Vec::new());
         if trace_frames {
             let anchor = world.live_anchor(1);
             if anchor != last_anchor {
@@ -698,7 +698,7 @@ fn replay_poseidon_live() {
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(771);
     while world.live_time() < target_time {
-        world.live_tick_ex(!no_unload);
+        world.live_tick_ex(!no_unload, &mut |_pos| Vec::new());
     }
     println!(
         "after ticks: time {}, {} chunks loaded",
@@ -806,10 +806,10 @@ fn controlled_live_spawn_parity() {
         (-20.0, -40.0),
     ] {
         world.live_player_move(1, wx, wz);
-        world.live_tick_ex(true);
+        world.live_tick_ex(true, &mut |_pos| Vec::new());
     }
     while world.live_time() < 300 {
-        world.live_tick_ex(true);
+        world.live_tick_ex(true, &mut |_pos| Vec::new());
     }
     println!(
         "FlintCore after 300 ticks: {} chunks loaded",
@@ -817,7 +817,7 @@ fn controlled_live_spawn_parity() {
     );
     world.live_player_quit(1);
     for _ in 0..200 {
-        world.live_unload_chunks();
+        world.live_unload_chunks(&mut |_pos| Vec::new());
     }
     world.save_all().unwrap();
 

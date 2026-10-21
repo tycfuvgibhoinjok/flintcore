@@ -16,6 +16,7 @@ use crate::world::decorate::GenWorld;
 use crate::world::generator::{Generator, HellGenerator};
 use crate::world::lighting::{LightType, LightingWorld};
 use crate::world::redstone::WorldEvent;
+use crate::world::storage::nbt::NbtTag;
 use crate::world::storage::{ChunkFileCache, ChunkLoader, LevelData, SessionLock};
 
 thread_local! {
@@ -199,6 +200,8 @@ pub struct World {
     pub(crate) packet_cache: RefCell<HashMap<ChunkPos, (PreChunk, MapChunk)>>,
     chunk_mgr: RefCell<WorldChunkManager>,
     storage: Option<RefCell<ChunkFileCache>>,
+    /// The entities of the chunks that were read from the disk (`S-01`).
+    pending_entities: Vec<(i32, NbtTag)>,
     pub(crate) level_data: RefCell<LevelData>,
     _session_lock: Option<SessionLock>,
     pub(crate) suppress_physics: bool,
@@ -523,6 +526,7 @@ impl World {
             packet_cache: RefCell::new(HashMap::new()),
             chunk_mgr,
             storage,
+            pending_entities: Vec::new(),
             level_data: RefCell::new(level),
             _session_lock: lock,
             suppress_physics: false,
@@ -791,14 +795,28 @@ impl World {
             Ok(Some(nbt)) => {
                 let mut c = ChunkLoader::chunk_from_nbt(&nbt).ok()?;
                 c.compact();
+                // Java `ChunkLoader.a(World, NBTTagCompound)`: the entities of
+                // the chunk are restored when the chunk is loaded.
+                for entity in ChunkLoader::entities_from_nbt(&nbt) {
+                    self.pending_entities.push((self.dimension, entity));
+                }
                 Some(c)
             }
             _ => None,
         }
     }
 
+    /// The entities of the chunks that were read from the disk.
+    pub fn take_pending_entities(&mut self) -> Vec<(i32, NbtTag)> {
+        std::mem::take(&mut self.pending_entities)
+    }
+
     /// Save one chunk to storage right away (used by chunk unloading).
-    pub(crate) fn write_chunk_to_storage(&mut self, pos: ChunkPos) -> Result<()> {
+    pub(crate) fn write_chunk_to_storage(
+        &mut self,
+        pos: ChunkPos,
+        entities: Vec<NbtTag>,
+    ) -> Result<()> {
         let Some(storage) = &self.storage else {
             return Ok(());
         };
@@ -809,7 +827,7 @@ impl World {
             return Ok(());
         }
         let time = self.level_data.borrow().time;
-        let nbt = ChunkLoader::chunk_to_nbt(chunk, time);
+        let nbt = ChunkLoader::chunk_to_nbt(chunk, time, entities);
         storage.borrow_mut().write_chunk(pos.x, pos.z, &nbt)?;
         self.chunks.get_mut(&pos).unwrap().dirty = false;
         Ok(())
@@ -831,7 +849,7 @@ impl World {
             let time = self.level_data.borrow().time;
             for (&pos, chunk) in &mut self.chunks {
                 if chunk.dirty {
-                    let nbt = ChunkLoader::chunk_to_nbt(chunk, time);
+                    let nbt = ChunkLoader::chunk_to_nbt(chunk, time, Vec::new());
                     storage.borrow_mut().write_chunk(pos.x, pos.z, &nbt)?;
                     chunk.dirty = false;
                 }
@@ -863,13 +881,18 @@ impl World {
     /// The file `level.dat` is not written here: the reference writes it
     /// when the server stops and by the command `save-all`
     /// (`MinecraftServer.saveChunks()`).
-    pub fn save_chunks_incremental(&mut self, max_chunks: usize) -> Result<usize> {
+    pub fn save_chunks_incremental(
+        &mut self,
+        max_chunks: usize,
+        entities: &mut dyn FnMut(ChunkPos) -> Vec<NbtTag>,
+    ) -> Result<usize> {
         let mut saved = 0usize;
         if let Some(storage) = &self.storage {
             let time = self.level_data.borrow().time;
             for (&pos, chunk) in &mut self.chunks {
                 if chunk.dirty {
-                    let nbt = ChunkLoader::chunk_to_nbt(chunk, time);
+                    let chunk_entities = entities(pos);
+                    let nbt = ChunkLoader::chunk_to_nbt(chunk, time, chunk_entities);
                     storage.borrow_mut().write_chunk(pos.x, pos.z, &nbt)?;
                     chunk.dirty = false;
                     saved += 1;
@@ -3936,7 +3959,7 @@ mod tests {
         world.ensure_chunk_base(ChunkPos::new(0, 0));
         world.java_set_type_id(0, 63, 0, blocks::STONE);
         world
-            .save_chunks_incremental(24)
+            .save_chunks_incremental(24, &mut |_pos| Vec::new())
             .expect("the chunks are saved");
         assert!(
             !temp_dir.join("level.dat").exists(),

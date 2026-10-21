@@ -146,6 +146,10 @@ async fn read_next_non_chunk_packet_id(stream: &mut TcpStream) -> u8 {
                 read_i16(stream).await,
             );
             continue;
+        } else if id == 4 {
+            // The time of the world (`Packet4UpdateTime`).
+            let _ = read_i64(stream).await;
+            continue;
         } else if id == 8 {
             let _ = read_i16(stream).await;
             continue;
@@ -592,6 +596,11 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
         read_bool(client).await,
     );
 
+    // The second packet of the time (`NetLoginHandler`: the time of the
+    // player is sent after the position of the player).
+    assert_eq!(read_u8(client).await, 4);
+    let _ = read_i64(client).await;
+
     // Consume initial WindowItems (104)
     assert_eq!(read_u8(client).await, 104);
     let _win_id = read_u8(client).await;
@@ -603,9 +612,12 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
         }
     }
 
-    // Consume initial UpdateHealth (8)
-    assert_eq!(read_u8(client).await, 8);
+    // The item in the hand (`EntityPlayer.a(Container, List)`): the packet
+    // of the slot of the hand follows the items of the inventory.
+    assert_eq!(read_u8(client).await, 103);
+    let _ = read_u8(client).await;
     let _ = read_i16(client).await;
+    let _item_id = read_i16(client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

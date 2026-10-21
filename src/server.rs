@@ -186,7 +186,9 @@ impl Server {
                 // Queue and immediately flush startup-only chunks outside the 128-block keep-spawn radius
                 world.queue_unwatched_chunks();
                 while !world.live.unload_queue.is_empty() {
-                    world.live_unload_chunks();
+                    // The store of the entities does not exist yet: the
+                    // chunks that are flushed here hold no entities.
+                    world.live_unload_chunks(&mut |_pos| Vec::new());
                 }
                 world.compact_all_chunks();
             }
@@ -354,7 +356,13 @@ impl Server {
         }
 
         if self.world.live_is_active() {
-            self.world.live_tick();
+            {
+                let seed = self.config.world.seed;
+                let world_uuid = crate::util::hash::world_uuid(seed);
+                let store = &self.entities;
+                self.world
+                    .live_tick(&mut |pos| store.chunk_entities_nbt(pos, 0, world_uuid, seed));
+            }
         } else {
             self.world.increment_time();
         }
@@ -370,7 +378,14 @@ impl Server {
         if self.nether.is_some() {
             self.with_dimension(-1, |s| {
                 if s.world.live_is_active() {
-                    s.world.live_tick();
+                    {
+                        let seed = s.config.world.seed;
+                        let world_uuid = crate::util::hash::world_uuid(seed);
+                        let store = &s.entities;
+                        s.world.live_tick(&mut |pos| {
+                            store.chunk_entities_nbt(pos, -1, world_uuid, seed)
+                        });
+                    }
                 } else {
                     s.world.increment_time();
                 }
@@ -440,10 +455,24 @@ impl Server {
                     .map(|player| self.player_store.player_to_nbt(player));
                 self.world.set_level_player(first_player);
                 let _ = self.world.save_level_data();
-                let _ = self.world.save_chunks_incremental(24);
+                // The entities of the chunks (`ChunkLoader.a(Chunk, World,
+                // NBTTagCompound)`).
+                let seed = self.config.world.seed;
+                let world_uuid = crate::util::hash::world_uuid(seed);
+                {
+                    let store = &self.entities;
+                    let _ = self.world.save_chunks_incremental(24, &mut |pos| {
+                        store.chunk_entities_nbt(pos, 0, world_uuid, seed)
+                    });
+                }
                 if self.nether.is_some() {
                     self.with_dimension(-1, |s| {
-                        let _ = s.world.save_chunks_incremental(24);
+                        let seed = s.config.world.seed;
+                        let world_uuid = crate::util::hash::world_uuid(seed);
+                        let store = &s.entities;
+                        let _ = s.world.save_chunks_incremental(24, &mut |pos| {
+                            store.chunk_entities_nbt(pos, -1, world_uuid, seed)
+                        });
                     });
                 }
             }
@@ -522,6 +551,11 @@ impl Server {
             }
         }
         self.tick_mob_spawners();
+
+        // Java `ChunkLoader.a(World, NBTTagCompound)`: the entities of the
+        // chunks that were loaded are restored before the entities are
+        // ticked.
+        self.restore_loaded_entities();
 
         // Tick boats, mobs, projectiles, primed TNTs, minecarts, paintings, and dropped items
         self.tick_boats();
@@ -9965,6 +9999,25 @@ impl Server {
         self.track_dropped_item(item_id);
     }
 
+    /// Java `ChunkLoader.a(World, NBTTagCompound)`: the entities of the
+    /// chunks that were read from the disk are restored.
+    fn restore_loaded_entities(&mut self) {
+        let pending = self.world.take_pending_entities();
+        if pending.is_empty() {
+            return;
+        }
+        let previous_dimension = self.entities.spawn_dimension;
+        // The random numbers of the entities come from the shared stream.
+        let mut rng = std::mem::replace(&mut self.entity_random, JavaRandom::new(0));
+        for (dimension, tag) in pending {
+            self.entities.spawn_dimension = dimension;
+            self.entities
+                .restore_entities(std::slice::from_ref(&tag), &mut rng);
+        }
+        self.entities.spawn_dimension = previous_dimension;
+        self.entity_random = rng;
+    }
+
     /// Java `Entity.a(ItemStack, float)`: the item appears at the position
     /// of the entity, without any spread and without any speed.
     fn spawn_dropped_item_at(
@@ -14030,6 +14083,149 @@ mod tests {
         );
         assert_eq!(item.pickup_delay, 40, "the delay of the pick-up");
         assert_eq!(item.mot_y, 0.20000000298023224, "the speed of the item");
+    }
+
+    /// The entities are saved in the chunk and restored.
+    ///
+    /// Java `ChunkLoader.a(Chunk, World, NBTTagCompound)`: the entities of
+    /// the chunk are written into the list `Entities`; the reading is
+    /// `ChunkLoader.a(World, NBTTagCompound)`.
+    #[test]
+    fn the_entities_are_saved_in_the_chunk_and_restored() {
+        use crate::entity::mob::MobType;
+        use crate::entity::projectile::ProjectileKind;
+        use crate::entity::store::EntityStore;
+        use crate::util::rng::JavaRandom;
+        use crate::world::chunk::{Chunk, ChunkPos};
+        use crate::world::storage::ChunkLoader;
+
+        let mut store = EntityStore::new();
+        let mut rng = JavaRandom::new(12345);
+        store.spawn_mob(MobType::Pig, 2.5, 64.0, 2.5, &mut rng);
+        store.spawn_dropped_item(
+            ItemStack::new(items::APPLE, 3, 0),
+            3.5,
+            64.0,
+            2.5,
+            0.0,
+            0.0,
+            0.0,
+            0,
+        );
+        store.spawn_boat(4.5, 64.0, 2.5);
+        store.spawn_primed_tnt(5.5, 64.0, 2.5, 80, 0.0);
+        store.spawn_minecart(0, 6.5, 64.0, 2.5);
+        store.spawn_projectile(
+            ProjectileKind::Arrow,
+            None,
+            false,
+            true,
+            7.5,
+            64.0,
+            2.5,
+            0.0,
+            0.0,
+            0.0,
+        );
+
+        let world_uuid = crate::util::hash::world_uuid(12345);
+        let map = store.all_entities_nbt(world_uuid, 12345);
+        let entities = map
+            .get(&(0, ChunkPos::new(0, 0)))
+            .cloned()
+            .expect("the entities of the chunk");
+        assert_eq!(entities.len(), 6, "the entities of the chunk");
+
+        // The names of the types are the names of the table `EntityTypes`.
+        let names: Vec<&str> = entities
+            .iter()
+            .filter_map(|tag| tag.get_str("id"))
+            .collect();
+        assert!(names.contains(&"Pig"), "the pig: {names:?}");
+        assert!(names.contains(&"Item"), "the item: {names:?}");
+        assert!(names.contains(&"Boat"), "the boat: {names:?}");
+        assert!(names.contains(&"PrimedTnt"), "the TNT: {names:?}");
+        assert!(names.contains(&"Minecart"), "the minecart: {names:?}");
+        assert!(names.contains(&"Arrow"), "the arrow: {names:?}");
+
+        // The chunk holds the entities.
+        let chunk = Chunk::new(ChunkPos::new(0, 0));
+        let nbt = ChunkLoader::chunk_to_nbt(&chunk, 100, entities.clone());
+        let restored = ChunkLoader::entities_from_nbt(&nbt);
+        assert_eq!(restored.len(), entities.len(), "the list of the entities");
+
+        // The entities are restored.
+        let mut restored_store = EntityStore::new();
+        let mut rng = JavaRandom::new(12345);
+        let ids = restored_store.restore_entities(&restored, &mut rng);
+        assert_eq!(ids.len(), entities.len(), "the restored entities");
+
+        let pig = restored_store.iter_mobs().next().expect("the pig");
+        assert_eq!(pig.mob_type, MobType::Pig);
+        assert_eq!(pig.x, 2.5);
+        assert_eq!(pig.y, 64.0);
+        assert_eq!(pig.z, 2.5);
+        assert_eq!(pig.health, 10, "the health of the pig");
+
+        let item = restored_store
+            .iter_dropped_items()
+            .next()
+            .expect("the dropped item");
+        assert_eq!(item.item.id, items::APPLE);
+        assert_eq!(item.item.count, 3);
+        assert_eq!(item.x, 3.5);
+
+        let boat = restored_store.iter_boats().next().expect("the boat");
+        assert_eq!(boat.x, 4.5);
+        assert_eq!(boat.y, 64.0 + 0.30000001192092896, "the height of the boat");
+
+        let tnt = restored_store
+            .iter_primed_tnts()
+            .next()
+            .expect("the primed TNT");
+        assert_eq!(tnt.fuse, 80, "the fuse of the primed TNT");
+        assert_eq!(tnt.x, 5.5);
+
+        let cart = restored_store
+            .iter_minecarts()
+            .next()
+            .expect("the minecart");
+        assert_eq!(cart.x, 6.5);
+        assert_eq!(cart.cart_type, 0);
+
+        let arrow = restored_store.iter_projectiles().next().expect("the arrow");
+        assert_eq!(arrow.kind, ProjectileKind::Arrow);
+        assert_eq!(arrow.x, 7.5);
+        assert!(arrow.from_player, "the arrow of the player");
+    }
+
+    /// The entities of the chunk are in the order of the slices and of the
+    /// insertion.
+    ///
+    /// Java `ChunkLoader.a(Chunk, World, NBTTagCompound)`: the reference
+    /// walks the slices of the chunk from the bottom to the top.
+    #[test]
+    fn the_entities_of_the_chunk_are_ordered_by_the_slices() {
+        use crate::entity::mob::MobType;
+        use crate::entity::store::EntityStore;
+        use crate::util::rng::JavaRandom;
+
+        let mut store = EntityStore::new();
+        let mut rng = JavaRandom::new(12345);
+        // A mob high up and a mob on the ground.
+        store.spawn_mob(MobType::Pig, 2.5, 200.0, 2.5, &mut rng);
+        store.spawn_mob(MobType::Cow, 3.5, 64.0, 2.5, &mut rng);
+
+        let world_uuid = crate::util::hash::world_uuid(12345);
+        let map = store.all_entities_nbt(world_uuid, 12345);
+        let entities = map
+            .get(&(0, crate::world::chunk::ChunkPos::new(0, 0)))
+            .cloned()
+            .expect("the entities of the chunk");
+        assert_eq!(entities.len(), 2);
+        // The mob on the ground is in the first slice.
+        let first = entities[0].get_str("id").expect("the name of the type");
+        assert_eq!(first, "Cow", "the mob of the lower slice comes first");
     }
 
     /// The mobs push each other away.

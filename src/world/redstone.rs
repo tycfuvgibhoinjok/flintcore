@@ -3769,7 +3769,7 @@ mod tests {
         for _ in 0..35 {
             world.active_detector_rails.clear();
             world.tick_single_minecart(&mut cart);
-            world.live_tick_ex(false);
+            world.live_tick_ex(false, &mut |_pos| Vec::new());
             assert_ne!(
                 world.get_data(5, 64, 5) & 8,
                 0,
@@ -3780,7 +3780,7 @@ mod tests {
         // Now move the minecart off the detector rail and advance 25 ticks -> detector rail must turn OFF
         world.active_detector_rails.clear();
         for _ in 0..25 {
-            world.live_tick_ex(false);
+            world.live_tick_ex(false, &mut |_pos| Vec::new());
         }
         assert_eq!(
             world.get_data(5, 64, 5) & 8,
@@ -3811,7 +3811,7 @@ mod tests {
             "Furnace minecart with fuel and push_x should propel itself along the track"
         );
 
-        let nbt = powered.to_nbt();
+        let nbt = powered.to_nbt((1, 2), (3, 4));
         let restored = Minecart::from_nbt(10, &nbt).expect("valid Minecart NBT");
         assert_eq!(restored.cart_type, 2);
         assert_eq!(restored.fuel, powered.fuel);

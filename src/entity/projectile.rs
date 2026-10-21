@@ -48,6 +48,12 @@ pub struct Projectile {
     /// Java `EntityArrow.shake`: the arrow that hit a block shakes for seven
     /// ticks, it can only be picked up when the counter is zero.
     pub shake: i32,
+    /// Java `EntityArrow.d`: the block the arrow is in.
+    pub x_tile: i32,
+    pub y_tile: i32,
+    pub z_tile: i32,
+    /// Java `EntityArrow.g`: the identifier of the block the arrow is in.
+    pub in_tile: i32,
     pub ticks_in_ground: i32,
     pub ticks_in_air: i32,
     pub catch_ticks: i32,
@@ -63,6 +69,79 @@ impl Projectile {
 
     pub fn in_water_or_catching(&self) -> bool {
         self.catch_ticks > 0
+    }
+
+    /// Java `EntityArrow.b(NBTTagCompound)` and `EntitySnowball.b(...)`.
+    pub fn to_nbt(&self, world_uuid: (i64, i64), entity_uuid: (i64, i64)) -> NbtTag {
+        let id = match self.kind {
+            ProjectileKind::Arrow => "Arrow",
+            ProjectileKind::Snowball => "Snowball",
+            // The egg and the fireball are not in the table `EntityTypes`,
+            // the reference does not save them.
+            _ => "Arrow",
+        };
+        let base = crate::entity::save::BaseEntity {
+            id,
+            pos: (self.x, self.y, self.z),
+            motion: (self.mot_x, self.mot_y, self.mot_z),
+            rotation: (self.yaw, self.pitch),
+            fall_distance: 0.0,
+            fire_ticks: 0,
+            air_ticks: 300,
+            on_ground: self.in_ground,
+        };
+        let mut tag = NbtTag::compound();
+        base.write(&mut tag, world_uuid, entity_uuid);
+        tag.insert("xTile", NbtTag::Short(self.x_tile as i16));
+        tag.insert("yTile", NbtTag::Short(self.y_tile as i16));
+        tag.insert("zTile", NbtTag::Short(self.z_tile as i16));
+        tag.insert("inTile", NbtTag::Byte(self.in_tile as i8));
+        tag.insert("shake", NbtTag::Byte(self.shake as i8));
+        tag.insert("inGround", NbtTag::Byte(i8::from(self.in_ground)));
+        tag.insert("player", NbtTag::Byte(i8::from(self.from_player)));
+        tag
+    }
+
+    /// Java `EntityArrow.a(NBTTagCompound)`: the reading of the projectile.
+    pub fn from_nbt(entity_id: i32, kind: ProjectileKind, tag: &NbtTag) -> Option<Self> {
+        let id = match kind {
+            ProjectileKind::Arrow => "Arrow",
+            ProjectileKind::Snowball => "Snowball",
+            _ => return None,
+        };
+        if tag.get_str("id")? != id {
+            return None;
+        }
+        let base = crate::entity::save::BaseEntity::read(tag, id)?;
+        Some(Self {
+            entity_id,
+            kind,
+            shooter_id: None,
+            shooter_is_skeleton: false,
+            x: base.pos.0,
+            y: base.pos.1,
+            z: base.pos.2,
+            mot_x: base.motion.0,
+            mot_y: base.motion.1,
+            mot_z: base.motion.2,
+            accel_x: 0.0,
+            accel_y: 0.0,
+            accel_z: 0.0,
+            yaw: base.rotation.0,
+            pitch: base.rotation.1,
+            in_ground: base.on_ground,
+            shake: tag.get_i8("shake").unwrap_or(0) as i32,
+            x_tile: tag.get_i16("xTile").unwrap_or(0) as i32,
+            y_tile: tag.get_i16("yTile").unwrap_or(0) as i32,
+            z_tile: tag.get_i16("zTile").unwrap_or(0) as i32,
+            in_tile: tag.get_i8("inTile").unwrap_or(0) as i32,
+            ticks_in_ground: 0,
+            ticks_in_air: 0,
+            catch_ticks: 0,
+            hooked_entity: None,
+            from_player: tag.get_bool("player").unwrap_or(false),
+            dead: false,
+        })
     }
 }
 
@@ -83,6 +162,45 @@ pub struct PrimedTnt {
 impl PrimedTnt {
     pub fn chunk_pos(&self) -> ChunkPos {
         ChunkPos::new((self.x.floor() as i32) >> 4, (self.z.floor() as i32) >> 4)
+    }
+
+    /// Java `EntityTNTPrimed.b(NBTTagCompound)`: the tags of the primed TNT.
+    pub fn to_nbt(&self, world_uuid: (i64, i64), entity_uuid: (i64, i64)) -> NbtTag {
+        let base = crate::entity::save::BaseEntity {
+            id: "PrimedTnt",
+            pos: (self.x, self.y, self.z),
+            motion: (self.mot_x, self.mot_y, self.mot_z),
+            rotation: (0.0, 0.0),
+            fall_distance: 0.0,
+            fire_ticks: 0,
+            air_ticks: 300,
+            on_ground: self.on_ground,
+        };
+        let mut tag = NbtTag::compound();
+        base.write(&mut tag, world_uuid, entity_uuid);
+        tag.insert("Fuse", NbtTag::Byte(self.fuse as i8));
+        tag
+    }
+
+    /// Java `EntityTNTPrimed.a(NBTTagCompound)`: the reading of the primed
+    /// TNT.
+    pub fn from_nbt(entity_id: i32, tag: &NbtTag) -> Option<Self> {
+        if tag.get_str("id")? != "PrimedTnt" {
+            return None;
+        }
+        let base = crate::entity::save::BaseEntity::read(tag, "PrimedTnt")?;
+        Some(Self {
+            entity_id,
+            x: base.pos.0,
+            y: base.pos.1,
+            z: base.pos.2,
+            mot_x: base.motion.0,
+            mot_y: base.motion.1,
+            mot_z: base.motion.2,
+            fuse: tag.get_i8("Fuse").unwrap_or(80) as i32,
+            on_ground: base.on_ground,
+            dead: false,
+        })
     }
 }
 
@@ -222,33 +340,19 @@ impl Minecart {
     }
 
     /// Java `EntityMinecart.b(NBTTagCompound)` (`EntityMinecart.java:658-679`).
-    pub fn to_nbt(&self) -> NbtTag {
+    pub fn to_nbt(&self, world_uuid: (i64, i64), entity_uuid: (i64, i64)) -> NbtTag {
+        let base = crate::entity::save::BaseEntity {
+            id: "Minecart",
+            pos: (self.x, self.y, self.z),
+            motion: (self.mot_x, self.mot_y, self.mot_z),
+            rotation: (self.yaw, self.pitch),
+            fall_distance: self.fall_distance,
+            fire_ticks: self.fire_ticks,
+            air_ticks: 300,
+            on_ground: self.on_ground,
+        };
         let mut tag = NbtTag::compound();
-        tag.insert("id", NbtTag::String("Minecart".to_string()));
-        tag.insert(
-            "Pos",
-            NbtTag::List(vec![
-                NbtTag::Double(self.x),
-                NbtTag::Double(self.y),
-                NbtTag::Double(self.z),
-            ]),
-        );
-        tag.insert(
-            "Motion",
-            NbtTag::List(vec![
-                NbtTag::Double(self.mot_x),
-                NbtTag::Double(self.mot_y),
-                NbtTag::Double(self.mot_z),
-            ]),
-        );
-        tag.insert(
-            "Rotation",
-            NbtTag::List(vec![NbtTag::Float(self.yaw), NbtTag::Float(self.pitch)]),
-        );
-        tag.insert("FallDistance", NbtTag::Float(self.fall_distance));
-        tag.insert("Fire", NbtTag::Short(self.fire_ticks as i16));
-        tag.insert("Air", NbtTag::Short(300));
-        tag.insert("OnGround", NbtTag::Byte(i8::from(self.on_ground)));
+        base.write(&mut tag, world_uuid, entity_uuid);
         tag.insert("Type", NbtTag::Int(self.cart_type as i32));
         if self.cart_type == 2 {
             tag.insert("PushX", NbtTag::Double(self.push_x));
@@ -276,53 +380,24 @@ impl Minecart {
         if tag.get_str("id")? != "Minecart" {
             return None;
         }
-        let pos = tag.get_list("Pos")?;
-        if pos.len() < 3 {
+        // The position is read by the base tags (`Entity.e(NBTTagCompound)`).
+        if tag.get_list("Pos").map(|pos| pos.len()) != Some(3) {
             return None;
         }
-        let x = match pos[0] {
-            NbtTag::Double(v) => v,
-            _ => return None,
-        };
-        let y = match pos[1] {
-            NbtTag::Double(v) => v,
-            _ => return None,
-        };
-        let z = match pos[2] {
-            NbtTag::Double(v) => v,
-            _ => return None,
-        };
         let cart_type = (tag.get_i32("Type").unwrap_or(0) as u8).min(2);
-        let mut cart = Self::new(entity_id, cart_type, x, y - MINECART_HEIGHT_OFFSET, z);
-        cart.y = y;
-        cart.last_y = y;
-        if let Some(mot) = tag.get_list("Motion") {
-            if mot.len() >= 3 {
-                if let NbtTag::Double(vx) = mot[0] {
-                    cart.mot_x = vx;
-                }
-                if let NbtTag::Double(vy) = mot[1] {
-                    cart.mot_y = vy;
-                }
-                if let NbtTag::Double(vz) = mot[2] {
-                    cart.mot_z = vz;
-                }
-            }
-        }
-        if let Some(rot) = tag.get_list("Rotation") {
-            if rot.len() >= 2 {
-                if let NbtTag::Float(yw) = rot[0] {
-                    cart.yaw = yw;
-                    cart.last_yaw = yw;
-                }
-                if let NbtTag::Float(pt) = rot[1] {
-                    cart.pitch = pt;
-                }
-            }
-        }
-        cart.fall_distance = tag.get_f32("FallDistance").unwrap_or(0.0);
-        cart.fire_ticks = tag.get_i16("Fire").unwrap_or(0) as i32;
-        cart.on_ground = tag.get_i8("OnGround").unwrap_or(0) != 0;
+        let base = crate::entity::save::BaseEntity::read(tag, "Minecart")?;
+        let mut cart = Self::new(entity_id, cart_type, base.pos.0, base.pos.1, base.pos.2);
+        cart.y = base.pos.1;
+        cart.last_y = base.pos.1;
+        cart.mot_x = base.motion.0;
+        cart.mot_y = base.motion.1;
+        cart.mot_z = base.motion.2;
+        cart.yaw = base.rotation.0;
+        cart.last_yaw = base.rotation.0;
+        cart.pitch = base.rotation.1;
+        cart.fall_distance = base.fall_distance;
+        cart.fire_ticks = base.fire_ticks;
+        cart.on_ground = base.on_ground;
         if cart_type == 2 {
             cart.push_x = tag.get_f64("PushX").unwrap_or(0.0);
             cart.push_z = tag.get_f64("PushZ").unwrap_or(0.0);
@@ -361,6 +436,56 @@ pub struct Painting {
 impl Painting {
     pub fn chunk_pos(&self) -> ChunkPos {
         ChunkPos::new(self.x >> 4, self.z >> 4)
+    }
+
+    /// Java `EntityPainting.b(NBTTagCompound)`: the tags of the painting.
+    pub fn to_nbt(&self, world_uuid: (i64, i64), entity_uuid: (i64, i64)) -> NbtTag {
+        // The position of the painting is the centre of its box
+        // (`EntityPainting.b(int)`).
+        let (bounds, _) =
+            Self::bounds_and_wall_blocks(self.x, self.y, self.z, self.direction, &self.title);
+        let base = crate::entity::save::BaseEntity {
+            id: "Painting",
+            pos: (
+                (bounds.0 + bounds.3) / 2.0,
+                (bounds.1 + bounds.4) / 2.0,
+                (bounds.2 + bounds.5) / 2.0,
+            ),
+            motion: (0.0, 0.0, 0.0),
+            rotation: ((self.direction * 90) as f32, 0.0),
+            fall_distance: 0.0,
+            fire_ticks: 0,
+            air_ticks: 300,
+            on_ground: false,
+        };
+        let mut tag = NbtTag::compound();
+        base.write(&mut tag, world_uuid, entity_uuid);
+        tag.insert("Dir", NbtTag::Byte(self.direction as i8));
+        tag.insert("Motive", NbtTag::String(self.title.clone()));
+        tag.insert("TileX", NbtTag::Int(self.x));
+        tag.insert("TileY", NbtTag::Int(self.y));
+        tag.insert("TileZ", NbtTag::Int(self.z));
+        tag
+    }
+
+    /// Java `EntityPainting.a(NBTTagCompound)`: the reading of the painting.
+    pub fn from_nbt(entity_id: i32, tag: &NbtTag) -> Option<Self> {
+        if tag.get_str("id")? != "Painting" {
+            return None;
+        }
+        // The position is read by the base tags (`Entity.e(NBTTagCompound)`).
+        let _base = crate::entity::save::BaseEntity::read(tag, "Painting")?;
+        let title = tag.get_str("Motive").unwrap_or("Kebab").to_string();
+        Some(Self {
+            entity_id,
+            title,
+            x: tag.get_i32("TileX")?,
+            y: tag.get_i32("TileY")?,
+            z: tag.get_i32("TileZ")?,
+            direction: tag.get_i8("Dir").unwrap_or(0) as i32,
+            tick_count: 0,
+            dead: false,
+        })
     }
 
     pub fn art_pixel_size(title: &str) -> (i32, i32) {

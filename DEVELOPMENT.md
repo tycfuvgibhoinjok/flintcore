@@ -466,6 +466,11 @@ Mob movement parity harness:
   - The arrow of the reference checks the hit along the segment of the
     movement, the arrow that hit a block shakes for seven ticks and the
     fireball does no direct damage.
+  - The entities are saved in the chunk: the list `Entities` holds them in
+    the layout of the reference (the name of the type, the tags of
+    `Entity.d()` and the tags of the type). The entities appear in the
+    world when the chunk is loaded. The egg and the fireball are not saved
+    — they are not in the table `EntityTypes`.
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.

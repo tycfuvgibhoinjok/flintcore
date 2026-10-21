@@ -7,6 +7,7 @@ use crate::gameplay::items::ItemStack;
 use crate::net::ConnId;
 use crate::util::rng::JavaRandom;
 use crate::world::chunk::ChunkPos;
+use crate::world::storage::nbt::NbtTag;
 
 #[derive(Debug, Clone)]
 pub struct DroppedItem {
@@ -28,6 +29,50 @@ pub struct DroppedItem {
 impl DroppedItem {
     pub fn chunk_pos(&self) -> ChunkPos {
         ChunkPos::new((self.x as i32) >> 4, (self.z as i32) >> 4)
+    }
+
+    /// Java `EntityItem.b(NBTTagCompound)`: the tags of the dropped item.
+    pub fn to_nbt(&self, world_uuid: (i64, i64), entity_uuid: (i64, i64)) -> NbtTag {
+        let base = crate::entity::save::BaseEntity {
+            id: "Item",
+            pos: (self.x, self.y, self.z),
+            motion: (self.mot_x, self.mot_y, self.mot_z),
+            rotation: (0.0, 0.0),
+            fall_distance: 0.0,
+            fire_ticks: 0,
+            air_ticks: 300,
+            on_ground: self.on_ground,
+        };
+        let mut tag = NbtTag::compound();
+        base.write(&mut tag, world_uuid, entity_uuid);
+        tag.insert("Health", NbtTag::Short(self.health as i8 as i16));
+        tag.insert("Age", NbtTag::Short(self.age as i16));
+        tag.insert("Item", crate::entity::save::item_to_nbt(&self.item));
+        tag
+    }
+
+    /// Java `EntityItem.a(NBTTagCompound)`: the reading of the dropped item.
+    pub fn from_nbt(entity_id: i32, tag: &NbtTag) -> Option<Self> {
+        if tag.get_str("id")? != "Item" {
+            return None;
+        }
+        let base = crate::entity::save::BaseEntity::read(tag, "Item")?;
+        let item = crate::entity::save::item_from_nbt(tag.get("Item")?)?;
+        Some(Self {
+            entity_id,
+            item,
+            x: base.pos.0,
+            y: base.pos.1,
+            z: base.pos.2,
+            mot_x: base.motion.0,
+            mot_y: base.motion.1,
+            mot_z: base.motion.2,
+            on_ground: base.on_ground,
+            age: tag.get_i16("Age").unwrap_or(0) as i32,
+            pickup_delay: 0,
+            health: tag.get_i16("Health").unwrap_or(5),
+            dead: false,
+        })
     }
 }
 
@@ -62,6 +107,51 @@ impl Boat {
     pub fn mounted_y_offset(&self) -> f64 {
         -0.30000001192092896
     }
+
+    /// Java `EntityBoat.b(NBTTagCompound)`: the boat has no tags of its own.
+    pub fn to_nbt(&self, world_uuid: (i64, i64), entity_uuid: (i64, i64)) -> NbtTag {
+        let base = crate::entity::save::BaseEntity {
+            id: "Boat",
+            pos: (self.x, self.y, self.z),
+            motion: (self.mot_x, self.mot_y, self.mot_z),
+            rotation: (self.yaw, self.pitch),
+            fall_distance: 0.0,
+            fire_ticks: 0,
+            air_ticks: 300,
+            on_ground: self.on_ground,
+        };
+        let mut tag = NbtTag::compound();
+        base.write(&mut tag, world_uuid, entity_uuid);
+        tag
+    }
+
+    /// Java `EntityBoat.a(NBTTagCompound)`: the reading of the boat.
+    pub fn from_nbt(entity_id: i32, tag: &NbtTag) -> Option<Self> {
+        if tag.get_str("id")? != "Boat" {
+            return None;
+        }
+        let base = crate::entity::save::BaseEntity::read(tag, "Boat")?;
+        Some(Self {
+            entity_id,
+            x: base.pos.0,
+            y: base.pos.1,
+            z: base.pos.2,
+            prev_x: base.pos.0,
+            prev_y: base.pos.1,
+            prev_z: base.pos.2,
+            mot_x: base.motion.0,
+            mot_y: base.motion.1,
+            mot_z: base.motion.2,
+            yaw: base.rotation.0,
+            pitch: base.rotation.1,
+            damage: 0,
+            time_since_hit: 0,
+            rock_direction: 1,
+            passenger_id: None,
+            on_ground: base.on_ground,
+            dead: false,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +183,17 @@ pub struct EntityStore {
     pub spawn_dimension: i32,
 }
 
+/// The entities of one chunk: the slice of the chunk, the identifier of the
+/// entity and the tags of the entity.
+type ChunkEntities = Vec<(u8, i32, NbtTag)>;
+
+/// Java `Chunk.a(Entity)`: the slice of the chunk the entity is in (the
+/// height of the entity divided by sixteen, eight slices).
+fn entity_slice(y: f64) -> u8 {
+    let slice = (y / 16.0).floor() as i32;
+    slice.clamp(0, 7) as u8
+}
+
 impl EntityStore {
     pub fn new() -> Self {
         Self {
@@ -111,6 +212,197 @@ impl EntityStore {
             dimensions: HashMap::new(),
             spawn_dimension: 0,
         }
+    }
+
+    /// Java `ChunkLoader.a(Chunk, World, NBTTagCompound)`: the entities of the
+    /// chunk are written into the list `Entities`.
+    ///
+    /// The reference walks the slices of the chunk from the bottom to the top
+    /// and the entities of a slice in the order of their insertion; the
+    /// identifier of an entity grows with the order of the insertion, so the
+    /// order of the identifiers reproduces that order.
+    pub fn all_entities_nbt(
+        &self,
+        world_uuid: (i64, i64),
+        seed: i64,
+    ) -> HashMap<(i32, ChunkPos), Vec<NbtTag>> {
+        let mut map: HashMap<(i32, ChunkPos), ChunkEntities> = HashMap::new();
+
+        for mob in &self.mobs {
+            if mob.dead {
+                continue;
+            }
+            let uuid = crate::util::hash::entity_uuid(seed, mob.entity_id);
+            let tag = mob.to_nbt(world_uuid, uuid);
+            map.entry((self.dimension_of(mob.entity_id), mob.chunk_pos()))
+                .or_default()
+                .push((entity_slice(mob.y), mob.entity_id, tag));
+        }
+
+        for item in self.dropped_items.values() {
+            if item.dead {
+                continue;
+            }
+            let uuid = crate::util::hash::entity_uuid(seed, item.entity_id);
+            let tag = item.to_nbt(world_uuid, uuid);
+            map.entry((self.dimension_of(item.entity_id), item.chunk_pos()))
+                .or_default()
+                .push((entity_slice(item.y), item.entity_id, tag));
+        }
+
+        for boat in self.boats.values() {
+            if boat.dead {
+                continue;
+            }
+            let uuid = crate::util::hash::entity_uuid(seed, boat.entity_id);
+            let tag = boat.to_nbt(world_uuid, uuid);
+            map.entry((self.dimension_of(boat.entity_id), boat.chunk_pos()))
+                .or_default()
+                .push((entity_slice(boat.y), boat.entity_id, tag));
+        }
+
+        for tnt in self.primed_tnts.values() {
+            if tnt.dead {
+                continue;
+            }
+            let uuid = crate::util::hash::entity_uuid(seed, tnt.entity_id);
+            let tag = tnt.to_nbt(world_uuid, uuid);
+            map.entry((self.dimension_of(tnt.entity_id), tnt.chunk_pos()))
+                .or_default()
+                .push((entity_slice(tnt.y), tnt.entity_id, tag));
+        }
+
+        for cart in self.minecarts.values() {
+            let uuid = crate::util::hash::entity_uuid(seed, cart.entity_id);
+            let tag = cart.to_nbt(world_uuid, uuid);
+            map.entry((self.dimension_of(cart.entity_id), cart.chunk_pos()))
+                .or_default()
+                .push((entity_slice(cart.y), cart.entity_id, tag));
+        }
+
+        for proj in self.projectiles.values() {
+            if proj.dead {
+                continue;
+            }
+            // The egg and the fireball are not in the table `EntityTypes`:
+            // the reference does not save them.
+            if !matches!(proj.kind, ProjectileKind::Arrow | ProjectileKind::Snowball) {
+                continue;
+            }
+            let uuid = crate::util::hash::entity_uuid(seed, proj.entity_id);
+            let tag = proj.to_nbt(world_uuid, uuid);
+            map.entry((self.dimension_of(proj.entity_id), proj.chunk_pos()))
+                .or_default()
+                .push((entity_slice(proj.y), proj.entity_id, tag));
+        }
+
+        for painting in self.paintings.values() {
+            if painting.dead {
+                continue;
+            }
+            let uuid = crate::util::hash::entity_uuid(seed, painting.entity_id);
+            let tag = painting.to_nbt(world_uuid, uuid);
+            map.entry((self.dimension_of(painting.entity_id), painting.chunk_pos()))
+                .or_default()
+                .push((entity_slice(painting.y as f64), painting.entity_id, tag));
+        }
+
+        // The order of the slices and of the insertion.
+        for entities in map.values_mut() {
+            entities.sort_by_key(|(slice, id, _)| (*slice, *id));
+        }
+        map.into_iter()
+            .map(|(key, entities)| (key, entities.into_iter().map(|(_, _, tag)| tag).collect()))
+            .collect()
+    }
+
+    /// Java `ChunkLoader.a(Chunk, World, NBTTagCompound)`: the entities of the
+    /// chunk of the dimension.
+    pub fn chunk_entities_nbt(
+        &self,
+        pos: ChunkPos,
+        dimension: i32,
+        world_uuid: (i64, i64),
+        seed: i64,
+    ) -> Vec<NbtTag> {
+        self.all_entities_nbt(world_uuid, seed)
+            .remove(&(dimension, pos))
+            .unwrap_or_default()
+    }
+
+    /// Java `ChunkLoader.a(World, NBTTagCompound)`: the entities of the chunk
+    /// are restored.
+    pub fn restore_entities(&mut self, tags: &[NbtTag], rng: &mut JavaRandom) -> Vec<i32> {
+        let mut restored = Vec::new();
+        for tag in tags {
+            let Some(name) = tag.get_str("id") else {
+                continue;
+            };
+            match name {
+                "Item" => {
+                    let id = self.allocate_id();
+                    if let Some(item) = DroppedItem::from_nbt(id, tag) {
+                        self.dropped_items.insert(id, item);
+                        self.tag_spawned(id);
+                        restored.push(id);
+                    }
+                }
+                "Boat" => {
+                    let id = self.allocate_id();
+                    if let Some(boat) = Boat::from_nbt(id, tag) {
+                        self.boats.insert(id, boat);
+                        self.tag_spawned(id);
+                        restored.push(id);
+                    }
+                }
+                "PrimedTnt" => {
+                    let id = self.allocate_id();
+                    if let Some(tnt) = PrimedTnt::from_nbt(id, tag) {
+                        self.primed_tnts.insert(id, tnt);
+                        self.tag_spawned(id);
+                        restored.push(id);
+                    }
+                }
+                "Minecart" => {
+                    let id = self.allocate_id();
+                    if let Some(cart) = Minecart::from_nbt(id, tag) {
+                        self.minecarts.insert(id, cart);
+                        self.tag_spawned(id);
+                        restored.push(id);
+                    }
+                }
+                "Arrow" | "Snowball" => {
+                    let kind = if name == "Arrow" {
+                        ProjectileKind::Arrow
+                    } else {
+                        ProjectileKind::Snowball
+                    };
+                    let id = self.allocate_id();
+                    if let Some(proj) = Projectile::from_nbt(id, kind, tag) {
+                        self.projectiles.insert(id, proj);
+                        self.tag_spawned(id);
+                        restored.push(id);
+                    }
+                }
+                "Painting" => {
+                    let id = self.allocate_id();
+                    if let Some(painting) = Painting::from_nbt(id, tag) {
+                        self.paintings.insert(id, painting);
+                        self.tag_spawned(id);
+                        restored.push(id);
+                    }
+                }
+                _ => {
+                    // The mobs: the name of the type is the name of the mob.
+                    let id = self.allocate_id();
+                    if let Some(mob) = Mob::from_nbt(id, tag, rng) {
+                        self.insert_mob(mob);
+                        restored.push(id);
+                    }
+                }
+            }
+        }
+        restored
     }
 
     pub fn allocate_id(&mut self) -> i32 {
@@ -485,6 +777,10 @@ impl EntityStore {
             pitch: 0.0,
             in_ground: false,
             shake: 0,
+            x_tile: 0,
+            y_tile: 0,
+            z_tile: 0,
+            in_tile: 0,
             ticks_in_ground: 0,
             ticks_in_air: 0,
             catch_ticks: 0,

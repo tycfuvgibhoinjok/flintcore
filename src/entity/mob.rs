@@ -1195,37 +1195,28 @@ impl Mob {
         drops
     }
 
-    pub fn to_nbt(&self) -> NbtTag {
+    /// Java `Entity.c(NBTTagCompound)`: the mob in the NBT.
+    ///
+    /// The tags of `Entity.d(NBTTagCompound)` and of
+    /// `EntityLiving.b(NBTTagCompound)`.
+    pub fn to_nbt(&self, world_uuid: (i64, i64), entity_uuid: (i64, i64)) -> NbtTag {
+        let base = crate::entity::save::BaseEntity {
+            id: self.mob_type.nbt_id(),
+            pos: (self.x, self.y + self.step_offset as f64, self.z),
+            motion: (self.mot_x, self.mot_y, self.mot_z),
+            rotation: (self.yaw, self.pitch),
+            fall_distance: self.fall_distance,
+            fire_ticks: self.fire_ticks,
+            air_ticks: self.air_ticks as i32,
+            on_ground: self.on_ground,
+        };
         let mut tag = NbtTag::compound();
-        tag.insert("id", NbtTag::String(self.mob_type.nbt_id().to_string()));
-        tag.insert(
-            "Pos",
-            NbtTag::List(vec![
-                NbtTag::Double(self.x),
-                NbtTag::Double(self.y),
-                NbtTag::Double(self.z),
-            ]),
-        );
-        tag.insert(
-            "Motion",
-            NbtTag::List(vec![
-                NbtTag::Double(self.mot_x),
-                NbtTag::Double(self.mot_y),
-                NbtTag::Double(self.mot_z),
-            ]),
-        );
-        tag.insert(
-            "Rotation",
-            NbtTag::List(vec![NbtTag::Float(self.yaw), NbtTag::Float(self.pitch)]),
-        );
-        tag.insert("FallDistance", NbtTag::Float(self.fall_distance));
-        tag.insert("Fire", NbtTag::Short(self.fire_ticks as i16));
+        base.write(&mut tag, world_uuid, entity_uuid);
+        // Java `EntityLiving.b(NBTTagCompound)`.
         tag.insert("Health", NbtTag::Short(self.health));
-        tag.insert("OnGround", NbtTag::Byte(i8::from(self.on_ground)));
-        // The state of the hit of the reference (`EntityLiving`): the time of
-        // the red flash of the hurt and the distance of the walk.
         tag.insert("HurtTime", NbtTag::Short(self.hurt_ticks as i16));
-        tag.insert("WalkDist", NbtTag::Float(self.walk_dist));
+        tag.insert("DeathTime", NbtTag::Short(self.death_ticks as i16));
+        tag.insert("AttackTime", NbtTag::Short(self.attack_ticks as i16));
 
         match self.mob_type {
             MobType::Pig => {
@@ -1260,61 +1251,34 @@ impl Mob {
     pub fn from_nbt(entity_id: i32, tag: &NbtTag, rng: &mut JavaRandom) -> Option<Self> {
         let id_str = tag.get_str("id")?;
         let mob_type = MobType::from_nbt_id(id_str)?;
-        let pos = tag.get_list("Pos")?;
-        if pos.len() < 3 {
+        // The position is read by the base tags (`Entity.e(NBTTagCompound)`).
+        if tag.get_list("Pos").map(|pos| pos.len()) != Some(3) {
             return None;
         }
-        let x = match pos[0] {
-            NbtTag::Double(v) => v,
-            _ => return None,
-        };
-        let y = match pos[1] {
-            NbtTag::Double(v) => v,
-            _ => return None,
-        };
-        let z = match pos[2] {
-            NbtTag::Double(v) => v,
-            _ => return None,
-        };
 
-        let mut mob = Self::new(entity_id, mob_type, x, y, z, rng);
-        if let Some(mot) = tag.get_list("Motion") {
-            if mot.len() >= 3 {
-                if let NbtTag::Double(v) = mot[0] {
-                    mob.mot_x = v;
-                }
-                if let NbtTag::Double(v) = mot[1] {
-                    mob.mot_y = v;
-                }
-                if let NbtTag::Double(v) = mot[2] {
-                    mob.mot_z = v;
-                }
-            }
-        }
-        if let Some(rot) = tag.get_list("Rotation") {
-            if rot.len() >= 2 {
-                if let NbtTag::Float(v) = rot[0] {
-                    mob.yaw = v;
-                }
-                if let NbtTag::Float(v) = rot[1] {
-                    mob.pitch = v;
-                }
-            }
-        }
+        let base = crate::entity::save::BaseEntity::read(tag, mob_type.nbt_id())?;
+        let mut mob = Self::new(entity_id, mob_type, base.pos.0, base.pos.1, base.pos.2, rng);
+        mob.mot_x = base.motion.0;
+        mob.mot_y = base.motion.1;
+        mob.mot_z = base.motion.2;
+        mob.yaw = base.rotation.0;
+        mob.pitch = base.rotation.1;
+        mob.fall_distance = base.fall_distance;
+        mob.fire_ticks = base.fire_ticks;
+        mob.air_ticks = base.air_ticks as i16;
+        mob.on_ground = base.on_ground;
+        // Java `EntityLiving.a(NBTTagCompound)`.
         if let Some(h) = tag.get_i16("Health") {
             mob.health = h;
-        }
-        if let Some(f) = tag.get_i16("Fire") {
-            mob.fire_ticks = f as i32;
-        }
-        if let Some(og) = tag.get_bool("OnGround") {
-            mob.on_ground = og;
         }
         if let Some(h) = tag.get_i16("HurtTime") {
             mob.hurt_ticks = h as i32;
         }
-        if let Some(w) = tag.get_f32("WalkDist") {
-            mob.walk_dist = w;
+        if let Some(d) = tag.get_i16("DeathTime") {
+            mob.death_ticks = d as i32;
+        }
+        if let Some(a) = tag.get_i16("AttackTime") {
+            mob.attack_ticks = a as i32;
         }
 
         match mob_type {
@@ -2505,7 +2469,7 @@ mod tests {
             let meta = mob.encode_metadata();
             assert_eq!(*meta.last().unwrap(), 127);
 
-            let nbt = mob.to_nbt();
+            let nbt = mob.to_nbt((1, 2), (3, 4));
             let restored = Mob::from_nbt(mob.entity_id, &nbt, &mut rng).unwrap();
             assert_eq!(restored.mob_type, mtype);
             assert_eq!(restored.pig_saddled, mob.pig_saddled);

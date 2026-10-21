@@ -12,38 +12,7 @@ pub struct PlayerStore {
     world_uuid: (i64, i64),
 }
 
-/// The hash of FNV-1a.
-fn fnv1a(bytes: &[u8], seed: u64) -> i64 {
-    let mut hash = seed;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash as i64
-}
-
-/// The UUID of the world (`World.getUUID()`).
-///
-/// The reference draws the UUID of the world at random, the port derives
-/// it from the seed of the world, so that the files of the world are the
-/// same from run to run.
-pub fn world_uuid(seed: i64) -> (i64, i64) {
-    (
-        fnv1a(&seed.to_le_bytes(), 0xcbf2_9ce4_8422_2325),
-        fnv1a(&seed.to_le_bytes(), 0x9e37_79b9_7f4a_7c15),
-    )
-}
-
-/// The UUID of the player (`Entity.uniqueId`).
-///
-/// The reference draws it at random, the port derives it from the name of
-/// the player.
-pub fn player_uuid(name: &str) -> (i64, i64) {
-    (
-        fnv1a(name.as_bytes(), 0xcbf2_9ce4_8422_2325),
-        fnv1a(name.as_bytes(), 0x9e37_79b9_7f4a_7c15),
-    )
-}
+pub use crate::util::hash::{fnv1a, player_uuid, world_uuid};
 
 impl PlayerStore {
     pub fn new(world_dir: &Path) -> Self {

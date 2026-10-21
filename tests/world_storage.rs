@@ -65,6 +65,45 @@ fn test_level_dat_persistence_and_atomic_swap() {
     let _ = fs::remove_dir_all(&world_dir);
 }
 
+/// The entities of the chunk are written into the list `Entities`.
+///
+/// Java `ChunkLoader.a(Chunk, World, NBTTagCompound)`.
+#[test]
+fn test_entities_are_saved_in_the_chunk_file() {
+    let world_dir = create_temp_world_dir("entities_test");
+    let mut cache = ChunkFileCache::new(&world_dir);
+    let chunk = Chunk::new(ChunkPos::new(3, -2));
+
+    let mut pig = flintcore::world::storage::NbtTag::compound();
+    pig.insert(
+        "id",
+        flintcore::world::storage::NbtTag::String("Pig".into()),
+    );
+    pig.insert(
+        "Pos",
+        flintcore::world::storage::NbtTag::List(vec![
+            flintcore::world::storage::NbtTag::Double(1.0),
+            flintcore::world::storage::NbtTag::Double(64.0),
+            flintcore::world::storage::NbtTag::Double(2.0),
+        ]),
+    );
+
+    let nbt = ChunkLoader::chunk_to_nbt(&chunk, 100, vec![pig]);
+    cache.write_chunk(3, -2, &nbt).unwrap();
+
+    // The file of the chunk holds the entities.
+    let read = cache.read_chunk(3, -2).unwrap().unwrap();
+    let entities = ChunkLoader::entities_from_nbt(&read);
+    assert_eq!(entities.len(), 1, "the list of the entities");
+    assert_eq!(
+        entities[0].get_str("id"),
+        Some("Pig"),
+        "the name of the type"
+    );
+
+    let _ = fs::remove_dir_all(&world_dir);
+}
+
 #[test]
 fn test_session_lock_guard() {
     let world_dir = create_temp_world_dir("session_test");
@@ -136,7 +175,7 @@ fn test_chunk_file_and_tile_entity_round_trip() {
         ],
     ));
 
-    let nbt = ChunkLoader::chunk_to_nbt(&chunk, 5000);
+    let nbt = ChunkLoader::chunk_to_nbt(&chunk, 5000, Vec::new());
     cache.write_chunk(pos.x, pos.z, &nbt).unwrap();
     cache.flush_all().unwrap();
 

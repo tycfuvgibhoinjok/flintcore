@@ -6,7 +6,9 @@ use crate::world::storage::nbt::NbtTag;
 pub struct ChunkLoader;
 
 impl ChunkLoader {
-    pub fn chunk_to_nbt(chunk: &Chunk, world_time: i64) -> NbtTag {
+    /// Java `ChunkLoader.a(Chunk, World, NBTTagCompound)`: the entities of the
+    /// chunk are written into the list `Entities`.
+    pub fn chunk_to_nbt(chunk: &Chunk, world_time: i64, entities: Vec<NbtTag>) -> NbtTag {
         let mut level = NbtTag::compound();
         level.insert("xPos", NbtTag::Int(chunk.pos.x));
         level.insert("zPos", NbtTag::Int(chunk.pos.z));
@@ -35,7 +37,7 @@ impl ChunkLoader {
         level.insert("SkyLight", NbtTag::ByteArray(sky_light));
         level.insert("BlockLight", NbtTag::ByteArray(block_light));
         level.insert("HeightMap", NbtTag::ByteArray(chunk.height_map.to_vec()));
-        level.insert("Entities", NbtTag::List(Vec::new()));
+        level.insert("Entities", NbtTag::List(entities));
 
         let mut tile_entities = Vec::new();
         for te in &chunk.tile_entities {
@@ -46,6 +48,18 @@ impl ChunkLoader {
         let mut root = NbtTag::compound();
         root.insert("Level", level);
         root
+    }
+
+    /// Java `ChunkLoader.a(World, NBTTagCompound)`: the entities of the chunk
+    /// are read from the list `Entities`.
+    pub fn entities_from_nbt(root: &NbtTag) -> Vec<NbtTag> {
+        let Some(level) = root.get("Level") else {
+            return Vec::new();
+        };
+        match level.get("Entities") {
+            Some(NbtTag::List(list)) => list.clone(),
+            _ => Vec::new(),
+        }
     }
 
     pub fn chunk_from_nbt(root: &NbtTag) -> Result<Chunk> {
@@ -196,7 +210,7 @@ mod tests {
             ["Line 1".into(), "Line 2".into(), "".into(), "".into()],
         ));
 
-        let nbt = ChunkLoader::chunk_to_nbt(&chunk, 1000);
+        let nbt = ChunkLoader::chunk_to_nbt(&chunk, 1000, Vec::new());
         let restored = ChunkLoader::chunk_from_nbt(&nbt).unwrap();
 
         assert_eq!(restored.pos, ChunkPos::new(-5, 12));

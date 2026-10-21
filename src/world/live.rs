@@ -28,6 +28,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use crate::gameplay::blocks;
 use crate::util::rng::JavaRandom;
 use crate::world::chunk::{ChunkPos, ChunkState};
+use crate::world::storage::nbt::NbtTag;
 use crate::world::world::World;
 
 #[derive(Debug, Clone)]
@@ -565,14 +566,14 @@ impl World {
 
     /// `World.doTick` -> `ChunkProviderServer.unloadChunks`: up to 50 queued
     /// chunks are saved and dropped from memory each tick.
-    pub fn live_tick(&mut self) {
-        self.live_tick_ex(true);
+    pub fn live_tick(&mut self, entities: &mut dyn FnMut(ChunkPos) -> Vec<NbtTag>) {
+        self.live_tick_ex(true, entities);
     }
 
     /// Mirror `ChunkProviderServer.unloadChunks()` directly (unload up to 50
     /// chunks from `unloadQueue` without advancing world time or running
     /// scheduled ticks).
-    pub fn live_unload_chunks(&mut self) {
+    pub fn live_unload_chunks(&mut self, entities: &mut dyn FnMut(ChunkPos) -> Vec<NbtTag>) {
         let mut unloaded = 0usize;
         for _ in 0..50 {
             let Some(pos) = self.live.unload_queue.pop_front() else {
@@ -586,7 +587,8 @@ impl World {
             }
             self.falling_sands
                 .retain(|e| (e.x >> 4) != pos.x || (e.z >> 4) != pos.z);
-            let _ = self.write_chunk_to_storage(pos);
+            let chunk_entities = entities(pos);
+            let _ = self.write_chunk_to_storage(pos, chunk_entities);
             self.chunks.remove(&pos);
             self.packet_cache.borrow_mut().remove(&pos);
             self.live.dirty_chunks.remove(&pos);
@@ -613,9 +615,13 @@ impl World {
     /// (`doTick` order: `unloadChunks` -> `worldData.a(f + 1)` -> `a(false)`).
     /// Random block ticks (`World.j()`) are not modelled: their positions come
     /// from the unseeded `World.g` LCG.
-    pub fn live_tick_ex(&mut self, unloads: bool) {
+    pub fn live_tick_ex(
+        &mut self,
+        unloads: bool,
+        entities: &mut dyn FnMut(ChunkPos) -> Vec<NbtTag>,
+    ) {
         if unloads {
-            self.live_unload_chunks();
+            self.live_unload_chunks(entities);
         }
         self.live_time += 1;
         self.level_data.borrow_mut().time = self.live_time;
@@ -722,7 +728,7 @@ mod tests {
             for pos in added {
                 let _ = world.prepare_chunk_packets(pos);
             }
-            world.live_tick();
+            world.live_tick(&mut |_pos| Vec::new());
         }
 
         // View distance 2 -> (2*2 + 1)^2 = 25 chunks. Even after walking 25 chunks
