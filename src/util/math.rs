@@ -35,8 +35,13 @@ pub fn lerp(delta: f64, start: f64, end: f64) -> f64 {
     start + delta * (end - start)
 }
 
+/// Java `MathHelper.c(float)`: the square root of a single precision value.
+///
+/// The reference takes the square root in a double precision and rounds the
+/// result to a single precision value ✓ — the single precision square root
+/// can differ in the last bit ✓.
 pub fn sqrt_f32(value: f32) -> f32 {
-    value.sqrt()
+    math_helper_c(value)
 }
 
 /// Java `MathHelper.c(float)`: the square root of a single precision value.
@@ -56,8 +61,15 @@ pub fn math_helper_a(value: f64) -> f32 {
     value.sqrt() as f32
 }
 
+/// Java `MathHelper.abs(float)`: `f >= 0.0F ? f : -f`.
+///
+/// The sign of the negative zero is preserved by the reference ✓.
 pub fn abs_f32(value: f32) -> f32 {
-    value.abs()
+    if value >= 0.0 {
+        value
+    } else {
+        -value
+    }
 }
 
 /// The trigonometry of the reference (`org.bukkit.craftbukkit.TrigMath`).
@@ -161,6 +173,27 @@ mod tests {
         // precision value.
         assert_eq!(math_helper_c(3.0), 1.732_050_8);
         assert_eq!(math_helper_c(9.0), 3.0);
+    }
+
+    /// Java `MathHelper.abs(float)`: the sign of the negative zero is kept.
+    #[test]
+    fn the_absolute_value_keeps_the_sign_of_the_negative_zero() {
+        assert_eq!(abs_f32(-0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(abs_f32(0.0), 0.0);
+        assert_eq!(abs_f32(-2.5), 2.5);
+        assert_eq!(abs_f32(2.5), 2.5);
+    }
+
+    /// Java `MathHelper.d(float)` and `MathHelper.floor(double)`: the value is
+    /// truncated toward zero and corrected down when it is negative.
+    #[test]
+    fn the_floor_of_the_reference_keeps_the_truncation_toward_zero() {
+        assert_eq!(floor_float(1.6), 1);
+        assert_eq!(floor_float(-1.6), -2);
+        assert_eq!(floor_float(-0.5), -1);
+        assert_eq!(floor_double(1.6), 1);
+        assert_eq!(floor_double(-1.6), -2);
+        assert_eq!(floor_double(-0.5), -1);
     }
 
     #[test]

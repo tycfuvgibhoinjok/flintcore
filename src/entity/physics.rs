@@ -359,9 +359,13 @@ impl Aabb {
 }
 
 /// The height of a fluid (`BlockFluids.c`).
+///
+/// Java `BlockFluids.c(int)`: the level is the data of the block (eight or
+/// more means a full block ✓) and the height is `(float)(i + 1) / 9.0F` ✓ — a
+/// single precision division ✓.
 fn fluid_height(data: u8) -> f64 {
     let level = if data >= 8 { 0 } else { data };
-    (level as f64 + 1.0) / 9.0
+    ((level + 1) as f32 / 9.0f32) as f64
 }
 
 /// Java `World.a(AxisAlignedBB, Material)`: does the box touch the fluid?
@@ -1051,9 +1055,12 @@ pub fn move_entity(
             moved_z = fallback_z;
             *aabb = fallback_box;
         } else {
+            // Java `Entity.java:513-517`: `this.br = (float)((double)this.br
+            // + d12 + 0.01D)` — the sum is in a double precision ✓ and it is
+            // rounded once ✓.
             let rest = aabb.min_y - (aabb.min_y as i32) as f64;
             if rest > 0.0 {
-                step_offset += (rest + 0.01) as f32;
+                step_offset = (step_offset as f64 + rest + 0.01) as f32;
             }
         }
     }
@@ -1084,6 +1091,19 @@ mod tests {
     use super::*;
     use crate::config::WorldConfig;
     use crate::world::chunk::ChunkPos;
+
+    /// The height of the fluid is a single precision value.
+    ///
+    /// Java `BlockFluids.c(int)`: `(float)(i + 1) / 9.0F` — the division is in
+    /// a single precision ✓.
+    #[test]
+    fn the_height_of_the_fluid_is_a_single_precision_value() {
+        assert_eq!(fluid_height(0), (1.0f32 / 9.0f32) as f64);
+        assert_eq!(fluid_height(1), (2.0f32 / 9.0f32) as f64);
+        // The data of eight or more means a full block.
+        assert_eq!(fluid_height(8), (1.0f32 / 9.0f32) as f64);
+        assert_eq!(fluid_height(15), (1.0f32 / 9.0f32) as f64);
+    }
 
     /// A world with a stone floor at `y = 63`.
     fn test_world() -> World {

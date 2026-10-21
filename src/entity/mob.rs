@@ -1707,23 +1707,27 @@ pub fn find_path(
     goal_z: f64,
     max_dist: f32,
 ) -> Vec<(i32, i32, i32)> {
-    let half = (length / 2.0) as f64;
+    // Java `Pathfinder.java:26`: `entity.length / 2.0F` — the division is in
+    // a single precision ✓ — and the goal is `MathHelper.floor(d0 - (double)
+    // (entity.length / 2.0F))` ✓.
+    let half = (length / 2.0f32) as f64;
     let start = (
-        (start_x - half).floor() as i32,
-        start_y.floor() as i32,
-        (start_z - half).floor() as i32,
+        crate::util::math::floor_double(start_x - half),
+        crate::util::math::floor_double(start_y),
+        crate::util::math::floor_double(start_z - half),
     );
     let goal = (
-        (goal_x - half).floor() as i32,
-        goal_y.floor() as i32,
-        (goal_z - half).floor() as i32,
+        crate::util::math::floor_double(goal_x - half),
+        crate::util::math::floor_double(goal_y),
+        crate::util::math::floor_double(goal_z - half),
     );
-    // `Pathfinder` builds the size box of the entity: `floor(length + 1)`,
-    // `floor(width + 1)` and `floor(length + 1)`.
+    // `Pathfinder.java:27`: the size box of the entity —
+    // `MathHelper.d(entity.length + 1.0F)` ✓ — the addition is in a single
+    // precision ✓.
     let size = (
-        (length + 1.0).floor() as i32,
-        (width + 1.0).floor() as i32,
-        (length + 1.0).floor() as i32,
+        crate::util::math::floor_float(length + 1.0f32),
+        crate::util::math::floor_float(width + 1.0f32),
+        crate::util::math::floor_float(length + 1.0f32),
     );
     let mut pathfinder = Pathfinder::new(world, size, goal, max_dist);
     pathfinder.search(start).unwrap_or_default()
