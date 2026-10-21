@@ -3060,6 +3060,14 @@ impl World {
         }
     }
 
+    /// The state of the random of the world (a diagnostic ✓).
+    ///
+    /// The value is the `seed` field of `java.util.Random` ✓ — the same
+    /// field that the reference shows ✓.
+    pub fn world_random_state(&self) -> u64 {
+        self.world_random.state()
+    }
+
     /// Suppresses or allows the physics of the neighbours ✓.
     ///
     /// Java `World.suppressPhysics` ✓: the blocks that are placed while the

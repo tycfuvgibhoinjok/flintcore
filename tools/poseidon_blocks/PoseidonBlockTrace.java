@@ -29,7 +29,8 @@ import java.lang.reflect.Method;
 public class PoseidonBlockTrace {
 
     /** The scenarios of the harness. */
-    public static final String[] SCENARIOS = {"water_spread", "lava_into_water", "sand_fall"};
+    public static final String[] SCENARIOS = {"water_spread", "lava_into_water", "water_into_lava",
+        "sand_fall", "lava_spread", "fire_spread", "redstone_torch", "piston_push"};
 
     /** Removes a directory with its content. */
     private static void deleteRecursive(File file) {
@@ -93,11 +94,31 @@ public class PoseidonBlockTrace {
         } else if (scenario.equals("lava_into_water")) {
             world.setTypeIdAndData(8, 64, 8, 11, 0);
             world.setTypeIdAndData(9, 64, 8, 9, 0);
+        } else if (scenario.equals("water_into_lava")) {
+            world.setTypeIdAndData(8, 64, 8, 9, 0);
+            world.setTypeIdAndData(9, 64, 8, 11, 0);
         } else if (scenario.equals("sand_fall")) {
             world.setTypeIdAndData(8, 64, 8, 0, 0);
             for (int y = 65; y <= 67; ++y) {
                 world.setTypeIdAndData(8, y, 8, 12, 0);
             }
+        } else if (scenario.equals("lava_spread")) {
+            world.setTypeIdAndData(8, 64, 8, 11, 0);
+        } else if (scenario.equals("fire_spread")) {
+            // The planks of the floor and the fire above them.
+            for (int x = 5; x <= 11; ++x) {
+                world.setTypeIdAndData(x, 64, 8, 5, 0);
+            }
+            world.setTypeIdAndData(8, 65, 8, 51, 0);
+        } else if (scenario.equals("redstone_torch")) {
+            // The torch of the redstone on the floor and the wire next to it.
+            world.setTypeIdAndData(8, 64, 8, 75, 5);
+            world.setTypeIdAndData(9, 64, 8, 55, 0);
+        } else if (scenario.equals("piston_push")) {
+            // The piston, the block above it and the lever that powers it.
+            world.setTypeIdAndData(8, 64, 8, 33, 0);
+            world.setTypeIdAndData(8, 65, 8, 1, 0);
+            world.setTypeIdAndData(9, 64, 8, 69, 9);
         } else {
             System.err.println("unknown scenario " + scenario);
             System.exit(2);

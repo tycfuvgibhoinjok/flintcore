@@ -42,10 +42,23 @@ javac -nowarn -cp "$OUT:$CLASSES:$LIBS" -d "$OUT" \
 javac -nowarn -cp "$OUT:$CLASSES:$LIBS" -d "$OUT" \
   tools/poseidon_blocks/PoseidonBlockTrace.java 2>/dev/null
 
-for s in water_spread lava_into_water sand_fall; do
+# The scenarios and their number of ticks: the lava spreads slower than the
+# water (`BlockFlowing.c` ✓ — the delay of the lava is 30 ticks ✓).
+run_scenario() {
+  s="$1"
+  ticks="$2"
   java -Dflint.trace=0,60,0,15,80,15 -cp "$OUT:$CLASSES:$LIBS" \
-    flintcore.test.PoseidonBlockTrace "$s" 42 20 2>/dev/null \
+    flintcore.test.PoseidonBlockTrace "$s" 42 "$ticks" 2>/dev/null \
     | awk '/^=== scenario ===$/ { found = 1; next } found' \
     | grep -E "^(A4|A5|B|G|PHYS|FA|CONV|RNG|RNG2|RNG3|J|FLOW|DOWN) " > "$GOLDEN/$s.txt"
   echo "$GOLDEN/$s.txt regenerated: $(wc -l < "$GOLDEN/$s.txt") lines"
-done
+}
+
+run_scenario water_spread 20
+run_scenario lava_into_water 20
+run_scenario water_into_lava 20
+run_scenario sand_fall 20
+run_scenario lava_spread 90
+run_scenario fire_spread 40
+run_scenario redstone_torch 20
+run_scenario piston_push 20

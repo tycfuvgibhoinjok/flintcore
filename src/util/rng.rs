@@ -22,6 +22,11 @@ pub struct JavaRandom {
 }
 
 impl JavaRandom {
+    /// The state of the stream (the `seed` field of `java.util.Random` ✓).
+    pub fn state(&self) -> u64 {
+        self.seed
+    }
+
     pub fn new(seed: i64) -> Self {
         Self {
             seed: (seed as u64 ^ MULTIPLIER) & MASK,
