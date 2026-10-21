@@ -1091,14 +1091,16 @@ impl Mob {
         let mut drops = Vec::new();
         match self.mob_type {
             MobType::Pig => {
+                // Java `EntityLiving.q()`: one draw of the number of the items
+                // and **one** stack of them.
                 let count = rng.next_i32_bound(3) as u8;
                 let id = if self.fire_ticks > 0 {
                     items::GRILLED_PORK
                 } else {
                     items::PORK
                 };
-                for _ in 0..count {
-                    drops.push(ItemStack::new(id, 1, 0));
+                if count > 0 {
+                    drops.push(ItemStack::new(id, count, 0));
                 }
             }
             MobType::Sheep => {
@@ -1112,42 +1114,43 @@ impl Mob {
             }
             MobType::Cow => {
                 let count = rng.next_i32_bound(3) as u8;
-                for _ in 0..count {
-                    drops.push(ItemStack::new(items::LEATHER, 1, 0));
+                if count > 0 {
+                    drops.push(ItemStack::new(items::LEATHER, count, 0));
                 }
             }
             MobType::Chicken | MobType::Zombie => {
                 let count = rng.next_i32_bound(3) as u8;
-                for _ in 0..count {
-                    drops.push(ItemStack::new(items::FEATHER, 1, 0));
+                if count > 0 {
+                    drops.push(ItemStack::new(items::FEATHER, count, 0));
                 }
             }
             MobType::Squid => {
+                // Java `EntitySquid.q()`: one draw and one stack.
                 let count = (rng.next_i32_bound(3) + 1) as u8;
-                for _ in 0..count {
-                    drops.push(ItemStack::new(items::INK_SACK, 1, 0));
-                }
+                drops.push(ItemStack::new(items::INK_SACK, count, 0));
             }
             MobType::Skeleton => {
+                // Java `EntitySkeleton.q()`: two draws and two stacks — the
+                // arrows and the bones.
                 let arrows = rng.next_i32_bound(3) as u8;
-                for _ in 0..arrows {
-                    drops.push(ItemStack::new(items::ARROW, 1, 0));
+                if arrows > 0 {
+                    drops.push(ItemStack::new(items::ARROW, arrows, 0));
                 }
                 let bones = rng.next_i32_bound(3) as u8;
-                for _ in 0..bones {
-                    drops.push(ItemStack::new(items::BONE, 1, 0));
+                if bones > 0 {
+                    drops.push(ItemStack::new(items::BONE, bones, 0));
                 }
             }
             MobType::Spider => {
                 let count = rng.next_i32_bound(3) as u8;
-                for _ in 0..count {
-                    drops.push(ItemStack::new(items::STRING, 1, 0));
+                if count > 0 {
+                    drops.push(ItemStack::new(items::STRING, count, 0));
                 }
             }
             MobType::Creeper => {
                 let count = rng.next_i32_bound(3) as u8;
-                for _ in 0..count {
-                    drops.push(ItemStack::new(items::SULPHUR, 1, 0));
+                if count > 0 {
+                    drops.push(ItemStack::new(items::SULPHUR, count, 0));
                 }
                 if killed_by_skeleton_arrow {
                     let record = items::GOLD_RECORD + rng.next_i32_bound(2) as i16;
@@ -1156,8 +1159,8 @@ impl Mob {
             }
             MobType::Ghast => {
                 let count = rng.next_i32_bound(3) as u8;
-                for _ in 0..count {
-                    drops.push(ItemStack::new(items::SULPHUR, 1, 0));
+                if count > 0 {
+                    drops.push(ItemStack::new(items::SULPHUR, count, 0));
                 }
             }
             MobType::Slime => {
@@ -1165,16 +1168,14 @@ impl Mob {
                 // the items, the slime of a size bigger than one drops
                 // nothing (`EntitySlime.j()`).
                 let count = rng.next_i32_bound(3) as u8;
-                if self.slime_size == 1 {
-                    for _ in 0..count {
-                        drops.push(ItemStack::new(items::SLIME_BALL, 1, 0));
-                    }
+                if self.slime_size == 1 && count > 0 {
+                    drops.push(ItemStack::new(items::SLIME_BALL, count, 0));
                 }
             }
             MobType::PigZombie => {
                 let count = rng.next_i32_bound(3) as u8;
-                for _ in 0..count {
-                    drops.push(ItemStack::new(items::GRILLED_PORK, 1, 0));
+                if count > 0 {
+                    drops.push(ItemStack::new(items::GRILLED_PORK, count, 0));
                 }
             }
             MobType::Wolf => {
@@ -1187,8 +1188,8 @@ impl Mob {
                 // The giant is a zombie (`EntityZombie.j()` returns the
                 // feathers).
                 let count = rng.next_i32_bound(3) as u8;
-                for _ in 0..count {
-                    drops.push(ItemStack::new(items::FEATHER, 1, 0));
+                if count > 0 {
+                    drops.push(ItemStack::new(items::FEATHER, count, 0));
                 }
             }
         }

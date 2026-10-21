@@ -5109,6 +5109,17 @@ impl Server {
                 continue;
             }
 
+            // Java `EntityMonster.m_()`: with the monsters switched off the
+            // monster dies at the end of its tick (`this.die()`).
+            // The world of the port is never static (`World.isStatic` ✓), so
+            // the check of the reference is always true ✓.
+            if mtype.is_monster() && !self.config.spawning.spawn_monsters {
+                let health = self.entities.get_mob(mob_id).map(|m| m.health).unwrap_or(0);
+                if health > 0 {
+                    self.damage_mob(mob_id, health, None, false);
+                }
+            }
+
             // The corpse of a dead mob is not despawned, it leaves the world
             // when the counter of the death passes twenty. A dead mob has no
             // artificial intelligence (`EntityLiving.v()`), it only falls.
@@ -5296,19 +5307,39 @@ impl Server {
                                 hunt
                             };
                             if hunt_sheep {
-                                let sheep = self.entities.iter_mobs().find_map(|s| {
-                                    if !s.dead
-                                        && s.mob_type == MobType::Sheep
-                                        && (s.x - mx).abs() <= 16.0
-                                        && (s.y - my).abs() <= 4.0
-                                        && (s.z - mz).abs() <= 16.0
-                                    {
-                                        Some((s.entity_id, false, s.x, s.y, s.z))
-                                    } else {
-                                        None
-                                    }
-                                });
-                                target_pos = sheep;
+                                // The list of the sheep of the reference
+                                // (`EntityWolf.c_()`): the box is the position
+                                // of the wolf grown by 16/4/16 (`AABB.b(16.0D,
+                                // 4.0D, 16.0D)` ✓), and the sheep is chosen by
+                                // a number of the **world** ✓.
+                                let sheep: Vec<(i32, f64, f64, f64)> = self
+                                    .entities
+                                    .iter_mobs()
+                                    .filter(|s| {
+                                        !s.dead
+                                            && s.mob_type == MobType::Sheep
+                                            && s.x >= mx - 16.0
+                                            && s.x <= mx + 17.0
+                                            && s.y >= my - 4.0
+                                            && s.y <= my + 5.0
+                                            && s.z >= mz - 16.0
+                                            && s.z <= mz + 17.0
+                                    })
+                                    .map(|s| (s.entity_id, s.x, s.y, s.z))
+                                    .collect();
+                                if !sheep.is_empty() {
+                                    let index = {
+                                        let mut rng = std::mem::replace(
+                                            &mut self.world.world_random,
+                                            JavaRandom::new(0),
+                                        );
+                                        let index = rng.next_i32_bound(sheep.len() as i32) as usize;
+                                        self.world.world_random = rng;
+                                        index
+                                    };
+                                    let (id, x, y, z) = sheep[index];
+                                    target_pos = Some((id, false, x, y, z));
+                                }
                             }
                         }
                     }
@@ -12414,8 +12445,10 @@ mod tests {
         config.world.view_distance = 2;
         config.server.allow_nether = false;
         // The scenario has exactly one mob, the natural spawning must not add
-        // any other.
-        config.spawning.spawn_monsters = false;
+        // any other.  The monsters are **on** (`world.spawnMonsters = 1` of the
+        // harness of the reference ✓) — with them off the monsters would die
+        // at the first tick (`EntityMonster.m_()` ✓) ✓.
+        config.spawning.spawn_monsters = true;
         config.spawning.spawn_animals = false;
         config.spawning.spawn_water_mobs = false;
         config.spawning.spawn_squids = false;
@@ -12849,6 +12882,92 @@ mod tests {
         assert_eq!(server.entity_random.draws, shadow.draws);
         // The wolf drops nothing (`EntityWolf.j()` returns -1).
         assert_eq!(server.entities.iter_dropped_items().count(), 0);
+    }
+
+    /// The mob drops one stack of the items, not N stacks of one item.
+    ///
+    /// Java `EntityLiving.q()`: `loot.add(new ItemStack(i, count))` — the
+    /// number of the items is **one** stack.
+    #[test]
+    fn the_death_of_a_mob_drops_one_stack() {
+        let (mut server, mob_id) = mob_scenario_server("flat");
+        let mut shadow = server.entity_random.clone();
+        server.damage_mob(mob_id, 100, None, false);
+        // The sound of the death (two numbers) and the number of the items.
+        let _ = shadow.next_f32();
+        let _ = shadow.next_f32();
+        let count = shadow.next_i32_bound(3) as u8;
+        assert_eq!(server.entity_random.draws, shadow.draws);
+        let drops: Vec<_> = server.entities.iter_dropped_items().collect();
+        if count > 0 {
+            assert_eq!(drops.len(), 1, "the mob drops one stack");
+            assert_eq!(
+                drops[0].item.count, count,
+                "the stack holds the drawn number of the items"
+            );
+        } else {
+            assert!(drops.is_empty(), "the mob drops nothing");
+        }
+    }
+
+    /// The monster dies when the monsters are switched off.
+    ///
+    /// Java `EntityMonster.m_()`: `if (!world.isStatic && world.spawnMonsters
+    /// == 0) { this.die(); }` — the monster dies at the end of its tick ✓.
+    #[test]
+    fn the_monster_dies_when_the_monsters_are_off() {
+        let (mut server, mob_id) = mob_scenario_server("chase");
+        server.config.spawning.spawn_monsters = false;
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(mob.dead, "the monster dies with the monsters off");
+        assert_eq!(mob.health, 0, "the monster has no health");
+
+        // With the monsters on the monster lives.
+        let (mut server, mob_id) = mob_scenario_server("chase");
+        server.config.spawning.spawn_monsters = true;
+        server.tick_mobs();
+        let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
+        assert!(!mob.dead, "the monster lives with the monsters on");
+    }
+
+    /// The wolf chooses the sheep of the list by a number of the world.
+    ///
+    /// Java `EntityWolf.c_()`: the hunt draws `nextInt(100)` from the random
+    /// of the world ✓, and the sheep of the list is chosen by
+    /// `nextInt(list.size())` ✓ — the **second** draw of the world ✓.
+    #[test]
+    fn the_wolf_chooses_the_sheep_by_a_number_of_the_world() {
+        let (mut server, mob_id) = mob_scenario_server("wolf");
+        // A sheep next to the wolf.
+        let (wx, wy, wz) = server
+            .entities
+            .get_mob(mob_id)
+            .map(|m| (m.x, m.y, m.z))
+            .expect("the wolf is alive");
+        let sheep_id =
+            server
+                .entities
+                .spawn_mob(MobType::Sheep, wx + 2.0, wy, wz, &mut server.entity_random);
+        // The random of the world: the first draw is zero (the hunt).
+        let mut seed = 0i64;
+        while JavaRandom::new(seed).next_i32_bound(100) != 0 {
+            seed += 1;
+        }
+        server.world.world_random = JavaRandom::new(seed);
+        let before = server.world.world_random.draws;
+        server.tick_mobs();
+        assert_eq!(
+            server.world.world_random.draws,
+            before + 2,
+            "the hunt and the choice of the sheep draw two numbers of the world"
+        );
+        let wolf = server.entities.get_mob(mob_id).expect("the wolf is alive");
+        assert_eq!(
+            wolf.target_id,
+            Some(sheep_id),
+            "the wolf hunts the sheep of the list"
+        );
     }
 
     /// The giant drops the feathers of the zombie.
