@@ -10,7 +10,7 @@ use crate::entity::mob::{
     chunk_light_at, evaluate_natural_spawns, find_path, light_curve, MobType,
 };
 use crate::entity::physics::Aabb;
-use crate::entity::player::DiggingState;
+use crate::entity::player::{DiggingState, Player};
 use crate::entity::projectile::{Painting, ProjectileKind, PAINTING_TITLES};
 use crate::entity::store::EntityStore;
 use crate::entity::tracker::EntityTracker;
@@ -610,6 +610,11 @@ impl Server {
         }
         self.stream_chunks();
 
+        // The falling sand of the world is told to the client ✓
+        // (`EntityFallingSand` ✓ — the entity is added to the world before the
+        // tracker is updated ✓).
+        self.falling_sand_phase();
+
         // The tracker of the entities is updated every tick
         // (`MinecraftServer.tick`: `tracker.updatePlayers()`).
         self.run_tracker_tick();
@@ -717,7 +722,7 @@ impl Server {
             .cloned()
             .collect();
 
-        let tracking_packets = self.tracker.tick_world(
+        let mut tracking_packets = self.tracker.tick_world(
             &mut players,
             &mut items,
             &mut boats,
@@ -727,6 +732,8 @@ impl Server {
             &mut minecarts,
             &paintings,
         );
+        // The falling sand of the world (`EntityFallingSand` ✓).
+        tracking_packets.extend(self.tracker.tick_falling_sands(self.world.falling_sands()));
         for p in players {
             if let Some(live) = self.entities.get_player_mut(p.entity_id) {
                 live.mot_x = p.mot_x;
@@ -6936,6 +6943,46 @@ impl Server {
             for _ in 0..count {
                 let _ = self.entity_random.next_f32();
                 let _ = self.entity_random.next_f32();
+            }
+        }
+    }
+
+    /// The falling sand of the world (`EntityFallingSand` ✓).
+    ///
+    /// Java `EntityTrackerEntry.java:377-385` — the client gets the falling
+    /// sand as a vehicle spawn with the type 70 (the sand ✓) or 71 (the
+    /// gravel ✓); `EntityTracker.java:58-59` — the radius of the tracking is
+    /// 160 ✓ and the update interval is 20 ✓.
+    fn falling_sand_phase(&mut self) {
+        // The new sand: the number of the entity ✓.
+        let mut spawned = Vec::new();
+        for sand in self.world.falling_sands_mut() {
+            if sand.entity_id == 0 {
+                sand.entity_id = self.entities.allocate_id();
+                spawned.push(sand.clone());
+            }
+        }
+        if !spawned.is_empty() {
+            let players: Vec<Player> = self.entities.iter_players().cloned().collect();
+            for sand in &spawned {
+                for out in self.tracker.track_falling_sand_and_scan(sand, &players) {
+                    self.send_tracked(out.recipient_id, out.packet);
+                }
+            }
+        }
+        // The sand that is gone (it landed or died): the client is told to
+        // remove the entity ✓.
+        let live: std::collections::HashSet<i32> = self
+            .world
+            .falling_sands()
+            .iter()
+            .map(|sand| sand.entity_id)
+            .collect();
+        for entity_id in self.tracker.falling_sand_ids() {
+            if !live.contains(&entity_id) {
+                for out in self.tracker.untrack_falling_sand(entity_id) {
+                    self.send_tracked(out.recipient_id, out.packet);
+                }
             }
         }
     }
@@ -14300,6 +14347,92 @@ mod tests {
                 .map(|mob| mob.wolf_sitting)
                 .unwrap_or(false),
             "the wolf in the water does not sit"
+        );
+    }
+
+    /// The falling sand is sent to the client.
+    ///
+    /// Java `EntityTrackerEntry.java:377-385` — the client gets the falling
+    /// sand as a vehicle spawn with the type 70 (the sand ✓) or 71 (the gravel
+    /// ✓).
+    #[test]
+    fn the_falling_sand_is_sent_to_the_client() {
+        use crate::world::world::FallingSand;
+
+        let sand = FallingSand {
+            x: 3,
+            z: 4,
+            loc_y: 64.5,
+            mot_y: 0.0,
+            id: blocks::SAND,
+            ticks: 0,
+            dead: false,
+            entity_id: 7,
+        };
+        let entry = crate::entity::tracker::EntityTrackerEntry::new_pos_entity(
+            7, 3.5, 64.5, 4.5, 160.0, 20,
+        );
+        let packets = entry.make_falling_sand_spawn_packets(&sand);
+        assert_eq!(packets.len(), 1, "the spawn of the falling sand");
+        match &packets[0] {
+            Clientbound::VehicleSpawn(spawn) => {
+                assert_eq!(spawn.entity_id, 7, "the number of the entity");
+                assert_eq!(spawn.vehicle_type, 70, "the type of the sand");
+            }
+            other => panic!("the spawn of the falling sand: {other:?}"),
+        }
+
+        // The gravel has the type 71 ✓.
+        let gravel = FallingSand {
+            id: blocks::GRAVEL,
+            ..sand.clone()
+        };
+        let packets = entry.make_falling_sand_spawn_packets(&gravel);
+        match &packets[0] {
+            Clientbound::VehicleSpawn(spawn) => {
+                assert_eq!(spawn.vehicle_type, 71, "the type of the gravel");
+            }
+            other => panic!("the spawn of the falling gravel: {other:?}"),
+        }
+    }
+
+    /// The falling sand of the world gets a number and is removed from the
+    /// tracker when it is gone.
+    ///
+    /// Java `EntityFallingSand` ✓ — the entity is added to the world ✓ and the
+    /// tracker tells the client about it ✓ (`EntityTracker.track` ✓).
+    #[test]
+    fn the_falling_sand_gets_a_number_and_is_untracked_when_it_is_gone() {
+        use crate::world::world::FallingSand;
+
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.world.falling_sands_mut().push(FallingSand {
+            x: 0,
+            z: 0,
+            loc_y: 64.5,
+            mot_y: 0.0,
+            id: blocks::SAND,
+            ticks: 0,
+            dead: false,
+            entity_id: 0,
+        });
+        server.falling_sand_phase();
+        assert_eq!(
+            server.tracker.falling_sand_ids().len(),
+            1,
+            "the falling sand is tracked"
+        );
+        assert!(
+            server.world.falling_sands()[0].entity_id != 0,
+            "the falling sand has a number"
+        );
+
+        // The sand has landed: the client is told to remove the entity ✓.
+        server.world.falling_sands_mut().clear();
+        server.falling_sand_phase();
+        assert!(
+            server.tracker.falling_sand_ids().is_empty(),
+            "the falling sand is untracked"
         );
     }
 

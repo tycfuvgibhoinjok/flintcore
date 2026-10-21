@@ -280,7 +280,7 @@ pub struct World {
 
 /// Active `EntityFallingSand` instance ticked by `World.cleanUp()`.
 #[derive(Clone, Debug)]
-pub(crate) struct FallingSand {
+pub struct FallingSand {
     pub x: i32,
     pub z: i32,
     pub loc_y: f64,
@@ -288,6 +288,10 @@ pub(crate) struct FallingSand {
     pub id: u8,
     pub ticks: i32,
     pub dead: bool,
+    /// The number of the entity (`Entity.id` ✓) — the client gets the falling
+    /// sand as a vehicle spawn (`EntityTrackerEntry.java:377-385` ✓).  Zero
+    /// means that the entity was not sent to the client yet ✓.
+    pub entity_id: i32,
 }
 
 /// Java `MetadataChunkBlock` — one queued light-propagation box in `World.C`.
@@ -1715,6 +1719,7 @@ impl World {
                     id,
                     ticks: 0,
                     dead: false,
+                    entity_id: 0,
                 });
             }
             return;
@@ -1727,6 +1732,17 @@ impl World {
         if j > 0 {
             self.java_set_type_id(x, j, z, id);
         }
+    }
+
+    /// The falling sand of the world (`EntityFallingSand` ✓).
+    pub fn falling_sands(&self) -> &[FallingSand] {
+        &self.falling_sands
+    }
+
+    /// The falling sand of the world (`EntityFallingSand` ✓) — the list is
+    /// changed when the client is told about a new entity ✓.
+    pub fn falling_sands_mut(&mut self) -> &mut Vec<FallingSand> {
+        &mut self.falling_sands
     }
 
     /// Java `World.cleanUp()` entity pass for `EntityFallingSand`.

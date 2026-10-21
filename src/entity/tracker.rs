@@ -9,6 +9,7 @@ use crate::net::packets::{
     EntityPainting, EntityTeleport, EntityVelocity, MobSpawn, NamedEntitySpawn, PickupSpawn,
     RelEntityMove, RelEntityMoveLook, Sleep, VehicleSpawn,
 };
+use crate::world::world::FallingSand;
 
 #[inline]
 pub fn pack_angle(angle: f32) -> u8 {
@@ -380,6 +381,26 @@ impl EntityTrackerEntry {
         packets
     }
 
+    /// Java `EntityTrackerEntry.java:377-385`: the falling sand is spawned on
+    /// the client as a vehicle with the type 70 (the sand ✓) or 71 (the gravel
+    /// ✓).
+    pub fn make_falling_sand_spawn_packets(&self, sand: &FallingSand) -> Vec<Clientbound> {
+        let vehicle_type = if sand.id == crate::gameplay::blocks::SAND {
+            70
+        } else {
+            71
+        };
+        vec![Clientbound::VehicleSpawn(VehicleSpawn {
+            entity_id: sand.entity_id,
+            vehicle_type,
+            x: self.encoded_x,
+            y: self.encoded_y,
+            z: self.encoded_z,
+            thrower_id: 0,
+            velocity: None,
+        })]
+    }
+
     pub fn make_painting_spawn_packets(&self, p: &Painting) -> Vec<Clientbound> {
         vec![Clientbound::EntityPainting(EntityPainting {
             entity_id: p.entity_id,
@@ -407,6 +428,7 @@ pub struct EntityTracker {
     tnt_entries: HashMap<i32, EntityTrackerEntry>,
     minecart_entries: HashMap<i32, EntityTrackerEntry>,
     painting_entries: HashMap<i32, EntityTrackerEntry>,
+    falling_sand_entries: HashMap<i32, EntityTrackerEntry>,
     tracking_range: f64,
 }
 
@@ -430,6 +452,7 @@ impl EntityTracker {
             tnt_entries: HashMap::new(),
             minecart_entries: HashMap::new(),
             painting_entries: HashMap::new(),
+            falling_sand_entries: HashMap::new(),
             tracking_range,
         }
     }
@@ -738,6 +761,85 @@ impl EntityTracker {
 
         self.painting_entries.insert(painting.entity_id, entry);
         outbound
+    }
+
+    /// Java `EntityTracker.track`: the falling sand is tracked with the radius
+    /// 160 ✓ and the update interval 20 ✓ (`EntityTracker.java:58-59` ✓).
+    pub fn track_falling_sand_and_scan(
+        &mut self,
+        sand: &FallingSand,
+        players: &[Player],
+    ) -> Vec<OutboundTrackingPacket> {
+        let mut outbound = Vec::new();
+        let mut entry = EntityTrackerEntry::new_pos_entity(
+            sand.entity_id,
+            sand.x as f64 + 0.5,
+            sand.loc_y,
+            sand.z as f64 + 0.5,
+            160.0,
+            20,
+        );
+        // The radius of the entity is limited by the distance of the view.
+        let range = 160.0f64.min(self.tracking_range);
+        let target_chunk = crate::world::chunk::ChunkPos::new(sand.x >> 4, sand.z >> 4);
+
+        for p in players {
+            if p.dead {
+                continue;
+            }
+            let dx = p.x - (sand.x as f64 + 0.5);
+            let dz = p.z - (sand.z as f64 + 0.5);
+            let chunk_ready = p.sent_chunks.is_empty() || p.sent_chunks.contains(&target_chunk);
+            if in_tracking_range(dx, dz, range)
+                && chunk_ready
+                && entry.tracked_players.insert(p.entity_id)
+            {
+                for packet in entry.make_falling_sand_spawn_packets(sand) {
+                    outbound.push(OutboundTrackingPacket {
+                        recipient_id: p.entity_id,
+                        packet,
+                    });
+                }
+            }
+        }
+
+        self.falling_sand_entries.insert(sand.entity_id, entry);
+        outbound
+    }
+
+    /// The updates of the falling sand (`EntityTrackerEntry.update()` ✓).
+    ///
+    /// The falling sand is in the air ✓ — the packet of the position is sent
+    /// every tick ✓ (`EntityTrackerEntry.update()` ✓: the entity is not on
+    /// the ground ✓).
+    pub fn tick_falling_sands(&mut self, sands: &[FallingSand]) -> Vec<OutboundTrackingPacket> {
+        let mut outbound = Vec::new();
+        for sand in sands {
+            if sand.entity_id == 0 {
+                continue;
+            }
+            if let Some(entry) = self.falling_sand_entries.get_mut(&sand.entity_id) {
+                Self::emit_pos_only_update(
+                    entry,
+                    sand.entity_id,
+                    sand.x as f64 + 0.5,
+                    sand.loc_y,
+                    sand.z as f64 + 0.5,
+                    true,
+                    &mut outbound,
+                );
+            }
+        }
+        outbound
+    }
+
+    /// The numbers of the falling sand that are tracked (`EntityTracker.b` ✓).
+    pub fn falling_sand_ids(&self) -> Vec<i32> {
+        self.falling_sand_entries.keys().copied().collect()
+    }
+
+    pub fn untrack_falling_sand(&mut self, entity_id: i32) -> Vec<OutboundTrackingPacket> {
+        Self::untrack_from(&mut self.falling_sand_entries, entity_id)
     }
 
     pub fn untrack_painting(&mut self, entity_id: i32) -> Vec<OutboundTrackingPacket> {
