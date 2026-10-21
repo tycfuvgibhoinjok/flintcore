@@ -483,6 +483,14 @@ impl Server {
         // Tick each player (no_damage_ticks, fire_ticks decrement, deferred digging)
         for player in self.entities.iter_players_mut() {
             player.tick();
+            // Java `EntityHuman.v()`: with the monsters switched off the
+            // player regains one point of health every twenty ticks.
+            if !self.config.spawning.spawn_monsters
+                && player.health < 20
+                && player.ticks_lived % 20 == 0
+            {
+                player.heal(1);
+            }
         }
         self.tick_player_environmental_damage();
         if self.nether.is_some() {
@@ -1137,6 +1145,13 @@ impl Server {
                     self.kick(id, "Illegal stance");
                     return;
                 }
+                // Java `NetServerHandler`: the stance is the height of the
+                // eyes above the feet, it must be in `[0.1, 1.65]`.
+                let eye_height = stance - y;
+                if !player.sleeping && (eye_height > 1.65 || eye_height < 0.1) {
+                    self.kick(id, "Illegal stance");
+                    return;
+                }
                 if x.abs() > 3.2e7 || z.abs() > 3.2e7 {
                     self.kick(id, "Illegal position");
                     return;
@@ -1508,7 +1523,7 @@ impl Server {
                         self.send_tracked(outbound.recipient_id, outbound.packet);
                     }
                     if self.config.mechanics.boats_drop_boat_not_wood {
-                        self.spawn_dropped_item_random(
+                        self.spawn_dropped_item_at(
                             bx,
                             by,
                             bz,
@@ -1518,7 +1533,7 @@ impl Server {
                     } else {
                         // EntityBoat.java:124-130 — drop 3x WOOD_PLANKS + 2x STICK
                         for _ in 0..3 {
-                            self.spawn_dropped_item_random(
+                            self.spawn_dropped_item_at(
                                 bx,
                                 by,
                                 bz,
@@ -1527,7 +1542,7 @@ impl Server {
                             );
                         }
                         for _ in 0..2 {
-                            self.spawn_dropped_item_random(
+                            self.spawn_dropped_item_at(
                                 bx,
                                 by,
                                 bz,
@@ -1589,7 +1604,7 @@ impl Server {
                     for outbound in self.tracker.untrack_painting(target_id) {
                         self.send_tracked(outbound.recipient_id, outbound.packet);
                     }
-                    self.spawn_dropped_item_random(
+                    self.spawn_dropped_item_at(
                         p.x as f64 + 0.5,
                         p.y as f64 + 0.5,
                         p.z as f64 + 0.5,
@@ -1794,8 +1809,11 @@ impl Server {
 
             if died {
                 self.dismount_player(target_id);
+                // Java `EntityHuman.dropItemStack(ItemStack, true)`: the
+                // items of the dead player fall at the height of the eyes
+                // and get a random speed.
                 for (dx, dy, dz, stack) in drops {
-                    self.spawn_dropped_item_random(dx, dy, dz, stack, 40);
+                    self.drop_item_of_the_dead_player(dx, dy, dz, stack);
                 }
                 let death_msg = format!("\u{00A7}e{target_name} was slain by {attacker_name}");
                 self.broadcast_chat(&death_msg);
@@ -2136,21 +2154,21 @@ impl Server {
             match te.kind {
                 TileEntityKind::Chest { items } => {
                     for stack in items.iter().flatten() {
-                        self.spawn_dropped_item_random(x as f64, y as f64, z as f64, *stack, 10);
+                        self.spawn_dropped_item_at(x as f64, y as f64, z as f64, *stack, 10);
                     }
                 }
                 TileEntityKind::Furnace { items, .. } => {
                     for stack in items.iter().flatten() {
-                        self.spawn_dropped_item_random(x as f64, y as f64, z as f64, *stack, 10);
+                        self.spawn_dropped_item_at(x as f64, y as f64, z as f64, *stack, 10);
                     }
                 }
                 TileEntityKind::Dispenser { items } => {
                     for stack in items.iter().flatten() {
-                        self.spawn_dropped_item_random(x as f64, y as f64, z as f64, *stack, 10);
+                        self.spawn_dropped_item_at(x as f64, y as f64, z as f64, *stack, 10);
                     }
                 }
                 TileEntityKind::RecordPlayer { record } if record > 0 => {
-                    self.spawn_dropped_item_random(
+                    self.spawn_dropped_item_at(
                         x as f64,
                         y as f64,
                         z as f64,
@@ -2221,7 +2239,7 @@ impl Server {
                 self.world.ignite_tnt(x, y, z, false);
                 self.process_world_events();
             } else {
-                self.spawn_dropped_item_random(
+                self.spawn_dropped_item_at(
                     x as f64,
                     y as f64,
                     z as f64,
@@ -2248,7 +2266,7 @@ impl Server {
             }
             self.world.world_random = rng;
             for stack in drops {
-                self.spawn_dropped_item_random(x as f64, y as f64, z as f64, stack, 10);
+                self.spawn_dropped_item_at(x as f64, y as f64, z as f64, stack, 10);
             }
         }
 
@@ -2256,7 +2274,7 @@ impl Server {
         let attached_drops = self.world.check_attached_blocks_around(x, y, z);
         for (ax, ay, az, stack) in attached_drops {
             self.send_block_change_to_observers(ax, ay, az);
-            self.spawn_dropped_item_random(ax as f64, ay as f64, az as f64, stack, 10);
+            self.spawn_dropped_item_at(ax as f64, ay as f64, az as f64, stack, 10);
         }
 
         // Damage tool in hand
@@ -2724,7 +2742,7 @@ impl Server {
                         data: 0,
                     }));
                     if ejected > 0 {
-                        self.spawn_dropped_item_random(
+                        self.spawn_dropped_item_at(
                             x as f64,
                             y as f64 + 0.6,
                             z as f64,
@@ -2829,9 +2847,12 @@ impl Server {
                 let time_of_day = self.world.world_time().rem_euclid(24000);
                 let is_night = (12541..=23458).contains(&time_of_day) || self.world.is_thundering();
                 if let Some(player) = self.entities.get_by_conn_mut(id) {
-                    if (player.x - hx as f64).abs() > 3.5
-                        || (player.y - y as f64).abs() > 2.5
-                        || (player.z - hz as f64).abs() > 3.5
+                    // Java `EntityHuman.a(int, int, int)`: the bed must
+                    // be at most three blocks away horizontally and two
+                    // blocks vertically.
+                    if (player.x - hx as f64).abs() > 3.0
+                        || (player.y - y as f64).abs() > 2.0
+                        || (player.z - hz as f64).abs() > 3.0
                     {
                         return true;
                     }
@@ -3006,7 +3027,7 @@ impl Server {
                         && self.config.mechanics.tile_grass_drop_seeds
                         && self.world.tick_random.next_i32_bound(8) == 0
                     {
-                        self.spawn_dropped_item_random(
+                        self.spawn_dropped_item_at(
                             cx as f64,
                             (cy + 1) as f64,
                             cz as f64,
@@ -4009,10 +4030,10 @@ impl Server {
                 self.send_tracked(outbound.recipient_id, outbound.packet);
             }
             if self.config.mechanics.boats_drop_boat_not_wood {
-                self.spawn_dropped_item_random(bx, by, bz, ItemStack::new(items::BOAT, 1, 0), 10);
+                self.spawn_dropped_item_at(bx, by, bz, ItemStack::new(items::BOAT, 1, 0), 10);
             } else {
                 for _ in 0..3 {
-                    self.spawn_dropped_item_random(
+                    self.spawn_dropped_item_at(
                         bx,
                         by,
                         bz,
@@ -4021,13 +4042,7 @@ impl Server {
                     );
                 }
                 for _ in 0..2 {
-                    self.spawn_dropped_item_random(
-                        bx,
-                        by,
-                        bz,
-                        ItemStack::new(items::STICK, 1, 0),
-                        10,
-                    );
+                    self.spawn_dropped_item_at(bx, by, bz, ItemStack::new(items::STICK, 1, 0), 10);
                 }
             }
         }
@@ -4069,8 +4084,8 @@ impl Server {
             &self.world,
             &mut rng,
             &player_positions,
-            true,
-            true,
+            self.config.spawning.spawn_monsters,
+            self.config.spawning.spawn_animals,
             monsters,
             animals,
             water,
@@ -4516,7 +4531,7 @@ impl Server {
                             2
                         };
                         for _ in 0..wool_count {
-                            self.spawn_dropped_item_random(
+                            self.spawn_dropped_item_at(
                                 mx,
                                 my + 0.5,
                                 mz,
@@ -4687,7 +4702,7 @@ impl Server {
             }
             if let Some((wx, wy, wz, color, count)) = punched_wool {
                 for _ in 0..count {
-                    self.spawn_dropped_item_random(
+                    self.spawn_dropped_item_at(
                         wx,
                         wy,
                         wz,
@@ -4916,7 +4931,7 @@ impl Server {
                 // mob leaves the world when the counter of the death passes
                 // twenty.
                 for item in drops {
-                    self.spawn_dropped_item_random(mx, my + 0.2, mz, item, 10);
+                    self.spawn_dropped_item_at(mx, my + 0.2, mz, item, 10);
                 }
             }
         }
@@ -6355,7 +6370,7 @@ impl Server {
         }
 
         for (ex, ey, ez) in eggs_to_drop {
-            self.spawn_dropped_item_random(ex, ey, ez, ItemStack::new(items::EGG, 1, 0), 10);
+            self.spawn_dropped_item_at(ex, ey, ez, ItemStack::new(items::EGG, 1, 0), 10);
         }
 
         for (entity_id, status) in status_packets {
@@ -7063,6 +7078,14 @@ impl Server {
             if p.dead || damage < 0 {
                 return false;
             }
+            // Java `EntityHuman.damageEntity`: with the monsters switched
+            // off there is no damage at all, otherwise the damage of the
+            // mobs and of the arrows is `i / 3 + 1`.
+            let damage = if self.config.spawning.spawn_monsters {
+                damage / 3 + 1
+            } else {
+                0
+            };
             let (dealt, died) = if damage == 0 {
                 if p.no_damage_ticks > 10 {
                     return false;
@@ -7190,8 +7213,11 @@ impl Server {
             self.send(conn_id, Clientbound::UpdateHealth(UpdateHealth { health }));
             if died {
                 self.dismount_player(player_id);
+                // Java `EntityHuman.dropItemStack(ItemStack, true)`: the
+                // items of the dead player fall at the height of the eyes
+                // and get a random speed.
                 for (dx, dy, dz, stack) in drops {
-                    self.spawn_dropped_item_random(dx, dy, dz, stack, 40);
+                    self.drop_item_of_the_dead_player(dx, dy, dz, stack);
                 }
                 self.broadcast_chat(&format!("\u{00A7}e{username} was slain by a mob"));
                 self.broadcast(Clientbound::EntityStatus(EntityStatus {
@@ -8025,7 +8051,7 @@ impl Server {
             for out in self.tracker.untrack_minecart(cart_id) {
                 self.send_tracked(out.recipient_id, out.packet);
             }
-            self.spawn_dropped_item_random(cx, cy, cz, ItemStack::new(items::MINECART, 1, 0), 10);
+            self.spawn_dropped_item_at(cx, cy, cz, ItemStack::new(items::MINECART, 1, 0), 10);
             if ctype == 1 {
                 // EntityMinecart.java:134-160 — split each stack into random sub-stacks of 10..=30
                 for mut item in cargo.into_iter().flatten() {
@@ -8033,7 +8059,7 @@ impl Server {
                         let split = (self.world.tick_random.next_i32_bound(21) + 10)
                             .min(item.count as i32) as u8;
                         item.count -= split;
-                        self.spawn_dropped_item_random(
+                        self.spawn_dropped_item_at(
                             cx,
                             cy,
                             cz,
@@ -8042,7 +8068,7 @@ impl Server {
                         );
                     }
                 }
-                self.spawn_dropped_item_random(
+                self.spawn_dropped_item_at(
                     cx,
                     cy,
                     cz,
@@ -8050,7 +8076,7 @@ impl Server {
                     10,
                 );
             } else if ctype == 2 {
-                self.spawn_dropped_item_random(
+                self.spawn_dropped_item_at(
                     cx,
                     cy,
                     cz,
@@ -8807,7 +8833,7 @@ impl Server {
         for ev in events {
             match ev {
                 WorldEvent::DropItem { x, y, z, item } => {
-                    self.spawn_dropped_item_random(x, y, z, item, 10);
+                    self.spawn_dropped_item_at(x, y, z, item, 10);
                 }
                 WorldEvent::DispenseItem {
                     x,
@@ -9119,7 +9145,7 @@ impl Server {
             self.world.ignite_tnt(tx, ty, tz, true);
         }
         for (dx, dy, dz, item) in drops_to_spawn {
-            self.spawn_dropped_item_random(dx, dy, dz, item, 10);
+            self.spawn_dropped_item_at(dx, dy, dz, item, 10);
         }
         self.process_world_events();
 
@@ -9912,7 +9938,36 @@ impl Server {
         }
     }
 
-    fn spawn_dropped_item_random(
+    /// Java `EntityHuman.dropItemStack(ItemStack, true)`: the item of the
+    /// dead player appears at the height of the eyes (`locY - 0.3 + t()`)
+    /// and gets a random speed of up to half a block in the horizontal
+    /// plane and `0.2` upwards.  The pickup delay is forty ticks.
+    fn drop_item_of_the_dead_player(&mut self, x: f64, y: f64, z: f64, item: ItemStack) {
+        if item.count == 0 || item.id <= 0 {
+            return;
+        }
+        let speed = self.entity_random.next_f32() as f64 * 0.5;
+        let angle = self.entity_random.next_f32() as f64 * std::f64::consts::PI * 2.0;
+        let mot_x = -angle.sin() * speed;
+        let mot_z = angle.cos() * speed;
+        let mot_y = 0.20000000298023224;
+        let item_id = self.entities.spawn_dropped_item(
+            item,
+            x,
+            // The height of the eyes of the player: `locY - 0.3 + 1.62`.
+            y - 0.30000001192092896 + 1.62,
+            z,
+            mot_x,
+            mot_y,
+            mot_z,
+            40,
+        );
+        self.track_dropped_item(item_id);
+    }
+
+    /// Java `Entity.a(ItemStack, float)`: the item appears at the position
+    /// of the entity, without any spread and without any speed.
+    fn spawn_dropped_item_at(
         &mut self,
         x: f64,
         y: f64,
@@ -9923,29 +9978,14 @@ impl Server {
         if item.count == 0 || item.id <= 0 {
             return;
         }
-        let mut rng = std::mem::replace(
-            &mut self.world.world_random,
-            crate::util::rng::JavaRandom::new(0),
-        );
-        let f = 0.7f32;
-        let d0 = (rng.next_f32() * f) as f64 + ((1.0 - f) as f64) * 0.5;
-        let d1 = (rng.next_f32() * f) as f64 + ((1.0 - f) as f64) * 0.5;
-        let d2 = (rng.next_f32() * f) as f64 + ((1.0 - f) as f64) * 0.5;
-        let mot_x = (rng.next_f32() * 0.2 - 0.1) as f64;
-        let mot_y = 0.2f64;
-        let mot_z = (rng.next_f32() * 0.2 - 0.1) as f64;
-        self.world.world_random = rng;
+        let item_id = self
+            .entities
+            .spawn_dropped_item(item, x, y, z, 0.0, 0.0, 0.0, pickup_delay);
+        self.track_dropped_item(item_id);
+    }
 
-        let item_id = self.entities.spawn_dropped_item(
-            item,
-            x + d0,
-            y + d1,
-            z + d2,
-            mot_x,
-            mot_y,
-            mot_z,
-            pickup_delay,
-        );
+    /// The new item is sent to the players that see it.
+    fn track_dropped_item(&mut self, item_id: i32) {
         let active_dimension = self.active_dimension;
         let players: Vec<_> = self
             .entities
@@ -9972,6 +10012,16 @@ impl Server {
         let mot_x = (-yaw_rad.sin() * pitch_rad.cos() * f) as f64;
         let mot_z = (yaw_rad.cos() * pitch_rad.cos() * f) as f64;
         let mot_y = (-pitch_rad.sin() * f + 0.1) as f64;
+
+        // Java `EntityHuman.dropItemStack(ItemStack, false)`: the item is
+        // spread a little around the direction of the look.
+        let mut spread = 0.02f64;
+        let angle = self.entity_random.next_f32() as f64 * std::f64::consts::PI * 2.0;
+        spread *= self.entity_random.next_f32() as f64;
+        let mot_x = mot_x + angle.cos() * spread;
+        let mot_y = mot_y
+            + (self.entity_random.next_f32() as f64 - self.entity_random.next_f32() as f64) * 0.1;
+        let mot_z = mot_z + angle.sin() * spread;
 
         let item_id = self
             .entities
@@ -11487,7 +11537,7 @@ impl Server {
                     .find(|p| p.username.eq_ignore_ascii_case(&target))
                     .map(|p| (p.x, p.y, p.z));
                 if let Some((tx, ty, tz)) = target_info {
-                    self.spawn_dropped_item_random(
+                    self.spawn_dropped_item_at(
                         tx,
                         ty,
                         tz,
@@ -11767,7 +11817,9 @@ impl Server {
         let keep_inv = self.config.mechanics.keep_inventory_on_death;
         let (conn_id, username, health, died, drops) = {
             if let Some(player) = self.entities.get_player_mut(entity_id) {
-                let (dealt, died) = player.take_damage_direct(damage);
+                // Java `EntityHuman.c(int)`: the armour reduces any damage
+                // of the player.
+                let (dealt, died) = player.take_damage(damage);
                 if dealt > 0 {
                     let drops = if died && !keep_inv {
                         let px = player.x;
@@ -11807,7 +11859,7 @@ impl Server {
         if died {
             self.dismount_player(entity_id);
             for (dx, dy, dz, stack) in drops {
-                self.spawn_dropped_item_random(dx, dy, dz, stack, 40);
+                self.spawn_dropped_item_at(dx, dy, dz, stack, 40);
             }
             let death_msg = format!("\u{00A7}e{username} {reason}");
             self.broadcast_chat(&death_msg);
@@ -11864,7 +11916,7 @@ impl Server {
         if died {
             self.dismount_player(entity_id);
             for (dx, dy, dz, stack) in drops {
-                self.spawn_dropped_item_random(dx, dy, dz, stack, 40);
+                self.spawn_dropped_item_at(dx, dy, dz, stack, 40);
             }
             let death_msg = format!("\u{00A7}e{username} {reason}");
             self.broadcast_chat(&death_msg);
@@ -12963,6 +13015,9 @@ mod tests {
     #[test]
     fn the_wolf_attacks_at_a_distance_of_less_than_one_and_a_half_blocks() {
         let (mut server, mob_id) = mob_scenario_server("flat");
+        // Java `EntityHuman.damageEntity`: with the monsters switched off
+        // the player takes no damage from them.
+        server.config.spawning.spawn_monsters = true;
         if let Some(mob) = server.entities.get_mob_mut(mob_id) {
             mob.mob_type = MobType::Wolf;
             // The angry wolf looks for a player (`EntityWolf.c_()`).
@@ -12974,6 +13029,9 @@ mod tests {
             player.x = 2.0;
             player.y = 64.0;
             player.z = 0.5;
+            // The player that has just appeared cannot be hurt for sixty
+            // ticks (`EntityPlayer.bM`).
+            player.spawn_protect_ticks = 0;
         }
         // The first tick gives the wolf its target (the attack of the
         // reference uses the target of the previous tick).
@@ -13883,6 +13941,95 @@ mod tests {
             mob.health, health,
             "the fireball does no direct damage, the explosion does"
         );
+    }
+
+    /// The damage of the mobs is scaled by the difficulty of the world.
+    ///
+    /// Java `EntityHuman.damageEntity`: with the monsters switched off
+    /// there is no damage at all, otherwise the damage is `i / 3 + 1`.
+    #[test]
+    fn the_damage_of_the_mobs_is_scaled_by_the_difficulty() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.config.spawning.spawn_monsters = true;
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.spawn_protect_ticks = 0;
+        }
+        // The damage of four points becomes two.
+        server.damage_player_from_mob(player_id, 4, 0.0, 0.0, false);
+        let health = server
+            .entities
+            .get_player(player_id)
+            .expect("the player is alive")
+            .health;
+        assert_eq!(health, 18, "the damage of the mob is scaled");
+
+        // With the monsters switched off there is no damage at all.
+        server.config.spawning.spawn_monsters = false;
+        server.damage_player_from_mob(player_id, 4, 0.0, 0.0, false);
+        let health = server
+            .entities
+            .get_player(player_id)
+            .expect("the player is alive")
+            .health;
+        assert_eq!(health, 18, "the monsters do no damage");
+    }
+
+    /// The player regains health when the monsters are switched off.
+    ///
+    /// Java `EntityHuman.v()`: `if (!world.allowMonsters && health < 20 &&
+    /// ticksLived % 20 * 12 == 0) this.b(1, REGEN)`.
+    #[test]
+    fn the_player_regains_health_when_the_monsters_are_off() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        server.config.spawning.spawn_monsters = false;
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.health = 10;
+            player.ticks_lived = 19;
+        }
+        server.tick(0);
+        let health = server
+            .entities
+            .get_player(player_id)
+            .expect("the player is alive")
+            .health;
+        assert_eq!(health, 11, "the player regains one point of health");
+    }
+
+    /// The items of the dead player fall at the height of the eyes.
+    ///
+    /// Java `EntityHuman.dropItemStack(ItemStack, true)`: the item appears
+    /// at `(locX, locY - 0.3 + t(), locZ)`, it gets a random speed and the
+    /// delay of the pick-up is forty ticks.
+    #[test]
+    fn the_items_of_the_dead_player_fall_at_the_height_of_the_eyes() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.x = 2.0;
+            player.y = 64.0;
+            player.z = 3.0;
+            player.spawn_protect_ticks = 0;
+            player.inventory.items[0] = Some(ItemStack::new(items::APPLE, 3, 0));
+        }
+        // The player dies.
+        server.config.spawning.spawn_monsters = true;
+        server.damage_player_from_mob(player_id, 100, 0.0, 0.0, false);
+        let item = server
+            .entities
+            .iter_dropped_items()
+            .next()
+            .expect("the item of the dead player");
+        assert_eq!(item.x, 2.0, "the x of the item");
+        assert_eq!(item.z, 3.0, "the z of the item");
+        assert_eq!(
+            item.y,
+            64.0 - 0.30000001192092896 + 1.62,
+            "the y of the item is the height of the eyes"
+        );
+        assert_eq!(item.pickup_delay, 40, "the delay of the pick-up");
+        assert_eq!(item.mot_y, 0.20000000298023224, "the speed of the item");
     }
 
     /// The mobs push each other away.

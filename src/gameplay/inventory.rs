@@ -1113,6 +1113,72 @@ mod tests {
     use super::*;
     use crate::gameplay::items::*;
 
+    /// The stack of the slot and the stack of the cursor are exchanged
+    /// when they are different.
+    ///
+    /// Java `Container.a(int, int, EntityHuman)`: the stacks with the same
+    /// identifier are merged, the other ones are exchanged.
+    #[test]
+    fn the_stacks_of_the_slot_and_of_the_cursor_are_exchanged() {
+        let mut window = InventoryPlayer::new();
+        // The slot holds a sword, the cursor the dirt.
+        window.items[10] = Some(ItemStack::new(276, 1, 0));
+        window.cursor = Some(ItemStack::new(1, 5, 0));
+        window.handle_window_click(10, 0, false);
+        assert_eq!(
+            window.items[10],
+            Some(ItemStack::new(1, 5, 0)),
+            "the slot holds the stack of the cursor"
+        );
+        assert_eq!(
+            window.cursor,
+            Some(ItemStack::new(276, 1, 0)),
+            "the cursor holds the stack of the slot"
+        );
+    }
+
+    /// The sword that does not fit in a stack does not change.
+    ///
+    /// Java `Container.a(int, int, EntityHuman)`: the stacks with the same
+    /// identifier are merged, but the sword fits only in a stack of one —
+    /// nothing moves.
+    #[test]
+    fn the_sword_that_does_not_fit_in_a_stack_does_not_move() {
+        let mut window = InventoryPlayer::new();
+        // The slot holds an intact sword, the cursor a damaged one.
+        window.items[10] = Some(ItemStack::new(276, 1, 0));
+        window.cursor = Some(ItemStack::new(276, 1, 5));
+        window.handle_window_click(10, 0, false);
+        assert_eq!(
+            window.items[10],
+            Some(ItemStack::new(276, 1, 0)),
+            "the sword stays in the slot"
+        );
+        assert_eq!(
+            window.cursor,
+            Some(ItemStack::new(276, 1, 5)),
+            "the sword stays on the cursor"
+        );
+    }
+
+    /// The stacks with the same identifier and the same data are merged.
+    ///
+    /// Java `Container.a(int, int, EntityHuman)`.
+    #[test]
+    fn the_stacks_with_the_same_data_are_merged() {
+        let mut window = InventoryPlayer::new();
+        // The cobblestone fits in a stack of sixty four.
+        window.items[10] = Some(ItemStack::new(4, 1, 0));
+        window.cursor = Some(ItemStack::new(4, 5, 0));
+        window.handle_window_click(10, 0, false);
+        assert_eq!(
+            window.items[10],
+            Some(ItemStack::new(4, 6, 0)),
+            "the stacks are merged"
+        );
+        assert_eq!(window.cursor, None, "the cursor is empty");
+    }
+
     #[test]
     fn inventory_add_and_stack() {
         let mut inv = InventoryPlayer::new();

@@ -59,6 +59,12 @@ pub struct Player {
     pub fire_ticks: i16,
     pub fall_distance: f32,
     pub no_damage_ticks: u8,
+    /// Java `EntityPlayer.bM`: the player that has just appeared cannot be
+    /// hurt for sixty ticks.
+    pub spawn_protect_ticks: u8,
+    /// Java `Entity.ticksLived`: the number of the ticks the player has
+    /// lived.
+    pub ticks_lived: u32,
     pub last_damage: i16,
     pub damage_remainder: i32,
     pub sneaking: bool,
@@ -138,6 +144,8 @@ impl Player {
             fire_ticks: 0,
             fall_distance: 0.0,
             no_damage_ticks: 0,
+            spawn_protect_ticks: 60,
+            ticks_lived: 0,
             last_damage: 0,
             damage_remainder: 0,
             sneaking: false,
@@ -227,36 +235,26 @@ impl Player {
         if self.fire_ticks > 0 {
             self.fire_ticks -= 1;
         }
+        // Java `EntityPlayer.bM`: the protection of the appearance is
+        // decreased every tick.
+        if self.spawn_protect_ticks > 0 {
+            self.spawn_protect_ticks -= 1;
+        }
+        self.ticks_lived = self.ticks_lived.wrapping_add(1);
     }
 
-    pub fn take_damage_direct(&mut self, amount: i16) -> (i16, bool) {
+    /// Java `EntityLiving.damageEntity(Entity, int)` and
+    /// `EntityHuman.c(int)`: the damage of the player.
+    ///
+    /// The armour of the player reduces **any** damage and wears it out —
+    /// the fall, the fire, the lava, the drowning and the void as well.
+    pub fn take_damage(&mut self, amount: i16) -> (i16, bool) {
         if self.dead {
             return (0, false);
         }
-        let eff_amount = if self.no_damage_ticks > 10 {
-            if amount <= self.last_damage {
-                return (0, false);
-            }
-            let diff = amount - self.last_damage;
-            self.last_damage = amount;
-            diff
-        } else {
-            self.last_damage = amount;
-            self.no_damage_ticks = 20;
-            amount
-        };
-
-        self.health = (self.health - eff_amount).max(0);
-
-        let died = self.health == 0;
-        if died {
-            self.dead = true;
-        }
-        (eff_amount, died)
-    }
-
-    pub fn take_damage(&mut self, amount: i16) -> (i16, bool) {
-        if self.dead {
+        // Java `EntityPlayer.damageEntity`: the player that has just
+        // appeared cannot be hurt.
+        if self.spawn_protect_ticks > 0 {
             return (0, false);
         }
         let eff_amount = if self.no_damage_ticks > 10 {
@@ -289,9 +287,12 @@ impl Player {
         (actual_damage, died)
     }
 
+    /// Java `EntityLiving.b(int)`: the healing sets the window of the
+    /// invulnerability to half of the maximum.
     pub fn heal(&mut self, amount: i16) {
         if !self.dead {
             self.health = (self.health + amount).min(20);
+            self.no_damage_ticks = 10;
         }
     }
 
@@ -361,5 +362,66 @@ impl Player {
             flags |= 0x04;
         }
         flags
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The healing sets the window of the invulnerability.
+    ///
+    /// Java `EntityLiving.b(int)`: `this.noDamageTicks = this.maxNoDamageTicks / 2`.
+    #[test]
+    fn the_healing_sets_the_window_of_the_invulnerability() {
+        let mut player = Player::new(1, 1, "Player".to_string(), 0.0, 64.0, 0.0);
+        player.health = 10;
+        player.no_damage_ticks = 0;
+        player.heal(5);
+        assert_eq!(player.health, 15, "the player is healed");
+        assert_eq!(
+            player.no_damage_ticks, 10,
+            "the window of the invulnerability"
+        );
+    }
+
+    /// The player that has just appeared cannot be hurt.
+    ///
+    /// Java `EntityPlayer.damageEntity`: `if (this.bM > 0) return false`.
+    #[test]
+    fn the_player_that_has_just_appeared_cannot_be_hurt() {
+        let mut player = Player::new(1, 1, "Player".to_string(), 0.0, 64.0, 0.0);
+        assert_eq!(
+            player.spawn_protect_ticks, 60,
+            "the protection of the appearance"
+        );
+        let (dealt, died) = player.take_damage(10);
+        assert_eq!(dealt, 0, "the player is not hurt");
+        assert!(!died, "the player is alive");
+        assert_eq!(player.health, 20, "the health of the player");
+        // The counter is decreased every tick.
+        player.tick();
+        assert_eq!(
+            player.spawn_protect_ticks, 59,
+            "the counter of the protection"
+        );
+    }
+
+    /// The armour of the player reduces any damage.
+    ///
+    /// Java `EntityHuman.c(int)`: the armour of the player reduces the
+    /// damage and wears it out.
+    #[test]
+    fn the_armour_of_the_player_reduces_the_damage() {
+        let mut player = Player::new(1, 1, "Player".to_string(), 0.0, 64.0, 0.0);
+        player.spawn_protect_ticks = 0;
+        // A full set of the diamond armour: twenty points.
+        player.inventory.armor[0] = Some(crate::gameplay::items::ItemStack::new(313, 1, 0));
+        player.inventory.armor[1] = Some(crate::gameplay::items::ItemStack::new(312, 1, 0));
+        player.inventory.armor[2] = Some(crate::gameplay::items::ItemStack::new(311, 1, 0));
+        player.inventory.armor[3] = Some(crate::gameplay::items::ItemStack::new(310, 1, 0));
+        let (dealt, _) = player.take_damage(10);
+        // The armour of twenty points leaves a fifth of the damage.
+        assert_eq!(dealt, 2, "the armour reduces the damage");
     }
 }
