@@ -44,6 +44,10 @@ pub struct Projectile {
     pub accel_z: f64,
     pub yaw: f32,
     pub pitch: f32,
+    /// Java `Entity.lastYaw` and `Entity.lastPitch` ✓: the rotation of the
+    /// previous tick ✓ — the smoothing of the rotation needs them ✓.
+    pub last_yaw: f32,
+    pub last_pitch: f32,
     pub in_ground: bool,
     /// Java `EntityArrow.shake`: the arrow that hit a block shakes for seven
     /// ticks, it can only be picked up when the counter is zero.
@@ -118,6 +122,8 @@ impl Projectile {
             kind,
             shooter_id: None,
             shooter_is_skeleton: false,
+            last_yaw: 0.0,
+            last_pitch: 0.0,
             x: base.pos.0,
             y: base.pos.1,
             z: base.pos.2,

@@ -20,7 +20,11 @@ javac -nowarn -cp "$CLASSES:$LIBS" -d "$CLASSES" \
   tools/poseidon_entities/PoseidonEntityTrace.java 2>/dev/null
 
 : > "$GOLDEN"
-for s in arrow snowball egg item tnt boat; do
+# The dropped item and the primed TNT take their first velocity from
+# `Math.random()` in the reference (`EntityItem.java:41-43` ✓,
+# `EntityTNTPrimed.java:29-32` ✓) => their traces are not reproducible ✓ =>
+# they are not in the golden file ✓.
+for s in arrow snowball egg boat; do
   java -cp "$CLASSES:$LIBS" \
     flintcore.test.PoseidonEntityTrace "$s" 12345 "/tmp/poseidon_entity_$s.txt" 100 2>/dev/null
   cat "/tmp/poseidon_entity_$s.txt" >> "$GOLDEN"

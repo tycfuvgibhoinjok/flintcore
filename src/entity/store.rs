@@ -775,6 +775,8 @@ impl EntityStore {
             accel_z: mot_z * 0.1,
             yaw: 0.0,
             pitch: 0.0,
+            last_yaw: 0.0,
+            last_pitch: 0.0,
             in_ground: false,
             shake: 0,
             x_tile: 0,

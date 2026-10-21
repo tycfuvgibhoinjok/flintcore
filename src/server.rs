@@ -7949,20 +7949,37 @@ impl Server {
             }
 
             if let Some(p) = self.entities.get_projectile_mut(pid) {
+                // Java `Entity.R()` (`Entity.java:220-224`): the rotation of
+                // the previous tick is kept ✓ — the smoothing of the rotation
+                // needs it ✓.
+                p.last_yaw = p.yaw;
+                p.last_pitch = p.pitch;
                 // Java `EntityArrow.m_()` (`EntityArrow.java:84-89`): while the
                 // arrow has no rotation yet, the rotation follows its motion
                 // ✓ (`Math.atan2` ✓ — the yaw from the horizontal motion ✓
                 // and the pitch from the vertical one ✓).
-                if p.pitch == 0.0 && p.yaw == 0.0 {
+                if p.kind == ProjectileKind::Arrow && p.last_pitch == 0.0 && p.last_yaw == 0.0 {
                     let horizontal = (p.mot_x * p.mot_x + p.mot_z * p.mot_z).sqrt();
                     p.yaw = (p.mot_x.atan2(p.mot_z) * 180.0 / std::f64::consts::PI) as f32;
                     p.pitch = (p.mot_y.atan2(horizontal) * 180.0 / std::f64::consts::PI) as f32;
+                    p.last_yaw = p.yaw;
+                    p.last_pitch = p.pitch;
                 }
                 p.ticks_in_air += 1;
                 p.x = next_x;
                 p.y = next_y;
                 p.z = next_z;
 
+                // Java `EntityArrow.m_()` (`EntityArrow.java:229-250`): the
+                // rotation follows the motion ✓ and it is smoothed with the
+                // rotation of the previous tick ✓ (`0.2F` ✓).
+                {
+                    let horizontal = (p.mot_x * p.mot_x + p.mot_z * p.mot_z).sqrt();
+                    let yaw = (p.mot_x.atan2(p.mot_z) * 180.0 / std::f64::consts::PI) as f32;
+                    let pitch = (p.mot_y.atan2(horizontal) * 180.0 / std::f64::consts::PI) as f32;
+                    p.yaw = p.last_yaw + (yaw - p.last_yaw) * 0.2;
+                    p.pitch = p.last_pitch + (pitch - p.last_pitch) * 0.2;
+                }
                 match p.kind {
                     ProjectileKind::FishingHook => {
                         if blocks::is_water(self.world.get_block(bx, by, bz)) {
@@ -13288,17 +13305,13 @@ mod tests {
     /// the tick of the first divergence ✓ — after it the behaviour differs
     /// (see W-54 of the plan ✓).
     const KNOWN_DIVERGENCES: &[(&str, usize)] = &[
-        // The arrow sticks in the ground in the port and flies through it in
-        // the reference ✓ (the box of the collision ✓).
+        // The projectiles stick in the ground in the port and fly through it
+        // in the reference ✓ (the box of the collision ✓).
         ("arrow", 12),
-        // The snowball and the egg smooth their rotation in the reference
-        // ✓ (`EntityArrow.m_()` ✓ — the smoothing ✓) and the port does not ✓.
-        ("snowball", 1),
-        ("egg", 1),
-        // The dropped item, the primed TNT and the boat have another initial
-        // state in the port and in the reference ✓.
-        ("item", 0),
-        ("tnt", 0),
+        ("snowball", 12),
+        ("egg", 12),
+        // The boat has another initial state in the port and in the
+        // reference ✓ (`EntityBoat` ✓).
         ("boat", 0),
     ];
 
