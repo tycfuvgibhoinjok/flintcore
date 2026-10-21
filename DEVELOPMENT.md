@@ -413,8 +413,30 @@ Mob movement parity harness:
     of the world (`BlockTNT.d`).
   - The tags of the NBT keep the order of their insertion: the files of
     the world are the same byte for byte on every run.
-  - The file `level.dat` is written when the server stops and by the
-    command `save-all`, not every five seconds.
+  - The file `level.dat` is written when the server stops, by the command
+    `save-all` and by the periodic saving of the world, not every five
+    seconds.
+  - The tracker of the entities follows the reference: every type of
+    entity has its own interval of the update of the position (the player
+    2, the animals 3, the boat and the minecart 5, the snowball, the egg,
+    the fireball and the primed TNT 10, the arrow and the item 20, the
+    painting never), the packet is sent at once when the entity was
+    pushed, jumped or hurt, the radius of the tracking is a square in XZ
+    and is limited by the distance of the view, the threshold of the
+    rotation is one, and the tracker is updated every tick.
+  - The world is saved every forty ticks: the data of the level, the data
+    of the players and up to twenty four chunks. The keep-alive is not
+    sent (the reference never sends it), the connection of the client is
+    kept alive by the packet of the time.
+  - The connection that received nothing for twelve hundred ticks is
+    disconnected, and the player that sends more than a thousand packets
+    in five seconds is disconnected with a message.
+  - The answers of the commands go to the executor and to the operators,
+    the command `say` goes to everybody; the texts of the commands are the
+    texts of the reference.
+  - The chat of the player is checked like in the reference: the length
+    before the trimming, the characters of the file `font.txt` (the
+    colour character is not in it) and no translation of the `&`.
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.
