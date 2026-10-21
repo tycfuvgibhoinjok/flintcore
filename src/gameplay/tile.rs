@@ -29,6 +29,19 @@ pub enum TileEntityKind {
     RecordPlayer {
         record: i32,
     },
+    /// Java `TileEntityPiston` (`TileEntityPiston.java` ✓).
+    Piston {
+        /// The id of the base block ✓ (`blockId` ✓).
+        block_id: i32,
+        /// The data of the base block ✓ (`blockData` ✓).
+        block_data: i32,
+        /// The direction of the piston ✓ (`facing` ✓).
+        facing: i32,
+        /// The progress of the movement ✓ (`progress` ✓).
+        progress: f32,
+        /// The piston is extending ✓ (`extending` ✓).
+        extending: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +113,32 @@ impl TileEntity {
             y,
             z,
             kind: TileEntityKind::Sign { lines },
+        }
+    }
+
+    /// Java `TileEntityPiston(int, int, int, boolean, boolean)`: the base
+    /// block, its data, the direction, the flag of the movement and the flag
+    /// of the extension ✓.
+    pub fn new_piston(
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: i32,
+        block_data: i32,
+        facing: i32,
+        extending: bool,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            z,
+            kind: TileEntityKind::Piston {
+                block_id,
+                block_data,
+                facing,
+                progress: 0.0,
+                extending,
+            },
         }
     }
 
@@ -295,6 +334,21 @@ impl TileEntity {
                     root.insert("Record", NbtTag::Int(*record));
                 }
             }
+            TileEntityKind::Piston {
+                block_id,
+                block_data,
+                facing,
+                progress,
+                extending,
+            } => {
+                // Java `TileEntityPiston.b(NBTTagCompound)` ✓.
+                root.insert("id", NbtTag::String("Piston".into()));
+                root.insert("blockId", NbtTag::Int(*block_id));
+                root.insert("blockData", NbtTag::Int(*block_data));
+                root.insert("facing", NbtTag::Int(*facing));
+                root.insert("progress", NbtTag::Float(*progress));
+                root.insert("extending", NbtTag::Byte(i8::from(*extending)));
+            }
         }
 
         root
@@ -399,6 +453,21 @@ impl TileEntity {
                 let record = tag.get_i32("Record").unwrap_or(0);
                 TileEntityKind::RecordPlayer { record }
             }
+            "Piston" => {
+                // Java `TileEntityPiston.a(NBTTagCompound)` ✓.
+                let block_id = tag.get_i32("blockId").unwrap_or(0);
+                let block_data = tag.get_i32("blockData").unwrap_or(0);
+                let facing = tag.get_i32("facing").unwrap_or(0);
+                let progress = tag.get_f32("progress").unwrap_or(0.0);
+                let extending = tag.get_bool("extending").unwrap_or(false);
+                TileEntityKind::Piston {
+                    block_id,
+                    block_data,
+                    facing,
+                    progress,
+                    extending,
+                }
+            }
             _ => return None,
         };
 
@@ -438,6 +507,32 @@ mod tests {
             TileEntity::from_nbt(&tag).map(|t| t.kind),
             Some(TileEntityKind::Note { note: 0 }),
             "the note is clamped to zero"
+        );
+    }
+
+    /// The tile entity of the piston is not lost.
+    ///
+    /// Java `ChunkLoader.java:200-211` restores every known tile entity ✓
+    /// (`TileEntity.c(NBTTagCompound)` ✓) — the tile entity of the piston is
+    /// one of them ✓ (`TileEntityPiston.java` ✓).
+    #[test]
+    fn the_tile_entity_of_the_piston_is_not_lost() {
+        let piston = TileEntity::new_piston(1, 2, 3, 33, 5, 2, true);
+        let tag = piston.to_nbt();
+        let restored = TileEntity::from_nbt(&tag).expect("the tile entity is restored");
+        assert_eq!(restored.x, 1);
+        assert_eq!(restored.y, 2);
+        assert_eq!(restored.z, 3);
+        assert_eq!(
+            restored.kind,
+            TileEntityKind::Piston {
+                block_id: 33,
+                block_data: 5,
+                facing: 2,
+                progress: 0.0,
+                extending: true,
+            },
+            "the state of the piston is restored"
         );
     }
 }

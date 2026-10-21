@@ -1060,6 +1060,22 @@ impl World {
         let hz = z + dz;
         self.java_set_raw_type_id_and_data(hx, hy, hz, blocks::PISTON_HEAD, ext_meta);
         self.java_apply_physics(hx, hy, hz, blocks::PISTON_HEAD as i32);
+        // Java `BlockPiston.a`: the moving piston gets the tile entity of the
+        // piston ✓ (`BlockPistonMoving.a(this.id, i1, i1, false, true)` ✓).
+        let piston_id = if is_sticky {
+            blocks::STICKY_PISTON
+        } else {
+            blocks::PISTON
+        };
+        self.set_world_tile_entity(crate::gameplay::tile::TileEntity::new_piston(
+            hx,
+            hy,
+            hz,
+            piston_id as i32,
+            dir as i32,
+            dir as i32,
+            true,
+        ));
         self.pending_piston_syncs.push((sync_time, hx, hy, hz));
         true
     }
@@ -1076,6 +1092,8 @@ impl World {
         if self.get_block(hx, hy, hz) == blocks::PISTON_HEAD {
             self.java_set_raw_type_id_and_data(hx, hy, hz, blocks::AIR, 0);
             self.java_apply_physics(hx, hy, hz, blocks::PISTON_HEAD as i32);
+            // The tile entity of the moving piston goes away with it ✓.
+            self.remove_world_tile_entity(hx, hy, hz);
             self.pending_piston_syncs.push((sync_time, hx, hy, hz));
         }
 
