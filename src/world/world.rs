@@ -3980,7 +3980,7 @@ mod tests {
         world.world_random.trace = true;
 
         let mut trace: Vec<String> = Vec::new();
-        let mut step = |name: &str, world: &mut World, trace: &mut Vec<String>| {
+        let step = |name: &str, world: &mut World, trace: &mut Vec<String>| {
             let draws: Vec<String> = world
                 .world_random
                 .trace_bits
