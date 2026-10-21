@@ -815,7 +815,12 @@ pub struct WorldgenConfig {
     pub generate_tallgrass: bool,
     pub custom_ore_seed_enabled: bool,
     pub custom_ore_seed: i64,
+    /// Java `world.settings.block-tree-growth.enabled` of the reference.
     pub block_tree_growth_enabled: bool,
+    /// Java `world.settings.block-tree-growth.list` of the reference: the
+    /// blocks that the leaves do not replace.  The default of the reference
+    /// is an empty list (`PoseidonConfig`: the key is missing ⇒ the list is
+    /// empty).
     pub block_tree_growth_blacklist: Vec<u8>,
 }
 
@@ -834,7 +839,7 @@ impl Default for WorldgenConfig {
             custom_ore_seed_enabled: false,
             custom_ore_seed: 0,
             block_tree_growth_enabled: true,
-            block_tree_growth_blacklist: vec![54, 63, 68],
+            block_tree_growth_blacklist: Vec::new(),
         }
     }
 }
@@ -1021,6 +1026,21 @@ mod tests {
         assert!(!parsed.mechanics.allow_minecart_boosters);
         assert!(parsed.fixes.block_pistons_pushing_furnaces);
         assert_eq!(parsed.spawning.monster_cap, 70);
+    }
+
+    /// The list of the blocks that the leaves do not replace is empty by
+    /// default.
+    ///
+    /// Java `PoseidonConfig`: the key `world.settings.block-tree-growth.list`
+    /// is missing by default, so the list of the blocked blocks is empty.
+    #[test]
+    fn the_default_blacklist_of_the_tree_growth_is_empty() {
+        let config = Config::default();
+        assert!(config.worldgen.block_tree_growth_enabled);
+        assert!(
+            config.worldgen.block_tree_growth_blacklist.is_empty(),
+            "the default list of the blocked blocks is empty"
+        );
     }
 
     #[test]

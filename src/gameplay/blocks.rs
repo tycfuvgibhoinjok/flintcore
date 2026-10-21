@@ -625,12 +625,6 @@ pub fn is_solid_normal_block(id: u8) -> bool {
     )
 }
 
-/// Java `Block.leafDecayBlacklist` (configured ids 54, 63, 68): tree
-/// generation never replaces these blocks with leaves.
-pub fn leaf_decay_blacklist(id: u8) -> bool {
-    matches!(id, CHEST | SIGN | WALL_SIGN)
-}
-
 pub fn is_liquid(id: u8) -> bool {
     matches!(id, WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA)
 }
