@@ -191,7 +191,8 @@ impl Server {
                 world.compact_all_chunks();
             }
         }
-        let player_store = crate::world::storage::PlayerStore::new(world.world_dir());
+        let player_store =
+            crate::world::storage::PlayerStore::with_seed(world.world_dir(), world.seed());
         let view_distance = config.world.view_distance;
 
         // Java `MinecraftServer`: the Nether world is created up front when
@@ -430,6 +431,14 @@ impl Server {
                         let _ = self.player_store.save_player(player);
                     }
                 }
+                // Java `WorldData.a(List)`: the compound `Player` of the
+                // file of the level holds the data of the first player.
+                let first_player = self
+                    .entities
+                    .iter_players()
+                    .next()
+                    .map(|player| self.player_store.player_to_nbt(player));
+                self.world.set_level_player(first_player);
                 let _ = self.world.save_level_data();
                 let _ = self.world.save_chunks_incremental(24);
                 if self.nether.is_some() {

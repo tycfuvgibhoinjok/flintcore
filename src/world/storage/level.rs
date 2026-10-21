@@ -25,6 +25,9 @@ pub struct LevelData {
     pub raining: bool,
     pub thunder_time: i32,
     pub thundering: bool,
+    /// Java `WorldData.a(List)`: the data of the first player of the world
+    /// is kept in the compound `Player`.
+    pub player: Option<NbtTag>,
 }
 
 impl Default for LevelData {
@@ -37,6 +40,7 @@ impl Default for LevelData {
             spawn_yaw: 0.0,
             spawn_pitch: 0.0,
             time: 0,
+            player: None,
             last_played: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -73,6 +77,9 @@ impl LevelData {
             "thundering",
             NbtTag::Byte(if self.thundering { 1 } else { 0 }),
         );
+        if let Some(player) = &self.player {
+            data.insert("Player", player.clone());
+        }
 
         let mut root = NbtTag::compound();
         root.insert("Data", data);
@@ -145,7 +152,15 @@ impl LevelData {
             _ => false,
         };
 
+        // Java `WorldData.a(List)`: the compound `Player` holds the data of
+        // the first player of the world.
+        let player = match data.get("Player") {
+            Some(player @ NbtTag::Compound(_)) => Some(player.clone()),
+            _ => None,
+        };
+
         Ok(Self {
+            player,
             seed,
             spawn_x,
             spawn_y,
@@ -270,6 +285,31 @@ impl SessionLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file of the level holds the compound `Player`.
+    ///
+    /// Java `WorldData.a(List)`: the compound `Player` holds the data of
+    /// the first player of the world.
+    #[test]
+    fn the_file_of_the_level_holds_the_compound_of_the_player() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("flintcore_level_player_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let mut level = LevelData::default();
+        let mut player = NbtTag::compound();
+        player.insert("Pos", NbtTag::List(vec![NbtTag::Double(1.0)]));
+        level.player = Some(player.clone());
+        level.save_to_dir(&temp_dir).unwrap();
+
+        let bytes = fs::read(temp_dir.join("level.dat")).unwrap();
+        let (_name, nbt) = NbtTag::from_gzip(&bytes).unwrap();
+        let data = nbt.get_compound("Data").expect("the data of the level");
+        assert!(data.get("Player").is_some(), "the compound of the player");
+        let loaded = LevelData::load_from_dir(&temp_dir).unwrap().unwrap();
+        assert!(loaded.player.is_some(), "the player of the level");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn level_data_atomic_round_trip() {

@@ -842,6 +842,11 @@ impl World {
         Ok(())
     }
 
+    /// The data of the first player of the world (`WorldData.a(List)`).
+    pub fn set_level_player(&mut self, player: Option<crate::world::storage::NbtTag>) {
+        self.level_data.borrow_mut().player = player;
+    }
+
     /// Java `PlayerNBTManager.save`: the file `level.dat` is written.
     ///
     /// The reference writes it into `level.dat_new`, moves the old file to

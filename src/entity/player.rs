@@ -67,6 +67,8 @@ pub struct Player {
     pub vehicle_id: Option<i32>,
     pub bed_pos: Option<(i32, i32, i32)>,
     pub spawn_bed: Option<(i32, i32, i32)>,
+    /// Java `EntityHuman.spawnWorld`: the world of the spawn point.
+    pub spawn_world: String,
     pub inventory: InventoryPlayer,
     pub open_container: Option<OpenContainer>,
     pub next_window_id: u8,
@@ -144,6 +146,7 @@ impl Player {
             vehicle_id: None,
             bed_pos: None,
             spawn_bed: None,
+            spawn_world: String::new(),
             inventory: InventoryPlayer::new(),
             open_container: None,
             next_window_id: 0,

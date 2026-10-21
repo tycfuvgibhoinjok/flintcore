@@ -8,12 +8,53 @@ use crate::world::storage::nbt::NbtTag;
 
 pub struct PlayerStore {
     players_dir: PathBuf,
+    /// The UUID of the world (`World.getUUID()`).
+    world_uuid: (i64, i64),
+}
+
+/// The hash of FNV-1a.
+fn fnv1a(bytes: &[u8], seed: u64) -> i64 {
+    let mut hash = seed;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash as i64
+}
+
+/// The UUID of the world (`World.getUUID()`).
+///
+/// The reference draws the UUID of the world at random, the port derives
+/// it from the seed of the world, so that the files of the world are the
+/// same from run to run.
+pub fn world_uuid(seed: i64) -> (i64, i64) {
+    (
+        fnv1a(&seed.to_le_bytes(), 0xcbf2_9ce4_8422_2325),
+        fnv1a(&seed.to_le_bytes(), 0x9e37_79b9_7f4a_7c15),
+    )
+}
+
+/// The UUID of the player (`Entity.uniqueId`).
+///
+/// The reference draws it at random, the port derives it from the name of
+/// the player.
+pub fn player_uuid(name: &str) -> (i64, i64) {
+    (
+        fnv1a(name.as_bytes(), 0xcbf2_9ce4_8422_2325),
+        fnv1a(name.as_bytes(), 0x9e37_79b9_7f4a_7c15),
+    )
 }
 
 impl PlayerStore {
     pub fn new(world_dir: &Path) -> Self {
+        Self::with_seed(world_dir, 0)
+    }
+
+    /// The store of the players of the world with the given seed.
+    pub fn with_seed(world_dir: &Path, seed: i64) -> Self {
         Self {
             players_dir: world_dir.join("players"),
+            world_uuid: world_uuid(seed),
         }
     }
 
@@ -101,9 +142,8 @@ impl PlayerStore {
         Ok(true)
     }
 
-    pub fn save_player(&self, player: &Player) -> Result<()> {
-        fs::create_dir_all(&self.players_dir)?;
-
+    /// The NBT of the player (`Entity.d()`).
+    pub fn player_to_nbt(&self, player: &Player) -> NbtTag {
         let mut root = NbtTag::compound();
         root.insert(
             "Pos",
@@ -134,10 +174,20 @@ impl PlayerStore {
         );
         root.insert("Dimension", NbtTag::Int(player.dimension));
         root.insert("Health", NbtTag::Short(player.health));
+        // Java `Entity.d()`: the UUID of the world and of the entity.
+        root.insert("WorldUUIDLeast", NbtTag::Long(self.world_uuid.0));
+        root.insert("WorldUUIDMost", NbtTag::Long(self.world_uuid.1));
+        let player_uuid = player_uuid(&player.username);
+        root.insert("UUIDLeast", NbtTag::Long(player_uuid.0));
+        root.insert("UUIDMost", NbtTag::Long(player_uuid.1));
+        // Java `EntityHuman.b()`: the sleep and the spawn point.
+        root.insert("Sleeping", NbtTag::Byte(i8::from(player.sleeping)));
+        root.insert("SleepTimer", NbtTag::Short(i16::from(player.sleep_ticks)));
         if let Some((sx, sy, sz)) = player.spawn_bed {
             root.insert("SpawnX", NbtTag::Int(sx));
             root.insert("SpawnY", NbtTag::Int(sy));
             root.insert("SpawnZ", NbtTag::Int(sz));
+            root.insert("SpawnWorld", NbtTag::String(player.spawn_world.clone()));
         }
 
         let mut inventory_list = Vec::new();
@@ -163,7 +213,13 @@ impl PlayerStore {
             }
         }
         root.insert("Inventory", NbtTag::List(inventory_list));
+        root
+    }
 
+    pub fn save_player(&self, player: &Player) -> Result<()> {
+        fs::create_dir_all(&self.players_dir)?;
+
+        let root = self.player_to_nbt(player);
         let bytes = root.to_gzip("")?;
         let final_file = self.player_file(&player.username);
         let tmp_file = self
@@ -183,6 +239,47 @@ impl PlayerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file of the player holds the tags of the reference.
+    ///
+    /// Java `Entity.d()`: `WorldUUIDLeast`, `WorldUUIDMost`, `UUIDLeast`
+    /// and `UUIDMost`; Java `EntityHuman.b()`: `Sleeping`, `SleepTimer`
+    /// and `SpawnWorld`.
+    #[test]
+    fn the_file_of_the_player_holds_the_tags_of_the_reference() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("flintcore_player_tags_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let store = PlayerStore::with_seed(&temp_dir, 12345);
+        let mut player = Player::new(1, 1, "Steve".into(), 0.0, 64.0, 0.0);
+        player.spawn_bed = Some((10, 65, 20));
+        player.spawn_world = "TestLevel".to_string();
+        player.sleep_ticks = 3;
+        store.save_player(&player).unwrap();
+
+        let bytes = fs::read(store.player_file("Steve")).unwrap();
+        let (_name, nbt) = NbtTag::from_gzip(&bytes).unwrap();
+        assert!(
+            nbt.get_i64("WorldUUIDLeast").is_some(),
+            "the UUID of the world"
+        );
+        assert!(
+            nbt.get_i64("WorldUUIDMost").is_some(),
+            "the UUID of the world"
+        );
+        assert!(nbt.get_i64("UUIDLeast").is_some(), "the UUID of the player");
+        assert!(nbt.get_i64("UUIDMost").is_some(), "the UUID of the player");
+        assert_eq!(nbt.get_i8("Sleeping"), Some(0), "the sleep of the player");
+        assert_eq!(nbt.get_i16("SleepTimer"), Some(3), "the timer of the sleep");
+        assert_eq!(
+            nbt.get_str("SpawnWorld"),
+            Some("TestLevel"),
+            "the world of the spawn point"
+        );
+        assert_eq!(nbt.get_i32("SpawnX"), Some(10), "the spawn point");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn player_store_round_trip() {
