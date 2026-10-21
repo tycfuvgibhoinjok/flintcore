@@ -1110,7 +1110,11 @@ impl Mob {
         if looking_back {
             tilt *= -1.0;
         }
-        // The tilt of the head (`EntityLiving.O` ✓).
+        // The tilt of the head (`EntityLiving.O` ✓) and its previous value
+        // (`EntityLiving.P` ✓ — the reference takes it in the post-update
+        // `EntityLiving.R()` ✓, and `Entity.m_()` calls it at the beginning
+        // of the tick ✓, so the previous value is the tilt of the last tick
+        // ✓).
         self.prev_look_pitch = self.look_pitch;
         self.look_pitch += tilt;
     }
@@ -2523,9 +2527,23 @@ mod tests {
         mob.update_look();
         assert!(mob.look_pitch > 0.0, "the head is tilted by the movement");
         assert!(mob.swing > 0.0, "the arm swings while the mob walks");
-        // The previous values are the ones of the last tick ✓.
+        // The previous swing is the swing of the last tick ✓ (the reference
+        // takes it in `EntityLiving.m_()` ✓).
         assert_eq!(mob.prev_swing, 0.0, "the previous swing is kept");
+        // The previous tilt is the tilt of the last tick ✓ (`EntityLiving.P` ✓).
         assert_eq!(mob.prev_look_pitch, 0.0, "the previous tilt is kept");
+
+        // The second tick: the tilt grows and the previous value is the tilt
+        // of the first tick ✓.
+        mob.last_x = mob.x;
+        mob.last_z = mob.z;
+        mob.x += 1.0;
+        mob.update_look();
+        assert_eq!(
+            mob.prev_look_pitch, 3.0,
+            "the previous tilt is the last one"
+        );
+        assert_eq!(mob.look_pitch, 6.0, "the tilt grows with the movement");
 
         // The mob in the air does not swing ✓.
         let mut mob = Mob::new(1, MobType::Pig, 0.0, 64.0, 0.0, &mut JavaRandom::new(0));
@@ -2535,6 +2553,64 @@ mod tests {
         mob.x += 1.0;
         mob.update_look();
         assert_eq!(mob.swing, 0.0, "the arm does not swing in the air");
+    }
+
+    /// The indices of the entries of the metadata.
+    fn metadata_indices(bytes: &[u8]) -> Vec<u8> {
+        let mut indices = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let head = bytes[i];
+            if head == 127 {
+                // The terminator of the metadata ✓.
+                break;
+            }
+            let kind = head >> 5;
+            indices.push(head & 0x1f);
+            i += 1;
+            i += match kind {
+                0 => 1, // a byte ✓
+                1 => 2, // a short ✓
+                2 => 4, // an int ✓
+                3 => 8, // a long ✓
+                4 => {
+                    // A string ✓: the length (two bytes ✓) and the units ✓.
+                    let len = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
+                    2 + 2 * len
+                }
+                _ => 0,
+            };
+        }
+        indices
+    }
+
+    /// The metadata of the mob has only the flags and the slots of its class.
+    ///
+    /// Java Beta 1.7.3: `Entity.b()` registers the index 0 (the flags ✓) and
+    /// every class registers its own slots (the pig: 16 ✓, the creeper: 16 and
+    /// 17 ✓, the wolf: 16, 17 and 18 ✓) — `EntityLiving` registers **nothing**
+    /// ✓, so there is no slot for the tilt of the head or the swing of the arm
+    /// ✓, and the protocol of Beta 1.7.3 has no packet for them either ✓
+    /// (the client draws the head of the mob itself ✓).
+    #[test]
+    fn the_metadata_of_the_mob_has_only_the_slots_of_its_class() {
+        let cases = [
+            (MobType::Pig, vec![0u8, 16]),
+            (MobType::Sheep, vec![0, 16]),
+            (MobType::Creeper, vec![0, 16, 17]),
+            (MobType::Slime, vec![0, 16]),
+            (MobType::Ghast, vec![0, 16]),
+            (MobType::Wolf, vec![0, 16, 17, 18]),
+            (MobType::Zombie, vec![0]),
+        ];
+        for (mob_type, expected) in cases {
+            let mob = Mob::new(1, mob_type, 0.0, 64.0, 0.0, &mut JavaRandom::new(0));
+            assert_eq!(
+                metadata_indices(&mob.encode_metadata()),
+                expected,
+                "the slots of the metadata of the {mob_type:?}"
+            );
+        }
     }
 
     #[test]
