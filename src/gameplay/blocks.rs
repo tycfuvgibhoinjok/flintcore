@@ -898,9 +898,13 @@ pub fn drop_naturally(
 /// Java `Block.a(Random)` — base drop count before per-item roll.
 pub fn drop_count(block_id: u8, rng: &mut JavaRandom) -> usize {
     match block_id {
+        // The dead bush and the head of the piston are not in the list: the
+        // reference drops the item of the base class for them
+        // (`Block.a(Random)` = one ✓) and draws the chance of the item ✓,
+        // even though the item itself is nothing ✓ — the draws decide the
+        // stream of the world ✓.
         AIR | WATER | STATIONARY_WATER | LAVA | STATIONARY_LAVA | GLASS | BOOKSHELF | FIRE
-        | MOB_SPAWNER | SNOW | ICE | PORTAL | CAKE | PISTON_HEAD | PISTON_MOVING | DEAD_BUSH
-        | TNT => 0,
+        | MOB_SPAWNER | SNOW | ICE | PORTAL | CAKE | PISTON_HEAD | TNT => 0,
         LEAVES => {
             if rng.next_i32_bound(20) == 0 {
                 1
@@ -1089,6 +1093,62 @@ mod tests {
         assert_eq!(drops.len(), 1);
         assert_eq!(drops[0].item.id, LEAVES as i16);
         assert_eq!(rng.draws, 3, "only the position of the item is drawn");
+    }
+
+    /// The drops of the blocks are the drops of the reference.
+    ///
+    /// The dump of the reference (`tools/poseidon_dump/PoseidonDrops.java`
+    /// ✓) holds the number of the dropped items and the dropped item for
+    /// every block and every metadata ✓, the file
+    /// `tests/golden/poseidon_drops.txt` holds them ✓.  The two values are
+    /// drawn from the random of the world in this order ✓, so the seed of
+    /// the dump decides them ✓.
+    #[test]
+    fn the_drops_of_the_blocks_are_the_drops_of_the_reference() {
+        let golden = include_str!("../../tests/golden/poseidon_drops.txt");
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for line in golden.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let [id, metadata, count, item] = parts[..] else {
+                continue;
+            };
+            let (Ok(id), Ok(metadata), Ok(count), Ok(item)) = (
+                id.parse::<u8>(),
+                metadata.parse::<u8>(),
+                count.parse::<usize>(),
+                item.parse::<i16>(),
+            ) else {
+                continue;
+            };
+            let mut rng = JavaRandom::new(12345);
+            let actual_count = drop_count(id, &mut rng);
+            let actual_item = drop_item_id(id, metadata, &mut rng);
+            checked += 1;
+            // The item of a block that drops nothing is never used: the
+            // reference returns the id of the block or zero, the port
+            // returns minus one ✓ — the behaviour is the same ✓.
+            // The item of a block that drops nothing is never used: the
+            // reference returns the id of the block or zero, the port
+            // returns minus one ✓ — the behaviour is the same ✓.
+            let same_item =
+                actual_item == item || (actual_item <= 0 && item <= 0 && count == actual_count);
+            if actual_count != count || (count > 0 && !same_item) {
+                failures.push(format!(
+                    "the block {id}:{metadata} drops {actual_count} {actual_item}, \
+                     the reference drops {count} {item}"
+                ));
+            }
+        }
+        assert!(checked > 1000, "the dump of the reference is empty");
+        assert!(
+            failures.is_empty(),
+            "the drops of the blocks differ from the reference:\n{}",
+            failures.join("\n")
+        );
     }
 
     /// The tables of the blocks are the tables of the reference.

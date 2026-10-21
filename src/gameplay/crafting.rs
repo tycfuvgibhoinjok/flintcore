@@ -213,6 +213,14 @@ impl CraftingManager {
         mgr
     }
 
+    /// The recipes of the manager.
+    ///
+    /// The dump of the recipes is compared with the dump of the reference
+    /// (`tools/poseidon_dump/PoseidonCrafting.java` ✓).
+    pub fn recipes(&self) -> &[Recipe] {
+        &self.recipes
+    }
+
     pub fn add_shaped(
         &mut self,
         result: ItemStack,
@@ -1044,6 +1052,79 @@ mod tests {
     fn recipe_count_matches_poseidon() {
         let mgr = CraftingManager::instance();
         assert_eq!(mgr.recipe_count(), 151);
+    }
+
+    /// The recipes of the port are the recipes of the reference.
+    ///
+    /// The dump of the reference (`tools/poseidon_dump/PoseidonCrafting.java`
+    /// ✓) holds the recipes in a normalized form ✓, the file
+    /// `tests/golden/poseidon_crafting.txt` holds them ✓.
+    #[test]
+    fn the_recipes_of_the_port_are_the_recipes_of_the_reference() {
+        let golden = include_str!("../../tests/golden/poseidon_crafting.txt");
+        let expected: Vec<String> = golden
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .collect();
+
+        let mgr = CraftingManager::instance();
+        let mut actual: Vec<String> = mgr
+            .recipes()
+            .iter()
+            .map(|recipe| match recipe {
+                Recipe::Shaped(r) => {
+                    let cells: Vec<String> = r
+                        .pattern
+                        .iter()
+                        .map(|cell| match cell {
+                            Some(ingredient) => format!("{}:{}", ingredient.id, ingredient.damage),
+                            None => "-".to_string(),
+                        })
+                        .collect();
+                    format!(
+                        "shaped {}:{}:{} {}x{} {}",
+                        r.result.id,
+                        r.result.count,
+                        r.result.damage,
+                        r.width,
+                        r.height,
+                        cells.join(" ")
+                    )
+                }
+                Recipe::Shapeless(r) => {
+                    let ingredients: Vec<String> = r
+                        .ingredients
+                        .iter()
+                        .map(|ingredient| format!("{}:{}", ingredient.id, ingredient.damage))
+                        .collect();
+                    format!(
+                        "shapeless {}:{}:{} {}",
+                        r.result.id,
+                        r.result.count,
+                        r.result.damage,
+                        ingredients.join(" ")
+                    )
+                }
+            })
+            .collect();
+
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        actual.sort();
+
+        let missing: Vec<&String> = expected_sorted
+            .iter()
+            .filter(|line| !actual.contains(line))
+            .collect();
+        let extra: Vec<&String> = actual
+            .iter()
+            .filter(|line| !expected_sorted.contains(line))
+            .collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "the recipes differ from the reference:\n  missing: {missing:?}\n  extra: {extra:?}"
+        );
     }
 
     #[test]
