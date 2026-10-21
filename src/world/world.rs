@@ -1032,25 +1032,6 @@ impl World {
         }
     }
 
-    /// Java `World.s(int, int, int)`: can a mob live at the position?
-    ///
-    /// The height of the terrain has to be below the position and the biome
-    /// has to be one where the mobs can spawn.
-    pub fn can_spawn_at(&self, x: i32, y: i32, z: i32) -> bool {
-        if !self.is_chunk_loaded(ChunkPos::new(x >> 4, z >> 4)) {
-            return false;
-        }
-        if self.height_map_at(x, z) > y {
-            return false;
-        }
-        // The biomes of the reference where the mobs cannot spawn (the ocean
-        // and the ones with the flag of the jungle).
-        !matches!(
-            self.biome_at(x, z),
-            crate::world::biome::Biome::Swampland | crate::world::biome::Biome::Sky
-        )
-    }
-
     /// Java `World.d(AxisAlignedBB)`: is there a fire or a lava block in the
     /// box?
     pub fn has_fire_or_lava_in(&self, aabb: &crate::entity::physics::Aabb) -> bool {

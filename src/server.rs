@@ -5415,14 +5415,24 @@ impl Server {
                     .get_mob(mob_id)
                     .filter(|m| m.wolf_tamed && !m.wolf_sitting)
                     .map(|m| m.wolf_owner.clone());
-                owner_name.and_then(|name| {
-                    players_snapshot
-                        .iter()
-                        .find(|(_, uname, _, _, _, dead)| {
-                            !dead && uname.eq_ignore_ascii_case(&name)
-                        })
-                        .map(|&(_, _, ox, oy, oz, _)| (ox, oy, oz))
-                })
+                match owner_name {
+                    Some(name) => {
+                        let owner = players_snapshot
+                            .iter()
+                            .find(|(_, uname, _, _, _, dead)| {
+                                !dead && uname.eq_ignore_ascii_case(&name)
+                            })
+                            .map(|&(_, _, ox, oy, oz, _)| (ox, oy, oz));
+                        if owner.is_none() {
+                            // Java `EntityWolf.c_()`: the owner of the wolf is
+                            // offline and the wolf is not in the water — the
+                            // wolf sits down ✓.
+                            self.wolf_sits_without_owner(mob_id);
+                        }
+                        owner
+                    }
+                    None => None,
+                }
             } else {
                 None
             };
@@ -5834,12 +5844,6 @@ impl Server {
                 }
             }
 
-            let in_rain = self.world.is_being_rained_on(
-                mx.floor() as i32,
-                my.floor() as i32,
-                mz.floor() as i32,
-            );
-
             // The collision boxes of the other entities (`World.getEntities`).
             entity_boxes.clear();
             self.collect_entity_boxes(mob_id, &mut entity_boxes);
@@ -5879,29 +5883,22 @@ impl Server {
                 // The void of the mob is handled in the update of the mob
                 // (`Entity.R()`).
 
-                // Wolf water shaking (`EntityWolf.v()`, `m_()`)
-                if mob.mob_type == MobType::Wolf {
-                    if mob.in_water || in_rain {
-                        mob.wolf_wet = true;
-                        mob.wolf_shaking = false;
-                        mob.wolf_shake_time = 0.0;
-                        mob.wolf_sitting = false;
-                    } else if mob.wolf_wet
-                        && !mob.wolf_shaking
-                        && mob.on_ground
-                        && mob.path.is_empty()
-                    {
-                        mob.wolf_shaking = true;
-                        mob.wolf_shake_time = 0.0;
-                        status_packets.push((mob_id, 8));
-                    } else if mob.wolf_shaking {
-                        mob.wolf_shake_time += 0.05;
-                        if mob.wolf_shake_time >= 2.0 {
-                            mob.wolf_wet = false;
-                            mob.wolf_shaking = false;
-                            mob.wolf_shake_time = 0.0;
-                        }
-                    }
+                // The start of the shake of the wolf (`EntityWolf.v()`): the
+                // wolf is wet ✓, it is not shaking yet ✓, it has no path ✓
+                // and it stands on the ground ✓.  The check of the wet and
+                // the timer of the shake are after the movement of the mob ✓
+                // (`EntityWolf.m_()` ✓).
+                if mob.mob_type == MobType::Wolf
+                    && !mob.dead
+                    && mob.wolf_wet
+                    && !mob.wolf_shaking
+                    && mob.on_ground
+                    && mob.path.is_empty()
+                {
+                    mob.wolf_shaking = true;
+                    mob.wolf_shake_time = 0.0;
+                    mob.wolf_prev_shake_time = 0.0;
+                    status_packets.push((mob_id, 8));
                 }
 
                 // Specific AI movement & attacks
@@ -6287,6 +6284,10 @@ impl Server {
             // the counter of the fire and the sound of the fizz. The
             // reference does it inside the movement of the entity, so it is
             // between the movement of the mob and the rest of its update.
+            // The shake of the wolf (`EntityWolf.m_()`): the check of the wet
+            // and the timer of the shake are after the movement of the mob ✓.
+            self.wolf_shake_phase(mob_id);
+
             self.mob_fire_phase(mob_id);
 
             // The sound of the step of the mob (`Entity.move()`): the
@@ -6868,6 +6869,91 @@ impl Server {
         }
     }
 
+    /// Java `EntityWolf.c_()`: the owner of the wolf is offline and the wolf
+    /// is not in the water — the wolf sits down ✓.
+    ///
+    /// The conditions of the reference ✓: the wolf is alive ✓, it has no
+    /// path ✓, it is tamed ✓, it is not ridden ✓ and it is not in the water
+    /// ✓ (`Entity.ad()` ✓).
+    fn wolf_sits_without_owner(&mut self, mob_id: i32) {
+        let Some(mob) = self.entities.get_mob_mut(mob_id) else {
+            return;
+        };
+        if mob.dead
+            || !mob.wolf_tamed
+            || mob.wolf_sitting
+            || !mob.path.is_empty()
+            || mob.vehicle_id.is_some()
+            || mob.in_water
+        {
+            return;
+        }
+        mob.wolf_sitting = true;
+    }
+
+    /// The shake of the wolf (`EntityWolf.m_()`).
+    ///
+    /// The wolf is wet when it is in the water ✓ or when it snows at its
+    /// position ✓ (`Entity.ac()` ✓).  A wet wolf does not shake ✓; a dry one
+    /// shakes for two seconds ✓ — the end of the shake is checked on the
+    /// **previous** time of the shake ✓ (`EntityWolf.java:170-176` ✓), so the
+    /// shake lasts forty-one ticks ✓.
+    fn wolf_shake_phase(&mut self, mob_id: i32) {
+        let Some(mob) = self.entities.get_mob_mut(mob_id) else {
+            return;
+        };
+        if mob.mob_type != MobType::Wolf || mob.dead {
+            return;
+        }
+        // `Entity.ac()`: the wolf is in the water or it rains at its
+        // position ✓ (`Entity.java:686-688` ✓ — `World.s(int, int, int)` ✓,
+        // the rain of the biome ✓).
+        let wet = mob.in_water
+            || self.world.is_being_rained_on(
+                mob.x.floor() as i32,
+                mob.y.floor() as i32,
+                mob.z.floor() as i32,
+            );
+        if wet {
+            mob.wolf_wet = true;
+            mob.wolf_shaking = false;
+            mob.wolf_shake_time = 0.0;
+            mob.wolf_prev_shake_time = 0.0;
+            mob.wolf_sitting = false;
+            return;
+        }
+        if !mob.wolf_shaking {
+            return;
+        }
+        // The sound of the shake (`EntityWolf.java:167-169`): the pitch is two
+        // numbers of the shared random of the entities ✓ — the reference does
+        // not send the sound to the client ✓.
+        if mob.wolf_shake_time == 0.0 {
+            let _ = self.entity_random.next_f32();
+            let _ = self.entity_random.next_f32();
+        }
+        mob.wolf_prev_shake_time = mob.wolf_shake_time;
+        mob.wolf_shake_time += 0.05;
+        if mob.wolf_prev_shake_time >= 2.0 {
+            mob.wolf_wet = false;
+            mob.wolf_shaking = false;
+            mob.wolf_prev_shake_time = 0.0;
+            mob.wolf_shake_time = 0.0;
+        }
+        if mob.wolf_shake_time > 0.4 {
+            // The drops of the water (`EntityWolf.java:178-188`): the number of
+            // the drops is the sine of the time of the shake ✓ and every drop
+            // draws two numbers of the shared random ✓.
+            let count =
+                (crate::util::math::sin((mob.wolf_shake_time - 0.4) * crate::entity::mob::JAVA_PI)
+                    * 7.0) as i32;
+            for _ in 0..count {
+                let _ = self.entity_random.next_f32();
+                let _ = self.entity_random.next_f32();
+            }
+        }
+    }
+
     /// The fire of the mob (`Entity.move()`).
     ///
     /// The reference checks the blocks of the box of the entity at the end
@@ -6879,10 +6965,11 @@ impl Server {
         let mut fizz = false;
         if let Some(mob) = self.entities.get_mob_mut(mob_id) {
             let box_ = mob.aabb();
-            // `Entity.ac()`: the entity is in the water or the position is
-            // one where the mobs can live.
+            // `Entity.ac()`: the entity is in the water or it rains at its
+            // position ✓ (`Entity.java:686-688` ✓ — `World.s(int, int, int)`
+            // ✓, the rain of the biome ✓).
             let burning = mob.was_in_water
-                || self.world.can_spawn_at(
+                || self.world.is_being_rained_on(
                     mob.x.floor() as i32,
                     mob.y.floor() as i32,
                     mob.z.floor() as i32,
@@ -14130,6 +14217,103 @@ mod tests {
             server.entities.iter_primed_tnts().count(),
             1,
             "the stone has no hook"
+        );
+    }
+
+    /// The shake of the wolf lasts forty-one ticks.
+    ///
+    /// Java `EntityWolf.m_()`: the end of the shake is checked on the
+    /// **previous** time of the shake (`this.i >= 2.0F` ✓,
+    /// `EntityWolf.java:170-176` ✓) — the time of the shake grows by 0.05 per
+    /// tick ✓ (a single precision ✓), so the shake lasts forty-two ticks ✓
+    /// (the accumulated value of the single precision passes two seconds only
+    /// on the forty-second tick ✓).
+    #[test]
+    fn the_shake_of_the_wolf_lasts_forty_two_ticks() {
+        let (mut server, mob_id) = mob_scenario_server("wolf");
+        // The wolf is wet (`EntityWolf.f`) and it shakes (`EntityWolf.g`).
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.wolf_wet = true;
+            mob.wolf_shaking = true;
+            mob.wolf_shake_time = 0.0;
+            mob.wolf_prev_shake_time = 0.0;
+        }
+        let mut ticks = 0;
+        loop {
+            server.wolf_shake_phase(mob_id);
+            ticks += 1;
+            let shaking = server
+                .entities
+                .get_mob(mob_id)
+                .map(|mob| mob.wolf_shaking)
+                .unwrap_or(false);
+            if !shaking {
+                break;
+            }
+            assert!(ticks < 100, "the shake of the wolf ends");
+        }
+        assert_eq!(ticks, 42, "the shake lasts forty-two ticks");
+    }
+
+    /// The sound of the shake of the wolf draws two numbers of the shared
+    /// random of the entities.
+    ///
+    /// Java `EntityWolf.java:167-169`: the tone of the sound is
+    /// `nextFloat() - nextFloat()` ✓ — the reference does not send the sound
+    /// to the client ✓, the numbers are drawn all the same ✓.
+    #[test]
+    fn the_sound_of_the_shake_of_the_wolf_draws_two_numbers() {
+        let (mut server, mob_id) = mob_scenario_server("wolf");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.wolf_wet = true;
+            mob.wolf_shaking = true;
+            mob.wolf_shake_time = 0.0;
+            mob.wolf_prev_shake_time = 0.0;
+        }
+        let before = server.entity_random.draws;
+        server.wolf_shake_phase(mob_id);
+        assert_eq!(
+            server.entity_random.draws - before,
+            2,
+            "the tone of the sound of the shake is drawn from the shared random"
+        );
+    }
+
+    /// The wolf whose owner is offline sits down.
+    ///
+    /// Java `EntityWolf.c_()`: the owner of the wolf is not in the world and
+    /// the wolf is not in the water — the wolf sits ✓.
+    #[test]
+    fn the_wolf_sits_when_its_owner_is_offline() {
+        let (mut server, mob_id) = mob_scenario_server("wolf");
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.wolf_tamed = true;
+            mob.wolf_owner = "TheOwner".to_string();
+            mob.wolf_sitting = false;
+        }
+        server.wolf_sits_without_owner(mob_id);
+        assert!(
+            server
+                .entities
+                .get_mob(mob_id)
+                .map(|mob| mob.wolf_sitting)
+                .unwrap_or(false),
+            "the wolf sits when its owner is offline"
+        );
+
+        // The wolf in the water does not sit (`Entity.ad()` ✓).
+        if let Some(mob) = server.entities.get_mob_mut(mob_id) {
+            mob.wolf_sitting = false;
+            mob.in_water = true;
+        }
+        server.wolf_sits_without_owner(mob_id);
+        assert!(
+            !server
+                .entities
+                .get_mob(mob_id)
+                .map(|mob| mob.wolf_sitting)
+                .unwrap_or(false),
+            "the wolf in the water does not sit"
         );
     }
 

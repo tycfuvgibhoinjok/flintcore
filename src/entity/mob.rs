@@ -362,9 +362,15 @@ pub struct Mob {
     pub wolf_angry: bool,
     pub wolf_tamed: bool,
     pub wolf_owner: String,
+    /// Java `EntityWolf.f`: the wolf is wet ✓.
     pub wolf_wet: bool,
+    /// Java `EntityWolf.g`: the wolf is shaking ✓.
     pub wolf_shaking: bool,
+    /// Java `EntityWolf.h`: the time of the shake ✓.
     pub wolf_shake_time: f32,
+    /// Java `EntityWolf.i`: the **previous** time of the shake ✓ — the shake
+    /// ends when it reaches two seconds ✓ (`EntityWolf.java:170-176` ✓).
+    pub wolf_prev_shake_time: f32,
     // Creeper
     pub creeper_fuse: i32,
     pub creeper_state: i8,
@@ -515,6 +521,7 @@ impl Mob {
             wolf_wet: false,
             wolf_shaking: false,
             wolf_shake_time: 0.0,
+            wolf_prev_shake_time: 0.0,
             creeper_fuse: 0,
             creeper_state: -1,
             creeper_powered: false,
