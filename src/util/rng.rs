@@ -13,6 +13,12 @@ pub struct JavaRandom {
     /// The raw values of the draws (a diagnostic trace).
     pub trace: bool,
     pub trace_values: Vec<i32>,
+    /// The number of the bits of every draw (a diagnostic trace).
+    ///
+    /// Java `Random.next(int bits)`: a draw of 31 bits and a draw of 32 bits
+    /// give different values ✓, so the trace of the reference needs the
+    /// number of the bits ✓.
+    pub trace_bits: Vec<u32>,
 }
 
 impl JavaRandom {
@@ -24,6 +30,7 @@ impl JavaRandom {
             draws: 0,
             trace: false,
             trace_values: Vec::new(),
+            trace_bits: Vec::new(),
         }
     }
 
@@ -39,6 +46,7 @@ impl JavaRandom {
         let value = (self.seed >> (48 - bits)) as i32;
         if self.trace {
             self.trace_values.push(value);
+            self.trace_bits.push(bits);
         }
         value
     }

@@ -3959,6 +3959,76 @@ mod tests {
         }
     }
 
+    /// The random of the world draws the same numbers as the reference.
+    ///
+    /// The harness `tools/poseidon_worldrand/PoseidonWorldRandomTrace.java`
+    /// dumps the draws of the reference, the golden file
+    /// `tests/golden/poseidon_world_random.txt` holds them.  The steps are
+    /// the calls that use the random of the world: the drops of a block
+    /// (`Block.dropNaturally`) and the weather (`World.i()`).
+    #[test]
+    fn the_random_of_the_world_draws_the_same_numbers_as_the_reference() {
+        let golden = include_str!("../../tests/golden/poseidon_world_random.txt");
+
+        let config = WorldConfig {
+            seed: 12345,
+            save_enabled: false,
+            random_seed: "fixed:12345".to_string(),
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        world.world_random.trace = true;
+
+        let mut trace: Vec<String> = Vec::new();
+        let mut step = |name: &str, world: &mut World, trace: &mut Vec<String>| {
+            let draws: Vec<String> = world
+                .world_random
+                .trace_bits
+                .iter()
+                .zip(world.world_random.trace_values.iter())
+                .map(|(bits, value)| format!("{bits}:{value}"))
+                .collect();
+            world.world_random.trace_bits.clear();
+            world.world_random.trace_values.clear();
+            trace.push(if draws.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name} {}", draws.join(" "))
+            });
+        };
+
+        step("start", &mut world, &mut trace);
+        for (id, metadata, name) in [
+            (blocks::STONE, 0u8, "drop_stone"),
+            (blocks::GRAVEL, 0, "drop_gravel"),
+            (blocks::LEAVES, 0, "drop_leaves"),
+            (blocks::CROPS, 7, "drop_crops"),
+            (blocks::LOG, 0, "drop_log"),
+        ] {
+            let _ = blocks::drop_naturally(id, metadata, 0, 64, 0, &mut world.world_random, None);
+            step(name, &mut world, &mut trace);
+        }
+        {
+            // The weather: the durations of the thunder and of the rain are
+            // drawn (`World.i()`).
+            let mut ld = world.level_data.borrow_mut();
+            ld.thunder_time = 0;
+            ld.rain_time = 0;
+        }
+        let _ = world.tick_weather();
+        step("weather", &mut world, &mut trace);
+
+        let expected: Vec<String> = golden
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .collect();
+        assert_eq!(
+            trace, expected,
+            "the draws of the random of the world differ from the reference"
+        );
+    }
+
     /// The seed of the random of the world comes from the configuration.
     ///
     /// `world.random_seed = "fixed:<n>"` gives the stream of the reference
