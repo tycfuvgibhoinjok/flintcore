@@ -437,6 +437,35 @@ Mob movement parity harness:
   - The chat of the player is checked like in the reference: the length
     before the trimming, the characters of the file `font.txt` (the
     colour character is not in it) and no translation of the `&`.
+  - The chunks are stored like in the reference: the file of the chunk is
+    `<world>/<x & 63 in base 36>/<z & 63 in base 36>/c.<x>.<z>.dat` with
+    the NBT compressed by gzip; the file is written as `tmp_chunk.dat`
+    and then renamed. The worlds of the port that used the regions of
+    Anvil are imported at the start of the server.
+  - The file of the player holds the UUID of the world and of the player,
+    the sleep of the player and the world of the spawn point; the file of
+    the level holds the compound `Player` with the data of the first
+    player of the world. The UUIDs are random in the reference, the port
+    derives them from the seed of the world and from the name of the
+    player, so that the files stay the same from run to run.
+  - The player of the reference: any damage is reduced by the armour,
+    the player that has just appeared cannot be hurt for sixty ticks, the
+    player regains health when the monsters are switched off, the damage
+    of the mobs and of the arrows is scaled by the difficulty, the stance
+    is checked, the bed must be near, and the healing sets the window of
+    the invulnerability.
+  - The dropped item of the reference: it does not take damage in the
+    lava, it is spread in the lava, it is pushed out of the block through
+    the nearest free face and it bounces off the ground.
+  - The primed TNT of the reference explodes on the eighty-first tick; the
+    angle of the hit comes from its own stream, the reference draws it
+    from `Math.random()` and not from the shared stream of the entities.
+  - The painting of the reference is checked every hundred ticks, it
+    breaks when any entity intersects its box and it drops the item at
+    its own position.
+  - The arrow of the reference checks the hit along the segment of the
+    movement, the arrow that hit a block shakes for seven ticks and the
+    fireball does no direct damage.
   - The trace is compared as text, so the port prints the numbers the way
     of Java: Java rounds half up, Rust rounds half to even and the same
     value can be printed with different digits.
