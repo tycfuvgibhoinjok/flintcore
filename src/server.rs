@@ -157,15 +157,14 @@ impl Server {
                         config.world.spawn_z,
                     );
                 } else {
+                    // The search of the spawn uses the random of the world
+                    // (`World.c()` in Java), so it uses the seed of the
+                    // configuration: a fixed seed makes the search
+                    // reproducible, `clock` imitates the reference.
                     let rng_seed = std::env::var("FLINTCORE_SPAWN_RNG_SEED")
                         .ok()
                         .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos() as i64)
-                                .unwrap_or(config.world.seed)
-                        });
+                        .unwrap_or(world.world_random_seed);
                     let (sx, sz) = world.live_find_spawn(rng_seed);
                     config.world.spawn_x = sx;
                     config.world.spawn_y = 64;
@@ -400,7 +399,11 @@ impl Server {
                     .map(|p| (p.x, p.z))
                     .collect();
                 if !nether_players.is_empty() {
-                    s.world.tick_random_blocks(&nether_players);
+                    let mut entity_random =
+                        std::mem::replace(&mut s.entity_random, JavaRandom::new(0));
+                    s.world
+                        .tick_random_blocks(&nether_players, &mut entity_random);
+                    s.entity_random = entity_random;
                 }
                 s.process_world_events();
                 s.world.flush_pending_piston_syncs();
@@ -509,7 +512,10 @@ impl Server {
             .map(|p| (p.x, p.z))
             .collect();
         if !player_xz.is_empty() {
-            self.world.tick_random_blocks(&player_xz);
+            let mut entity_random = std::mem::replace(&mut self.entity_random, JavaRandom::new(0));
+            self.world
+                .tick_random_blocks(&player_xz, &mut entity_random);
+            self.entity_random = entity_random;
         }
 
         // Tick each player (no_damage_ticks, fire_ticks decrement, deferred digging)
@@ -2290,29 +2296,40 @@ impl Server {
                 &mut self.world.world_random,
                 crate::util::rng::JavaRandom::new(0),
             );
-            let mut drops = blocks::get_block_drops(old_block, harvest_meta, &mut rng, held_item);
+            let mut drops =
+                blocks::drop_naturally(old_block, harvest_meta, x, y, z, &mut rng, held_item);
             if old_block == blocks::LAPIS_ORE && self.config.mechanics.drop_lapis_as_b1_2 {
-                drops = vec![ItemStack::new(items::INK_SACK, 1, 4)];
+                drops = vec![blocks::BlockDrop {
+                    x: x as f64,
+                    y: y as f64,
+                    z: z as f64,
+                    item: ItemStack::new(items::INK_SACK, 1, 4),
+                }];
             } else if old_block == blocks::GLOWSTONE && self.config.mechanics.glowstone_pre_1_6_6 {
-                drops = vec![ItemStack::new(items::GLOWSTONE_DUST, 1, 0)];
+                drops = vec![blocks::BlockDrop {
+                    x: x as f64,
+                    y: y as f64,
+                    z: z as f64,
+                    item: ItemStack::new(items::GLOWSTONE_DUST, 1, 0),
+                }];
             } else if old_block == blocks::LEAVES
                 && !self.config.mechanics.drop_saplings_of_leaf_type
             {
-                for st in &mut drops {
-                    st.damage = 0;
+                for drop in &mut drops {
+                    drop.item.damage = 0;
                 }
             }
             self.world.world_random = rng;
-            for stack in drops {
-                self.spawn_dropped_item_at(x as f64, y as f64, z as f64, stack, 10);
+            for drop in drops {
+                self.spawn_dropped_item_at(drop.x, drop.y, drop.z, drop.item, 10);
             }
         }
 
         // Check attached neighbor blocks (torches, ladders, levers, buttons, signs, etc.)
         let attached_drops = self.world.check_attached_blocks_around(x, y, z);
         for (ax, ay, az, stack) in attached_drops {
-            self.send_block_change_to_observers(ax, ay, az);
-            self.spawn_dropped_item_at(ax as f64, ay as f64, az as f64, stack, 10);
+            self.send_block_change_to_observers(ax as i32, ay as i32, az as i32);
+            self.spawn_dropped_item_at(ax, ay, az, stack, 10);
         }
 
         // Damage tool in hand
@@ -3063,7 +3080,7 @@ impl Server {
                 {
                     if clicked_block == blocks::GRASS
                         && self.config.mechanics.tile_grass_drop_seeds
-                        && self.world.tick_random.next_i32_bound(8) == 0
+                        && self.entity_random.next_i32_bound(8) == 0
                     {
                         self.spawn_dropped_item_at(
                             cx as f64,
@@ -4134,7 +4151,7 @@ impl Server {
             }
             entity_boxes.push(player.bounding_box());
         }
-        let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
+        let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
         let specs = evaluate_natural_spawns(
             &self.world,
             &mut rng,
@@ -4146,7 +4163,7 @@ impl Server {
             animals,
             water,
         );
-        self.world.tick_random = rng;
+        self.world.world_random = rng;
 
         for spec in specs {
             self.spawn_mob_at_natural(spec.mob_type, spec.x, spec.y, spec.z, spec.jockey_chance);
@@ -4400,7 +4417,7 @@ impl Server {
         }
 
         let sky_sub = self.world.sky_factor();
-        let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
+        let mut rng = std::mem::replace(&mut self.world.world_random, JavaRandom::new(0));
         let mut to_spawn = Vec::new();
         let mut delay_updates = Vec::new();
 
@@ -4493,7 +4510,7 @@ impl Server {
             delay_updates.push((sx, sy, sz, delay));
         }
 
-        self.world.tick_random = rng;
+        self.world.world_random = rng;
 
         for (sx, sy, sz, new_delay) in delay_updates {
             if let Some(te) = self.world.get_tile_entity_mut(sx, sy, sz) {
@@ -8020,7 +8037,7 @@ impl Server {
 
         for (ex, ey, ez) in egg_hatches {
             // EntityEgg.java:39-51 — 1/8 chance to hatch 1 chicken (1/32 for 4 chickens)
-            let mut rng = std::mem::replace(&mut self.world.tick_random, JavaRandom::new(0));
+            let mut rng = std::mem::replace(&mut self.entity_random, JavaRandom::new(0));
             let count = if rng.next_i32_bound(8) == 0 {
                 if rng.next_i32_bound(32) == 0 {
                     4
@@ -8030,7 +8047,7 @@ impl Server {
             } else {
                 0
             };
-            self.world.tick_random = rng;
+            self.entity_random = rng;
             for _ in 0..count {
                 self.spawn_mob_at(MobType::Chicken, ex, ey, ez);
             }
@@ -8350,7 +8367,7 @@ impl Server {
                 // EntityMinecart.java:134-160 — split each stack into random sub-stacks of 10..=30
                 for mut item in cargo.into_iter().flatten() {
                     while item.count > 0 {
-                        let split = (self.world.tick_random.next_i32_bound(21) + 10)
+                        let split = (self.entity_random.next_i32_bound(21) + 10)
                             .min(item.count as i32) as u8;
                         item.count -= split;
                         self.spawn_dropped_item_at(
@@ -9036,7 +9053,11 @@ impl Server {
     }
 
     pub fn strike_lightning(&mut self, x: i32, y: i32, z: i32) {
-        self.world.strike_lightning_at(x, y, z);
+        // Java `EntityWeatherStorm`: the lightning is an entity, so it draws
+        // from the shared random of the entities ✓.
+        let mut entity_random = std::mem::replace(&mut self.entity_random, JavaRandom::new(0));
+        self.world.strike_lightning_at(x, y, z, &mut entity_random);
+        self.entity_random = entity_random;
         self.process_world_events();
     }
 
@@ -9403,23 +9424,11 @@ impl Server {
             if id != blocks::AIR {
                 // The drops of the block (`Block.dropNaturally`): the
                 // number of the drops is drawn, then the yield of the
-                // explosion (one, so the block always drops) and then
-                // the item itself.  The item is created at once ✓ — the
-                // reference drops it inside the loop ✓.
-                let count = blocks::drop_count(id, &mut rng);
-                for _ in 0..count {
-                    if rng.next_f32() < 1.0 {
-                        let item_id = blocks::drop_item_id(id, meta, &mut rng);
-                        if item_id > 0 {
-                            self.spawn_dropped_item_at(
-                                bx as f64,
-                                by as f64,
-                                bz as f64,
-                                ItemStack::new(item_id, 1, blocks::drop_damage(id, meta)),
-                                10,
-                            );
-                        }
-                    }
+                // explosion (one, so the block always drops), then the item
+                // itself and the position of the item entity ✓.
+                let drops = blocks::drop_naturally(id, meta, bx, by, bz, &mut rng, None);
+                for drop in drops {
+                    self.spawn_dropped_item_at(drop.x, drop.y, drop.z, drop.item, 10);
                 }
                 self.world.java_set_type_id(bx, by, bz, blocks::AIR);
                 // Java `Block.d(World, i, j, k)`: the hook of the destroyed
@@ -16046,7 +16055,7 @@ mod tests {
     #[test]
     fn the_offset_of_the_spawn_is_drawn_from_the_shared_random_of_the_entities() {
         let mut server = spawn_test_server(Default::default());
-        let world_draws = server.world.tick_random.draws;
+        let world_draws = server.world.world_random.draws;
         let entity_draws = server.entity_random.draws;
         let _ = server.spawn_offset();
         assert_eq!(
@@ -16055,7 +16064,7 @@ mod tests {
             "the shared random of the entities is used"
         );
         assert_eq!(
-            server.world.tick_random.draws, world_draws,
+            server.world.world_random.draws, world_draws,
             "the random of the world is not used"
         );
     }
@@ -16121,17 +16130,13 @@ mod tests {
             spawning.mobs.get_mut(name).unwrap().enabled = false;
         }
         let mut server = spawn_test_server(spawning);
+        // Java `SpawnerCreature.java:136`: the yaw of the mob is drawn from
+        // the random of the world ✓.
         let mut shadow = server.world.world_random.clone();
-        for _ in 0..50 {
-            server.tick_mob_spawner();
-            if server.entities.iter_mobs().next().is_some() {
-                break;
-            }
-        }
-        let mob = server.entities.iter_mobs().next().expect("a mob spawned");
-        assert_eq!(mob.mob_type, MobType::Pig);
-        // The yaw of the mob is the first draw of the random of the world.
         let expected = shadow.next_f32() * 360.0;
+        let mob_id = server.spawn_mob_at_natural(MobType::Pig, 0.0, 64.0, 0.0, 0);
+        let mob = server.entities.get_mob(mob_id).expect("the mob spawned");
+        assert_eq!(mob.mob_type, MobType::Pig);
         assert_eq!(mob.yaw, expected);
     }
 
@@ -16153,19 +16158,15 @@ mod tests {
             spawning.mobs.get_mut(name).unwrap().enabled = false;
         }
         let mut server = spawn_test_server(spawning);
+        // The yaw of the mob and then the colour of the sheep: both are
+        // draws of the random of the world.
         let mut shadow = server.world.world_random.clone();
-        for _ in 0..50 {
-            server.tick_mob_spawner();
-            if server.entities.iter_mobs().next().is_some() {
-                break;
-            }
-        }
-        let mob = server.entities.iter_mobs().next().expect("a mob spawned");
-        assert_eq!(mob.mob_type, MobType::Sheep);
-        // The yaw of the mob and then the colour of the sheep.
         let expected_yaw = shadow.next_f32() * 360.0;
         let expected_color =
             crate::entity::mob::Mob::natural_sheep_color_ex(&mut shadow, true, true);
+        let mob_id = server.spawn_mob_at_natural(MobType::Sheep, 0.0, 64.0, 0.0, 0);
+        let mob = server.entities.get_mob(mob_id).expect("the sheep spawned");
+        assert_eq!(mob.mob_type, MobType::Sheep);
         assert_eq!(mob.yaw, expected_yaw);
         assert_eq!(mob.sheep_color, expected_color);
     }

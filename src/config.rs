@@ -107,6 +107,7 @@ impl Config {
 
     /// Checks the values that the deserializer cannot verify on its own.
     fn validate(&self) -> Result<()> {
+        WorldRandomSeed::parse(&self.world.random_seed)?;
         let spawning = &self.spawning;
         if spawning.spawn_interval_ticks == 0 {
             return Err(Error::Config(
@@ -337,6 +338,75 @@ impl Default for NetworkConfig {
     }
 }
 
+/// The seed of the random of the world (`World.random`).
+///
+/// Java `World.java:51`: `public Random random = new Random();` — the seed
+/// comes from the system clock, so the reference is not reproducible between
+/// two runs: the weather, the angle of a spawned mob and the drops of a mob
+/// differ every time.
+///
+/// The port keeps the world reproducible by default (`fixed`) and can imitate
+/// the reference with `clock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldRandomSeed {
+    /// A fixed seed: two worlds with the same seed behave the same way.
+    Fixed(i64),
+    /// The system clock: exactly like the reference (`new Random()`).
+    Clock,
+}
+
+impl WorldRandomSeed {
+    /// Parses the value of `world.random_seed`.
+    ///
+    /// * `fixed` — the seed 0 (the default of the port).
+    /// * `fixed:<n>` — an explicit seed.
+    /// * `clock` — the system clock (like the reference).
+    /// * `<n>` — a shorthand of `fixed:<n>`.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let spec = spec.trim();
+        if spec.eq_ignore_ascii_case("clock") {
+            return Ok(WorldRandomSeed::Clock);
+        }
+        if spec.eq_ignore_ascii_case("fixed") {
+            return Ok(WorldRandomSeed::Fixed(0));
+        }
+        if let Some(number) = spec.strip_prefix("fixed:") {
+            return number
+                .trim()
+                .parse::<i64>()
+                .map(WorldRandomSeed::Fixed)
+                .map_err(|_| {
+                    Error::Config(format!(
+                        "world.random_seed: '{number}' is not a number \
+                         (use `fixed`, `fixed:<n>` or `clock`)"
+                    ))
+                });
+        }
+        spec.parse::<i64>()
+            .map(WorldRandomSeed::Fixed)
+            .map_err(|_| {
+                Error::Config(format!(
+                    "world.random_seed: '{spec}' is not a number \
+                     (use `fixed`, `fixed:<n>` or `clock`)"
+                ))
+            })
+    }
+
+    /// The seed of the stream.
+    ///
+    /// The clock is read once, so the stream of the world does not change
+    /// during the life of the world.
+    pub fn resolve(self) -> i64 {
+        match self {
+            WorldRandomSeed::Fixed(seed) => seed,
+            WorldRandomSeed::Clock => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        }
+    }
+}
+
 /// World and world generation settings.
 ///
 /// Sources: `server.properties` (the vanilla server), `Poseidon`
@@ -396,6 +466,18 @@ pub struct WorldConfig {
     pub keep_spawn_in_memory: bool,
     /// `Poseidon: emergency.debug.regenerate-corrupt-chunks.enable`.
     pub regenerate_corrupt_chunks: bool,
+    /// The seed of the random of the world (`World.random`).
+    ///
+    /// Java `World.java:51`: `public Random random = new Random();` — the
+    /// reference takes the seed from the system clock, so the world is not
+    /// reproducible between two runs ✓.
+    ///
+    /// * `fixed` — the seed 0: the world is reproducible ✓ (the default of
+    ///   the port ✓).
+    /// * `fixed:<n>` — an explicit seed ✓.
+    /// * `clock` — the system clock, exactly like the reference ✓ (the world
+    ///   is not reproducible then ✓).
+    pub random_seed: String,
 }
 
 impl Default for WorldConfig {
@@ -422,6 +504,7 @@ impl Default for WorldConfig {
             push_player_up_at_join: true,
             keep_spawn_in_memory: true,
             regenerate_corrupt_chunks: false,
+            random_seed: "fixed".to_string(),
         }
     }
 }
@@ -1080,6 +1163,49 @@ mod tests {
         assert!(!parsed.mechanics.allow_minecart_boosters);
         assert!(parsed.fixes.block_pistons_pushing_furnaces);
         assert_eq!(parsed.spawning.monster_cap, 70);
+        assert_eq!(parsed.world.random_seed, "fixed");
+    }
+
+    /// The seed of the random of the world is parsed.
+    ///
+    /// Java `World.java:51`: `public Random random = new Random();` — the
+    /// reference takes the seed from the clock, the port takes it from the
+    /// configuration.
+    #[test]
+    fn the_seed_of_the_random_of_the_world_is_parsed() {
+        assert_eq!(
+            WorldRandomSeed::parse("fixed").unwrap(),
+            WorldRandomSeed::Fixed(0)
+        );
+        assert_eq!(
+            WorldRandomSeed::parse("fixed:42").unwrap(),
+            WorldRandomSeed::Fixed(42)
+        );
+        assert_eq!(
+            WorldRandomSeed::parse("42").unwrap(),
+            WorldRandomSeed::Fixed(42)
+        );
+        assert_eq!(
+            WorldRandomSeed::parse("clock").unwrap(),
+            WorldRandomSeed::Clock
+        );
+        assert!(WorldRandomSeed::parse("nonsense").is_err());
+        assert!(WorldRandomSeed::parse("fixed:x").is_err());
+    }
+
+    /// The configuration with an unknown seed of the random of the world does
+    /// not load.
+    ///
+    /// The configuration is strict: the mistake is named in the error.
+    #[test]
+    fn the_configuration_rejects_an_unknown_seed_of_the_random_of_the_world() {
+        let mut config = Config::default();
+        config.world.random_seed = "nonsense".to_string();
+        let error = config.validate().expect_err("the seed has to be rejected");
+        assert!(
+            error.to_string().contains("world.random_seed"),
+            "the error has to name the key: {error}"
+        );
     }
 
     /// The list of the blocks that the leaves do not replace by default.

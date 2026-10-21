@@ -6,7 +6,6 @@ use rayon::prelude::*;
 
 use crate::config::{FixesConfig, MechanicsConfig, SpawningConfig, WorldConfig, WorldgenConfig};
 use crate::gameplay::blocks;
-use crate::gameplay::items::ItemStack;
 use crate::net::packets::chunk::{MapChunk, PreChunk};
 use crate::util::rng::JavaRandom;
 use crate::util::{Error, Result};
@@ -213,6 +212,12 @@ pub struct World {
     /// instant-tick cascades (lava flow randomness). Kept here so the port
     /// mirrors the reference implementation.
     pub(crate) world_random: JavaRandom,
+    /// The seed of `world_random` (`world.random_seed` of the configuration).
+    ///
+    /// Java `World.java:51` takes the seed from the system clock; the port
+    /// keeps the world reproducible with a fixed seed and can imitate the
+    /// reference with `world.random_seed = "clock"`.
+    pub(crate) world_random_seed: i64,
     /// Java `World.j`: the intensity of the rain (0 to 1).
     pub(crate) rain_intensity: std::cell::Cell<f32>,
     /// Java `World.l`: the intensity of the thunder (0 to 1).
@@ -266,8 +271,6 @@ pub struct World {
     pub(crate) world_events: Vec<crate::world::redstone::WorldEvent>,
     /// Java `World.g` LCG state for `World.j()` random block ticks.
     pub(crate) random_tick_lcg: i32,
-    /// Separate RNG for live random block ticks so `world_random` stays untouched for parity tests.
-    pub(crate) tick_random: JavaRandom,
     /// Detector rails currently occupied by at least one `EntityMinecart` (`BlockMinecartDetector.f`).
     pub active_detector_rails: HashSet<(i32, i32, i32)>,
     /// Pressure plates currently occupied by an entity (`BlockPressurePlate.g`).
@@ -500,6 +503,13 @@ impl World {
         let live = crate::world::live::LiveState::new(config.view_distance);
         let initial_time = level.time;
         let world_seed = config.seed;
+        // Java `World.java:51`: `public Random random = new Random();` — the
+        // reference takes the seed from the system clock.  The port keeps the
+        // world reproducible (`world.random_seed = "fixed"`) and can imitate
+        // the reference (`world.random_seed = "clock"`).
+        let world_random_seed = crate::config::WorldRandomSeed::parse(&config.random_seed)
+            .unwrap_or(crate::config::WorldRandomSeed::Fixed(0))
+            .resolve();
         let hell_generator = if is_hell {
             Some(HellGenerator::new(world_seed))
         } else {
@@ -541,7 +551,8 @@ impl World {
             _session_lock: lock,
             suppress_physics: false,
             insta_tick: false,
-            world_random: JavaRandom::new(0),
+            world_random: JavaRandom::new(world_random_seed),
+            world_random_seed,
             rain_intensity: std::cell::Cell::new(0.0),
             thunder_intensity: std::cell::Cell::new(0.0),
             fluid_sides: [[false; 4]; 2],
@@ -565,7 +576,6 @@ impl World {
             random_tick_lcg: (world_seed as i32)
                 .wrapping_mul(3)
                 .wrapping_add(1_013_904_223),
-            tick_random: JavaRandom::new(world_seed ^ 0x5DEECE66D),
             active_detector_rails: HashSet::new(),
             active_pressure_plates: HashSet::new(),
             gen_pool,
@@ -2853,23 +2863,20 @@ impl World {
                     2.6f32 + (self.world_random.next_f32() - self.world_random.next_f32()) * 0.8f32;
             } else {
                 // `Block.g` -> `dropNaturally`: the block that is displaced
-                // by the water drops its item. The number of the drops and
-                // the item itself are drawn from the random of the world.
+                // by the water drops its item. The number of the drops, the
+                // chance of every drop, the item itself and the position of
+                // the item entity are drawn from the random of the world.
                 trace_rng3!(x, y, z);
                 let data = self.get_data(x, y, z);
-                let count = blocks::drop_count(target, &mut self.world_random);
-                for _ in 0..count {
-                    if self.world_random.next_f32() < 1.0 {
-                        let item_id = blocks::drop_item_id(target, data, &mut self.world_random);
-                        if item_id > 0 {
-                            self.world_events.push(WorldEvent::DropItem {
-                                x: x as f64,
-                                y: y as f64,
-                                z: z as f64,
-                                item: ItemStack::new(item_id, 1, blocks::drop_damage(target, data)),
-                            });
-                        }
-                    }
+                let drops =
+                    blocks::drop_naturally(target, data, x, y, z, &mut self.world_random, None);
+                for drop in drops {
+                    self.world_events.push(WorldEvent::DropItem {
+                        x: drop.x,
+                        y: drop.y,
+                        z: drop.z,
+                        item: drop.item,
+                    });
                 }
             }
         }
@@ -3313,7 +3320,7 @@ impl World {
         cx: i32,
         cy: i32,
         cz: i32,
-    ) -> Vec<(i32, i32, i32, crate::gameplay::items::ItemStack)> {
+    ) -> Vec<(f64, f64, f64, crate::gameplay::items::ItemStack)> {
         let mut drops = Vec::new();
         let neighbors = [
             (cx - 1, cy, cz),
@@ -3446,10 +3453,10 @@ impl World {
                 let _ = self.remove_world_tile_entity(x, y, z);
                 self.java_set_type_id(x, y, z, blocks::AIR);
                 let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
-                let item_drops = blocks::get_block_drops(id, data, &mut rng, None);
+                let item_drops = blocks::drop_naturally(id, data, x, y, z, &mut rng, None);
                 self.world_random = rng;
-                for stack in item_drops {
-                    drops.push((x, y, z, stack));
+                for drop in item_drops {
+                    drops.push((drop.x, drop.y, drop.z, drop.item));
                 }
             }
         }
@@ -3927,6 +3934,51 @@ impl LightingWorld for World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The random of the world is reproducible by default.
+    ///
+    /// Java `World.java:51` takes the seed from the system clock, so the
+    /// reference is not reproducible; the port keeps the world reproducible
+    /// with the seed 0 (`world.random_seed = "fixed"`).
+    #[test]
+    fn the_random_of_the_world_is_reproducible_by_default() {
+        let config = WorldConfig {
+            seed: 12345,
+            save_enabled: false,
+            ..WorldConfig::default()
+        };
+        let mut first = World::new(config.clone());
+        let mut second = World::new(config);
+        assert_eq!(first.world_random_seed, 0);
+        for _ in 0..8 {
+            assert_eq!(
+                first.world_random.next_i32(),
+                second.world_random.next_i32(),
+                "the two worlds have to draw the same numbers"
+            );
+        }
+    }
+
+    /// The seed of the random of the world comes from the configuration.
+    ///
+    /// `world.random_seed = "fixed:<n>"` gives the stream of the reference
+    /// with the same seed, `"clock"` imitates the reference
+    /// (`new Random()`), which is not reproducible.
+    #[test]
+    fn the_seed_of_the_random_of_the_world_comes_from_the_configuration() {
+        let config = WorldConfig {
+            seed: 12345,
+            save_enabled: false,
+            random_seed: "fixed:4242".to_string(),
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        assert_eq!(world.world_random_seed, 4242);
+        let mut reference = JavaRandom::new(4242);
+        for _ in 0..8 {
+            assert_eq!(world.world_random.next_i32(), reference.next_i32());
+        }
+    }
 
     /// The height of the spawn is the height of the highest solid block of the
     /// column of the spawn.

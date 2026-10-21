@@ -16,6 +16,12 @@ max_packets_per_tick = 2048
 
 [world]
 seed = 0
+# The seed of the random of the world (`World.random`).
+# "fixed" — the seed 0: the world is reproducible (the default).
+# "fixed:<n>" — an explicit seed.
+# "clock" — the system clock, exactly like the reference (`new Random()`):
+#           the world is not reproducible between two runs.
+random_seed = "fixed"
 view_distance = 10
 chunks_per_tick = 16
 gen_workers = 0

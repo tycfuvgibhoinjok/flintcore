@@ -775,6 +775,126 @@ pub fn drop_damage(block_id: u8, metadata: u8) -> i16 {
     }
 }
 
+/// A block that is dropped into the world.
+///
+/// Java `Block.a(World, int, int, int, ItemStack)`: the item entity of the
+/// drop.  The position is a part of the drop — the reference draws it from
+/// the random of the world ✓.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockDrop {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub item: ItemStack,
+}
+
+/// Java `Block.a(World, int, int, int, ItemStack)` — the position of the item
+/// entity of a drop.
+///
+/// The reference draws three numbers of the random of the world:
+/// `world.random.nextFloat() * 0.7F + (1.0F - 0.7F) * 0.5F` ✓.  The offset is
+/// added to the coordinate in `float` ✓, so the sum is rounded the same way
+/// as in the reference ✓.
+fn drop_position(rng: &mut JavaRandom, x: i32, y: i32, z: i32) -> (f64, f64, f64) {
+    const OFFSET: f32 = 0.7;
+    let dx = rng.next_f32() * OFFSET + (1.0f32 - OFFSET) * 0.5f32;
+    let dy = rng.next_f32() * OFFSET + (1.0f32 - OFFSET) * 0.5f32;
+    let dz = rng.next_f32() * OFFSET + (1.0f32 - OFFSET) * 0.5f32;
+    (
+        (x as f32 + dx) as f64,
+        (y as f32 + dy) as f64,
+        (z as f32 + dz) as f64,
+    )
+}
+
+/// Java `Block.dropNaturally(World, int, int, int, int, float)` — the drops
+/// of a block and the positions of the items.
+///
+/// The reference draws from the random of the world: the number of the items
+/// ✓, the chance of every item ✓, the item itself ✓ and the position of the
+/// item entity ✓.  The order of the draws decides the whole stream of the
+/// world, so it has to be the same as in the reference ✓.
+pub fn drop_naturally(
+    block_id: u8,
+    metadata: u8,
+    x: i32,
+    y: i32,
+    z: i32,
+    rng: &mut JavaRandom,
+    held_item: Option<ItemStack>,
+) -> Vec<BlockDrop> {
+    // The chance of the item (`f` of the reference) is the yield of the
+    // explosion, which is one ✓ — a plugin can change it, the port has no
+    // plugins ✓.
+    let chance = 1.0f32;
+    let mut drops = Vec::new();
+
+    // The leaves with the shears drop themselves (`BlockLeaves.a(World,
+    // EntityHuman, int, int, int, int)`): the block itself, without the
+    // draws of the normal path ✓.
+    if block_id == LEAVES {
+        if let Some(held) = held_item {
+            if held.id == items::SHEARS {
+                let (px, py, pz) = drop_position(rng, x, y, z);
+                drops.push(BlockDrop {
+                    x: px,
+                    y: py,
+                    z: pz,
+                    item: ItemStack::new(LEAVES as i16, 1, (metadata & 3) as i16),
+                });
+                return drops;
+            }
+        }
+    }
+
+    // The snow layer drops a snow ball (`BlockSnow.a(World, EntityHuman, ...)`):
+    // the item is created directly, so only the position is drawn ✓.
+    if block_id == SNOW {
+        let (px, py, pz) = drop_position(rng, x, y, z);
+        drops.push(BlockDrop {
+            x: px,
+            y: py,
+            z: pz,
+            item: ItemStack::new(items::SNOW_BALL, 1, 0),
+        });
+        return drops;
+    }
+
+    let count = drop_count(block_id, rng);
+    for _ in 0..count {
+        // The chance of the item (`world.random.nextFloat() < f`) ✓.
+        if rng.next_f32() < chance {
+            let item_id = drop_item_id(block_id, metadata, rng);
+            if item_id > 0 {
+                let (px, py, pz) = drop_position(rng, x, y, z);
+                drops.push(BlockDrop {
+                    x: px,
+                    y: py,
+                    z: pz,
+                    item: ItemStack::new(item_id, 1, drop_damage(block_id, metadata)),
+                });
+            }
+        }
+    }
+
+    // The crops drop the seeds (`BlockCrops.dropNaturally`) ✓.
+    if block_id == CROPS {
+        for _ in 0..3 {
+            if rng.next_i32_bound(15) <= metadata as i32 {
+                let (px, py, pz) = drop_position(rng, x, y, z);
+                drops.push(BlockDrop {
+                    x: px,
+                    y: py,
+                    z: pz,
+                    item: ItemStack::new(items::SEEDS, 1, 0),
+                });
+            }
+        }
+    }
+
+    drops
+}
+
 /// Java `Block.a(Random)` — base drop count before per-item roll.
 pub fn drop_count(block_id: u8, rng: &mut JavaRandom) -> usize {
     match block_id {
@@ -873,44 +993,6 @@ pub fn drop_item_id(block_id: u8, metadata: u8, rng: &mut JavaRandom) -> i16 {
 }
 
 /// Complete reproduction of `Block.a(World, EntityHuman, x, y, z, data)` / `Block.dropNaturally`.
-pub fn get_block_drops(
-    block_id: u8,
-    metadata: u8,
-    rng: &mut JavaRandom,
-    held_item: Option<ItemStack>,
-) -> Vec<ItemStack> {
-    if block_id == LEAVES {
-        if let Some(held) = held_item {
-            if held.id == items::SHEARS {
-                return vec![ItemStack::new(LEAVES as i16, 1, (metadata & 3) as i16)];
-            }
-        }
-    }
-
-    if block_id == SNOW {
-        return vec![ItemStack::new(items::SNOW_BALL, 1, 0)];
-    }
-
-    let mut drops = Vec::new();
-    let count = drop_count(block_id, rng);
-    for _ in 0..count {
-        let item_id = drop_item_id(block_id, metadata, rng);
-        if item_id > 0 {
-            drops.push(ItemStack::new(item_id, 1, drop_damage(block_id, metadata)));
-        }
-    }
-
-    if block_id == CROPS {
-        for _ in 0..3 {
-            if rng.next_i32_bound(15) <= metadata as i32 {
-                drops.push(ItemStack::new(items::SEEDS, 1, 0));
-            }
-        }
-    }
-
-    drops
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepSound {
     pub name: &'static str,
@@ -958,6 +1040,56 @@ pub fn piston_mobility(id: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drops of a block draw from the random of the world.
+    ///
+    /// Java `Block.dropNaturally`: the number of the items ✓, the chance of
+    /// every item ✓, the item itself ✓ and the position of the item entity
+    /// ✓.  The draws decide the whole stream of the world, so their number
+    /// and their order have to be the same as in the reference ✓.
+    #[test]
+    fn the_drops_of_a_block_draw_from_the_random_of_the_world() {
+        // The stone drops a cobblestone: the number of the items (no draw),
+        // the chance of the item (one draw), the item (no draw for the
+        // stone) and the position of the item entity (three draws).
+        let mut rng = JavaRandom::new(12345);
+        let drops = drop_naturally(STONE, 0, 10, 64, 20, &mut rng, None);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].item.id, COBBLESTONE as i16);
+        assert_eq!(rng.draws, 4, "the chance and the position of the item");
+        // The position of the item is inside the block (`0.15` to `0.85`).
+        assert!(drops[0].x >= 10.0 && drops[0].x < 11.0, "{}", drops[0].x);
+        assert!(drops[0].y >= 64.0 && drops[0].y < 65.0, "{}", drops[0].y);
+        assert!(drops[0].z >= 20.0 && drops[0].z < 21.0, "{}", drops[0].z);
+
+        // The gravel draws the item itself (`Block.a(int, Random)`): the
+        // flint is one item out of ten.
+        let mut rng = JavaRandom::new(12345);
+        let drops = drop_naturally(GRAVEL, 0, 0, 64, 0, &mut rng, None);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(rng.draws, 5, "the chance, the item and the position");
+    }
+
+    /// The leaves with the shears drop themselves.
+    ///
+    /// Java `BlockLeaves.a(World, EntityHuman, int, int, int, int)`: the
+    /// block itself, without the draws of the normal path ✓.
+    #[test]
+    fn the_leaves_with_the_shears_drop_themselves() {
+        let mut rng = JavaRandom::new(12345);
+        let drops = drop_naturally(
+            LEAVES,
+            0,
+            0,
+            64,
+            0,
+            &mut rng,
+            Some(ItemStack::new(items::SHEARS, 1, 0)),
+        );
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].item.id, LEAVES as i16);
+        assert_eq!(rng.draws, 3, "only the position of the item is drawn");
+    }
 
     /// The tables of the blocks are the tables of the reference.
     ///

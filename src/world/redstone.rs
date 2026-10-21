@@ -1004,14 +1004,14 @@ impl World {
                 // Fragile block breaks and drops item, terminating the push chain
                 let meta = self.get_data(cx, cy, cz);
                 let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
-                let drops = blocks::get_block_drops(id, meta, &mut rng, None);
+                let drops = blocks::drop_naturally(id, meta, cx, cy, cz, &mut rng, None);
                 self.world_random = rng;
-                for item in drops {
+                for drop in drops {
                     self.world_events.push(WorldEvent::DropItem {
-                        x: cx as f64,
-                        y: cy as f64,
-                        z: cz as f64,
-                        item,
+                        x: drop.x,
+                        y: drop.y,
+                        z: drop.z,
+                        item: drop.item,
                     });
                 }
                 // Poseidon `world.settings.pistons.other-fixes.enabled`:
@@ -2238,7 +2238,7 @@ impl World {
             return;
         }
 
-        let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+        let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
         let age = self.get_data(x, y, z) as i32;
         if old_fire {
             if age < 15 {
@@ -2257,7 +2257,7 @@ impl World {
             if !self.is_solid_normal_at(x, y - 1, z) || age > 3 {
                 self.java_set_type_id(x, y, z, blocks::AIR);
             }
-            self.tick_random = rng;
+            self.world_random = rng;
             return;
         }
 
@@ -2267,12 +2267,12 @@ impl World {
             && rng.next_i32_bound(4) == 0
         {
             self.java_set_type_id(x, y, z, blocks::AIR);
-            self.tick_random = rng;
+            self.world_random = rng;
             return;
         }
 
         if !self.mechanics.fire_spread {
-            self.tick_random = rng;
+            self.world_random = rng;
             return;
         }
 
@@ -2323,7 +2323,7 @@ impl World {
             }
         }
 
-        self.tick_random = rng;
+        self.world_random = rng;
     }
 
     // ---------------------------------------------------------------------
@@ -2393,7 +2393,7 @@ impl World {
             self.thunder_intensity.set(0.0);
             return if was_raining { Some(false) } else { None };
         }
-        let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+        let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
         let mut ld = self.level_data.borrow_mut();
 
         if ld.thunder_time <= 0 {
@@ -2427,7 +2427,7 @@ impl World {
         let storm = ld.raining;
         let thundering = ld.thundering;
         drop(ld);
-        self.tick_random = rng;
+        self.world_random = rng;
 
         // The intensity of the rain and of the thunder (`World.i()`): the sum
         // is in a double precision ✓ and the value is rounded to a single
@@ -2463,8 +2463,10 @@ impl World {
     }
 
     /// Java `EntityWeatherStorm` constructor block ignition (`EntityWeatherStorm.java:41-73`).
-    pub fn strike_lightning_at(&mut self, x: i32, y: i32, z: i32) {
-        let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+    pub fn strike_lightning_at(&mut self, x: i32, y: i32, z: i32, entity_random: &mut JavaRandom) {
+        // Java `EntityWeatherStorm`: the lightning is an entity, so it draws
+        // from the shared random of the entities ✓.
+        let mut rng = std::mem::replace(entity_random, JavaRandom::new(0));
         if self.chunks_area_loaded(x - 10, y - 10, z - 10, x + 10, y + 10, z + 10) {
             if (1..128).contains(&y)
                 && self.get_block(x, y, z) == blocks::AIR
@@ -2485,7 +2487,7 @@ impl World {
                 }
             }
         }
-        self.tick_random = rng;
+        self.world_random = rng;
         self.world_events
             .push(WorldEvent::LightningStrike { x, y, z });
     }
@@ -2531,7 +2533,7 @@ impl World {
     /// Java `BlockSoil.b(World, i, j, k, Entity)` (`BlockSoil.java:53-71`): 1/4 chance to trample farmland into dirt.
     pub fn trample_farmland(&mut self, x: i32, y: i32, z: i32) {
         if (0..128).contains(&y) && self.get_block(x, y, z) == blocks::FARMLAND {
-            let roll = self.tick_random.next_i32_bound(4);
+            let roll = self.world_random.next_i32_bound(4);
             if roll == 0 {
                 self.java_set_type_id(x, y, z, blocks::DIRT);
             }
@@ -2711,7 +2713,10 @@ impl World {
         let mut best = -1.0f64;
         let (mut bx, mut by, mut bz) = (ox, oy, oz);
         let mut rotation = 0i32;
-        let start_rotation = self.tick_random.next_i32_bound(4);
+        // Java `BlockPortal.a_(World, int, int, int)`: the axis of the
+        // portal comes from the frame of the obsidian, the reference does
+        // not draw a number for it ✓.
+        let start_rotation = 0;
 
         // First pass: prefer a 4x5x4 clear volume above solid ground.
         for px in ox - RADIUS..=ox + RADIUS {
@@ -2896,7 +2901,11 @@ impl World {
     // Random Block Ticks (`World.j()`)
     // ---------------------------------------------------------------------
 
-    pub fn tick_random_blocks(&mut self, player_positions: &[(f64, f64)]) {
+    pub fn tick_random_blocks(
+        &mut self,
+        player_positions: &[(f64, f64)],
+        entity_random: &mut JavaRandom,
+    ) {
         if player_positions.is_empty() {
             return;
         }
@@ -2919,7 +2928,7 @@ impl World {
         }
 
         let mut lcg = self.random_tick_lcg;
-        let mut rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+        let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
 
         for pos in active_chunks {
             let base_x = pos.x * 16;
@@ -2933,9 +2942,9 @@ impl World {
                 let wz = base_z + ((k >> 8) & 15);
                 let wy = self.top_solid_or_liquid_block(wx, wz);
                 if self.is_being_rained_on(wx, wy, wz) {
-                    self.tick_random = rng;
-                    self.strike_lightning_at(wx, wy, wz);
-                    rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+                    self.world_random = rng;
+                    self.strike_lightning_at(wx, wy, wz, entity_random);
+                    rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
                 }
             }
 
@@ -3270,9 +3279,9 @@ impl World {
                         self.destroy_plant(block_id, wx, y, wz);
                     }
                     blocks::FIRE => {
-                        self.tick_random = rng;
+                        self.world_random = rng;
                         self.tick_fire(wx, y, wz);
-                        rng = std::mem::replace(&mut self.tick_random, JavaRandom::new(0));
+                        rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));
                     }
                     blocks::LEAVES => {
                         if !self.mechanics.leaf_decay {
@@ -3364,7 +3373,7 @@ impl World {
         }
 
         self.random_tick_lcg = lcg;
-        self.tick_random = rng;
+        self.world_random = rng;
         let _ = CHUNK_HEIGHT;
     }
 }
@@ -3456,10 +3465,11 @@ mod tests {
     /// released.
     #[test]
     fn the_random_tick_releases_the_button() {
+        let mut entity_random = JavaRandom::new(0);
         let mut world = make_flat_world();
         // The button is pressed: the bit 8 of the data.
         world.java_set_type_id_and_data(0, 64, 0, blocks::STONE_BUTTON, 1 | 8);
-        world.tick_random_blocks(&[(0.0, 0.0)]);
+        world.tick_random_blocks(&[(0.0, 0.0)], &mut entity_random);
         // The random tick picks the blocks of the chunk by their position,
         // so the tick of the button is done by hand.
         world.tick_button(0, 64, 0);
@@ -3486,9 +3496,10 @@ mod tests {
     /// Java `BlockLockedChest.a`: the block is replaced by the air.
     #[test]
     fn the_random_tick_makes_the_locked_chest_disappear() {
+        let mut entity_random = JavaRandom::new(0);
         let mut world = make_flat_world();
         world.java_set_type_id(0, 64, 0, blocks::LOCKED_CHEST);
-        world.tick_random_blocks(&[(0.0, 0.0)]);
+        world.tick_random_blocks(&[(0.0, 0.0)], &mut entity_random);
         // The random tick picks the blocks of the chunk by their position,
         // so the tick of the chest is done by hand.
         world.java_set_type_id(0, 64, 0, blocks::LOCKED_CHEST);
@@ -3504,21 +3515,23 @@ mod tests {
     #[test]
     fn the_random_tick_does_nothing_for_the_pumpkin_and_the_cake() {
         // The world without the blocks of the reference.
+        let mut entity_random = JavaRandom::new(0);
         let mut plain = make_flat_world();
-        plain.tick_random_blocks(&[(0.0, 0.0)]);
-        let plain_draws = plain.tick_random.draws;
+        plain.tick_random_blocks(&[(0.0, 0.0)], &mut entity_random);
+        let plain_draws = plain.world_random.draws;
 
         // The world with the pumpkin, the lit pumpkin and the cake.
+        let mut entity_random = JavaRandom::new(0);
         let mut world = make_flat_world();
         world.java_set_type_id(0, 64, 0, blocks::PUMPKIN);
         world.java_set_type_id(1, 64, 0, blocks::JACK_O_LANTERN);
         world.java_set_type_id(2, 64, 0, blocks::CAKE);
-        world.tick_random_blocks(&[(0.0, 0.0)]);
+        world.tick_random_blocks(&[(0.0, 0.0)], &mut entity_random);
 
         // The three blocks do not override the method of the base class, so
         // the random tick draws nothing for them and leaves them alone.
         assert_eq!(
-            world.tick_random.draws, plain_draws,
+            world.world_random.draws, plain_draws,
             "the random tick of the pumpkin and the cake draws nothing"
         );
         assert_eq!(world.get_block(0, 64, 0), blocks::PUMPKIN);
