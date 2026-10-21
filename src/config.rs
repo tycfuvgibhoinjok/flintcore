@@ -38,11 +38,31 @@ impl Default for Config {
     }
 }
 
+/// The keys that were removed from the configuration and the reason.
+///
+/// The configuration is strict (`deny_unknown_fields`), so an old
+/// configuration with one of these keys does not load.  The error names the
+/// key and says why it is gone, so that it is clear what to delete.
+const REMOVED_KEYS: &[(&str, &str)] = &[(
+    "head_rotation_patch_enabled",
+    "the check of the pitch was removed: the reference has no such check \
+     (`Entity.c(float, float)` only rejects the `NaN` and the infinite angle)",
+)];
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let mut config: Config =
-            toml::from_str(&text).map_err(|error| Error::Config(error.to_string()))?;
+        let mut config: Config = toml::from_str(&text).map_err(|error| {
+            let mut message = error.to_string();
+            for (key, reason) in REMOVED_KEYS {
+                if message.contains(key) {
+                    message.push_str(&format!(
+                        "\nthe key `{key}` was removed: {reason} — delete the line from the configuration"
+                    ));
+                }
+            }
+            Error::Config(message)
+        })?;
         config.migrate()?;
         config.validate()?;
         Ok(config)
@@ -1041,6 +1061,32 @@ mod tests {
             config.worldgen.block_tree_growth_blacklist.is_empty(),
             "the default list of the blocked blocks is empty"
         );
+    }
+
+    /// The configuration with a removed key does not load and the error names
+    /// the key.
+    ///
+    /// The configuration is strict (`deny_unknown_fields`): the old
+    /// configurations break with a clear error.
+    #[test]
+    fn the_configuration_with_a_removed_key_does_not_load() {
+        let dir = std::env::temp_dir().join("flintcore-config-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flintcore.toml");
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        let text = text.replace("[fixes]\n", "[fixes]\nhead_rotation_patch_enabled = true\n");
+        std::fs::write(&path, &text).unwrap();
+
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("head_rotation_patch_enabled"),
+            "the error names the key: {error}"
+        );
+        assert!(
+            error.contains("was removed"),
+            "the error says that the key was removed: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
