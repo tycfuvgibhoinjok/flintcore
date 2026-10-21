@@ -1659,16 +1659,8 @@ impl Server {
         if let Some(proj) = self.entities.get_projectile_mut(target_id) {
             if use_entity.attack && proj.kind == ProjectileKind::Fireball {
                 if let Some(p) = self.entities.get_by_conn(id) {
-                    let deg = 0.017_453_292_f32;
-                    let yaw_rad = -p.yaw * deg - std::f32::consts::PI;
-                    let pitch_rad = -p.pitch * deg;
-                    let f3 = yaw_rad.cos();
-                    let f4 = yaw_rad.sin();
-                    let f5 = -pitch_rad.cos();
-                    let f6 = pitch_rad.sin();
-                    let look_x = (f4 * f5) as f64;
-                    let look_y = f6 as f64;
-                    let look_z = (f3 * f5) as f64;
+                    // `EntityLiving.Z()`: the vector of the look of the player.
+                    let (look_x, look_y, look_z) = crate::entity::mob::look_vector(p.yaw, p.pitch);
                     if let Some(fb) = self.entities.get_projectile_mut(target_id) {
                         fb.mot_x = look_x;
                         fb.mot_y = look_y;
@@ -5235,14 +5227,58 @@ impl Server {
                 }
             }
 
+            // The target of the ghast (`EntityGhast.c_()`): the nearest
+            // player within a hundred blocks ✓ — the search is repeated every
+            // twenty ticks ✓ (`this.h` ✓).
+            if mtype == MobType::Ghast && !corpse && !target_died {
+                let timer = self
+                    .entities
+                    .get_mob(mob_id)
+                    .map(|m| m.ghast_target_timer)
+                    .unwrap_or(0);
+                // `this.target == null || this.h-- <= 0`: the counter is
+                // decreased only when the ghast has a target.
+                let expired = if cur_target_id.is_some() {
+                    timer - 1 <= 0
+                } else {
+                    true
+                };
+                if expired {
+                    if let Some((pid, px, py, pz, dsq)) = closest_player {
+                        if dsq < 100.0 * 100.0 {
+                            target_pos = Some((pid, true, px, py, pz));
+                            attack_target = target_pos;
+                        }
+                    }
+                    if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                        mob.ghast_target_timer = if target_pos.is_some() { 20 } else { 0 };
+                    }
+                } else if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                    mob.ghast_target_timer = timer - 1;
+                }
+            }
+
+            // The centre of the box of the target (`EntityGhast.c_()`): the
+            // bottom of the box plus half of the width of the entity
+            // (`target.boundingBox.b + target.width / 2.0F`).
+            let mut target_centre_y = 0.0;
+            if let Some((tid, is_player, _, ty, _)) = target_pos {
+                let bottom = self.target_box_bottom(tid, is_player, ty);
+                let half_width = if is_player {
+                    0.9
+                } else {
+                    self.entities
+                        .get_mob(tid)
+                        .map(|m| m.size().1 as f64 / 2.0)
+                        .unwrap_or(0.0)
+                };
+                target_centre_y = bottom + half_width;
+            }
+
             // Acquire new target if none
             if target_pos.is_none() && !corpse && !target_died {
                 match mtype {
-                    MobType::Zombie
-                    | MobType::Skeleton
-                    | MobType::Creeper
-                    | MobType::Giant
-                    | MobType::Ghast => {
+                    MobType::Zombie | MobType::Skeleton | MobType::Creeper | MobType::Giant => {
                         // The target of the monster (`EntityMonster.findTarget()`):
                         // the closest player in sixteen blocks the mob can
                         // see.
@@ -5994,25 +6030,68 @@ impl Server {
                                 }
                             }
 
-                            if let Some((_, _, tx, ty, tz)) = target_pos {
-                                let tdx = tx - mob.x;
-                                let tdy = (ty + 1.0) - (mob.y + 2.0);
-                                let tdz = tz - mob.z;
-                                if tdx * tdx + tdy * tdy + tdz * tdz < 64.0 * 64.0 && has_los {
-                                    mob.yaw = -(crate::util::fdlibm::atan2(tdx, tdz) as f32)
-                                        * 180.0f32
-                                        / crate::entity::mob::JAVA_PI;
-                                    mob.look_yaw = mob.yaw;
+                            // The target of the ghast (`EntityGhast.c_()`):
+                            // the distance to the target is the square of the
+                            // differences of the positions (`Entity.g(Entity)`)
+                            // and it must be less than sixty four blocks.
+                            let mut target_in_range = None;
+                            if let Some((tid, is_player, tx, ty, tz)) = target_pos {
+                                let ddx = tx - mob.x;
+                                let ddy = ty - mob.y;
+                                let ddz = tz - mob.z;
+                                if ddx * ddx + ddy * ddy + ddz * ddz < 64.0 * 64.0 {
+                                    target_in_range = Some((tid, is_player, tx, ty, tz));
+                                }
+                            }
+                            if let Some((_tid, _is_player, tx, _ty, tz)) = target_in_range {
+                                // The direction to the target: the centre of
+                                // the box of the target
+                                // (`target.boundingBox.b + target.width /
+                                // 2.0F`) minus the centre of the box of the
+                                // ghast (`this.locY + this.width / 2.0F`).
+                                let d5 = tx - mob.x;
+                                let d6 = target_centre_y - (mob.y + 2.0);
+                                let d7 = tz - mob.z;
+                                mob.yaw = -(crate::util::fdlibm::atan2(d5, d7) as f32) * 180.0f32
+                                    / crate::entity::mob::JAVA_PI;
+                                mob.look_yaw = mob.yaw;
+                                if has_los {
+                                    if mob.ghast_charge == 10 {
+                                        // The sound of the charge of the ghast
+                                        // (`EntityGhast.c_()`): the pitch draws
+                                        // two numbers of the shared random.
+                                        let _ = self.entity_random.next_f32();
+                                        let _ = self.entity_random.next_f32();
+                                    }
                                     mob.ghast_charge += 1;
                                     if mob.ghast_charge == 20 {
+                                        // The sound of the fireball ✓ — the
+                                        // pitch draws two numbers ✓.
+                                        let _ = self.entity_random.next_f32();
+                                        let _ = self.entity_random.next_f32();
+                                        // The fireball (`EntityFireball.setDirection`):
+                                        // the direction to the target with the
+                                        // spread of three normal values.
+                                        let sx = d5 + self.entity_random.next_gaussian() * 0.4;
+                                        let sy = d6 + self.entity_random.next_gaussian() * 0.4;
+                                        let sz = d7 + self.entity_random.next_gaussian() * 0.4;
+                                        let len = crate::util::math::math_helper_a(
+                                            sx * sx + sy * sy + sz * sz,
+                                        ) as f64;
+                                        // The position of the fireball: the
+                                        // vector of the look of the ghast
+                                        // (`this.b(1.0F)`) times four and the
+                                        // centre of its box plus a half.
+                                        let look =
+                                            crate::entity::mob::look_vector(mob.yaw, mob.pitch);
                                         fireballs_to_shoot.push((
                                             mob_id,
-                                            mob.x,
-                                            mob.y + 2.0,
-                                            mob.z,
-                                            tdx,
-                                            tdy,
-                                            tdz,
+                                            mob.x + look.0 * 4.0,
+                                            mob.y + 2.0 + 0.5,
+                                            mob.z + look.2 * 4.0,
+                                            sx / len * 0.1,
+                                            sy / len * 0.1,
+                                            sz / len * 0.1,
                                         ));
                                         mob.ghast_charge = -40;
                                     }
@@ -6500,23 +6579,26 @@ impl Server {
             }
         }
 
-        for (ghast_id, gx, gy, gz, dx, dy, dz) in fireballs_to_shoot {
-            let len = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
-            let vx = (dx / len) * 0.9;
-            let vy = (dy / len) * 0.9;
-            let vz = (dz / len) * 0.9;
-            self.spawn_projectile_at(
+        for (ghast_id, gx, gy, gz, ax, ay, az) in fireballs_to_shoot {
+            // The fireball starts at rest (`EntityFireball`): the direction of
+            // the shot is its acceleration ✓.
+            let pid = self.spawn_projectile_at(
                 ProjectileKind::Fireball,
                 Some(ghast_id),
                 false,
                 false,
-                gx + (dx / len) * 4.0,
+                gx,
                 gy,
-                gz + (dz / len) * 4.0,
-                vx,
-                vy,
-                vz,
+                gz,
+                0.0,
+                0.0,
+                0.0,
             );
+            if let Some(proj) = self.entities.get_projectile_mut(pid) {
+                proj.accel_x = ax;
+                proj.accel_y = ay;
+                proj.accel_z = az;
+            }
         }
     }
 
@@ -7343,7 +7425,7 @@ impl Server {
         mot_x: f64,
         mot_y: f64,
         mot_z: f64,
-    ) {
+    ) -> i32 {
         let pid = self.entities.spawn_projectile(
             kind,
             shooter_id,
@@ -7368,6 +7450,7 @@ impl Server {
                 self.send_tracked(out.recipient_id, out.packet);
             }
         }
+        pid
     }
 
     fn tick_projectiles(&mut self) {
@@ -12940,6 +13023,47 @@ mod tests {
         server.tick_mobs();
         let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
         assert!(!mob.dead, "the monster lives with the monsters on");
+    }
+
+    /// The ghast shoots a fireball at the player.
+    ///
+    /// Java `EntityGhast.c_()`: after twenty ticks of the charge the ghast
+    /// shoots a fireball - the direction to the target with the spread of
+    /// three normal values (`EntityFireball.setDirection`) - and the fireball
+    /// starts at rest: the direction is its acceleration.
+    #[test]
+    fn the_ghast_shoots_a_fireball_at_the_player() {
+        let (mut server, mob_id) = mob_scenario_server("ghast");
+        // The player in front of the ghast.
+        let _player_id = mob_test_player(&mut server, ItemStack::new(items::BONE, 1, 0));
+        // The ghast charges and shoots.
+        let mut fireball = None;
+        for _ in 0..60 {
+            server.tick_mobs();
+            if let Some(proj) = server
+                .entities
+                .iter_projectiles()
+                .find(|p| p.kind == ProjectileKind::Fireball)
+            {
+                fireball = Some(proj.clone());
+                break;
+            }
+        }
+        let fireball = fireball.expect("the ghast shoots a fireball");
+        assert_eq!(fireball.mot_x, 0.0, "the fireball starts at rest");
+        assert_eq!(fireball.mot_y, 0.0, "the fireball starts at rest");
+        assert_eq!(fireball.mot_z, 0.0, "the fireball starts at rest");
+        // The direction of the shot is the acceleration of the fireball and it
+        // is normalized (`d0 / d3 * 0.1`).
+        let len =
+            (fireball.accel_x.powi(2) + fireball.accel_y.powi(2) + fireball.accel_z.powi(2)).sqrt();
+        assert!(
+            (len - 0.1).abs() < 1e-6,
+            "the direction of the fireball is normalized, got {len}"
+        );
+        // The charge of the ghast is reset after the shot.
+        let mob = server.entities.get_mob(mob_id).expect("the ghast is alive");
+        assert_eq!(mob.ghast_charge, -40, "the counter of the charge");
     }
 
     /// The wolf chooses the sheep of the list by a number of the world.

@@ -376,6 +376,10 @@ pub struct Mob {
     pub ghast_waypoint: (f64, f64, f64),
     pub ghast_course_cooldown: i32,
     pub ghast_charge: i32,
+    /// The counter of the search of the target of the ghast
+    /// (`EntityGhast.h`): the search of the nearby player is repeated every
+    /// twenty ticks.
+    pub ghast_target_timer: i32,
     // PigZombie
     pub pigzombie_anger: i32,
     /// Java `EntityPigZombie.soundDelay`: the counter of the sound of the
@@ -520,6 +524,7 @@ impl Mob {
             ghast_waypoint: (0.0, 0.0, 0.0),
             ghast_course_cooldown: 0,
             ghast_charge: 0,
+            ghast_target_timer: 0,
             pigzombie_anger: 0,
             pigzombie_sound_delay: 0,
             squid_swim_vec: (0.0, 0.0, 0.0),
@@ -2112,6 +2117,19 @@ pub fn world_sky_subtracted_with_weather(world_time: i64, rain: f32, thunder: f3
     ((1.0 - f) * 11.0) as i32
 }
 
+/// Java `EntityLiving.b(float)`: the vector of the look of the entity.
+///
+/// For the factor of one ✓ the vector is built from the yaw and the pitch of
+/// the entity ✓ (`EntityLiving.java:884-889` ✓): the trigonometry of the
+/// reference is the table of `MathHelper` ✓.
+pub fn look_vector(yaw: f32, pitch: f32) -> (f64, f64, f64) {
+    let f1 = crate::util::math::cos(-yaw * 0.017453292f32 - JAVA_PI);
+    let f2 = crate::util::math::sin(-yaw * 0.017453292f32 - JAVA_PI);
+    let f3 = -crate::util::math::cos(-pitch * 0.017453292f32);
+    let f4 = crate::util::math::sin(-pitch * 0.017453292f32);
+    ((f2 * f3) as f64, f4 as f64, (f1 * f3) as f64)
+}
+
 /// Java `Entity.c(float)`: the light of the block the mob is in.
 ///
 /// The reference uses the light of the block under the middle of the box of
@@ -2154,6 +2172,24 @@ pub fn chunk_sky_light_at(world: &World, x: i32, y: i32, z: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vector of the look of the entity.
+    ///
+    /// Java `EntityLiving.b(float)`: for the factor of one the vector is
+    /// built from the yaw and the pitch of the entity - the trigonometry of
+    /// the reference is the table of `MathHelper`.
+    #[test]
+    fn the_vector_of_the_look_is_the_direction_of_the_angles() {
+        // The yaw of zero: the vector points to the positive Z.
+        let (x, y, z) = look_vector(0.0, 0.0);
+        assert!(x.abs() < 1e-6, "the X of the vector");
+        assert!(y.abs() < 1e-6, "the Y of the vector");
+        assert!((z - 1.0).abs() < 1e-6, "the Z of the vector");
+        // The length of the vector is one.
+        let (x, y, z) = look_vector(35.0, -20.0);
+        let len = (x * x + y * y + z * z).sqrt();
+        assert!((len - 1.0).abs() < 1e-6, "the length of the vector");
+    }
 
     /// The wolf whines only when it is tamed and its health is below ten.
     ///
