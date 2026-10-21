@@ -839,8 +839,8 @@ pub struct WorldgenConfig {
     pub block_tree_growth_enabled: bool,
     /// Java `world.settings.block-tree-growth.list` of the reference: the
     /// blocks that the leaves do not replace.  The default of the reference
-    /// is an empty list (`PoseidonConfig`: the key is missing ⇒ the list is
-    /// empty).
+    /// is `"54,63,68"` (`PoseidonConfig.java:157` — the option is written
+    /// into the configuration file with this value ✓).
     pub block_tree_growth_blacklist: Vec<u8>,
 }
 
@@ -859,7 +859,7 @@ impl Default for WorldgenConfig {
             custom_ore_seed_enabled: false,
             custom_ore_seed: 0,
             block_tree_growth_enabled: true,
-            block_tree_growth_blacklist: Vec::new(),
+            block_tree_growth_blacklist: vec![54, 63, 68],
         }
     }
 }
@@ -1048,18 +1048,19 @@ mod tests {
         assert_eq!(parsed.spawning.monster_cap, 70);
     }
 
-    /// The list of the blocks that the leaves do not replace is empty by
-    /// default.
+    /// The list of the blocks that the leaves do not replace by default.
     ///
-    /// Java `PoseidonConfig`: the key `world.settings.block-tree-growth.list`
-    /// is missing by default, so the list of the blocked blocks is empty.
+    /// Java `PoseidonConfig.java:157`: the option
+    /// `world.settings.block-tree-growth.list` is written into the
+    /// configuration file with the value `"54,63,68"` ✓.
     #[test]
-    fn the_default_blacklist_of_the_tree_growth_is_empty() {
+    fn the_default_blacklist_of_the_tree_growth_is_the_one_of_the_reference() {
         let config = Config::default();
         assert!(config.worldgen.block_tree_growth_enabled);
-        assert!(
-            config.worldgen.block_tree_growth_blacklist.is_empty(),
-            "the default list of the blocked blocks is empty"
+        assert_eq!(
+            config.worldgen.block_tree_growth_blacklist,
+            vec![54, 63, 68],
+            "the default list of the blocked blocks"
         );
     }
 
