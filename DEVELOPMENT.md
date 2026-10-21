@@ -191,6 +191,21 @@ Worldgen parity harness (Overworld):
   trace (`A4`/`A5`/`B`/`G`/... lines) that can be diffed against a patched
   reference run for byte-level staged comparison.
 
+Entity movement parity harness (the entities that are not mobs):
+
+- Ground truth: `tools/poseidon_entities/PoseidonEntityTrace.java` runs a
+  scripted scenario of an entity in the reference and dumps its position,
+  velocity, rotation and ground flag after every tick (the arrow, the
+  snowball, the egg, the dropped item, the primed TNT and the boat).
+  Regenerate the golden file with
+  `sh tools/poseidon_entities/regenerate_golden.sh` (it writes
+  `tests/golden/poseidon_entity_traces.txt`).
+- The test `the_scenarios_of_the_entities_match_the_reference` in
+  `src/server.rs` compares the traces tick by tick.  The table
+  `KNOWN_DIVERGENCES` lists the tick of the first known divergence of every
+  scenario (see W-54 of the plan) — the test asserts that the traces are
+  equal before it and different at it, so a new divergence is caught.
+
 Block behavior parity harness:
 
 - Ground truth: `tools/poseidon_blocks/PoseidonBlockTrace.java` runs scripted

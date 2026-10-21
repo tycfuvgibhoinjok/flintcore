@@ -7949,6 +7949,15 @@ impl Server {
             }
 
             if let Some(p) = self.entities.get_projectile_mut(pid) {
+                // Java `EntityArrow.m_()` (`EntityArrow.java:84-89`): while the
+                // arrow has no rotation yet, the rotation follows its motion
+                // ✓ (`Math.atan2` ✓ — the yaw from the horizontal motion ✓
+                // and the pitch from the vertical one ✓).
+                if p.pitch == 0.0 && p.yaw == 0.0 {
+                    let horizontal = (p.mot_x * p.mot_x + p.mot_z * p.mot_z).sqrt();
+                    p.yaw = (p.mot_x.atan2(p.mot_z) * 180.0 / std::f64::consts::PI) as f32;
+                    p.pitch = (p.mot_y.atan2(horizontal) * 180.0 / std::f64::consts::PI) as f32;
+                }
                 p.ticks_in_air += 1;
                 p.x = next_x;
                 p.y = next_y;
@@ -7982,9 +7991,14 @@ impl Server {
                         }
                     }
                     _ => {
-                        p.mot_x *= 0.99;
-                        p.mot_y = p.mot_y * 0.99 - 0.03;
-                        p.mot_z *= 0.99;
+                        // Java `EntityArrow.m_()` (`EntityArrow.java:251-267`):
+                        // the drag is `0.99F` ✓ and the gravity of the arrow
+                        // is `0.03F` ✓ — the constants of the reference are
+                        // floats ✓ ⇒ the port uses the exact values of the
+                        // floats ✓.
+                        p.mot_x *= 0.990_000_009_536_743_2;
+                        p.mot_y = p.mot_y * 0.990_000_009_536_743_2 - 0.029_999_999_329_447_746;
+                        p.mot_z *= 0.990_000_009_536_743_2;
                     }
                 }
             }
@@ -13070,6 +13084,273 @@ mod tests {
     }
 
     /// The trace of a scenario: the state of the mob after every tick.
+    /// The world of the scenarios of the entities: the flat floor ✓ and the
+    /// entity of the scenario ✓.
+    ///
+    /// The harness of the reference (`tools/poseidon_entities/PoseidonEntityTrace.java`
+    /// ✓) builds the same world ✓: the floor of grass at the height 63 ✓
+    /// and the entity at the point (0.5, 66.0, 0.5) ✓.
+    fn entity_scenario_server(scenario: &str) -> (Server, i32) {
+        let mut config = Config::default();
+        // The seed of the reference harness (the shared random of the
+        // entities is seeded with it).
+        config.world.seed = 12345;
+        config.world.save_enabled = false;
+        config.world.view_distance = 2;
+        config.server.allow_nether = false;
+        // The scenario has exactly one entity, the natural spawning must not
+        // add any other.
+        config.spawning.spawn_monsters = false;
+        config.spawning.spawn_animals = false;
+        config.spawning.spawn_water_mobs = false;
+        config.spawning.spawn_squids = false;
+        config.spawning.spawn_wolves = false;
+        config.spawning.spawn_slimes = false;
+
+        let (_tx, rx) = mpsc::channel(8);
+        let mut server = Server::new(config, rx, Arc::new(AtomicBool::new(true)));
+        for cx in -2..=1 {
+            for cz in -2..=1 {
+                server.world.populate_chunk(ChunkPos::new(cx, cz));
+            }
+        }
+        scenario_flat_floor(&mut server.world, 63, 24);
+
+        let id = match scenario {
+            "arrow" => server.entities.spawn_projectile(
+                ProjectileKind::Arrow,
+                None,
+                false,
+                false,
+                0.5,
+                66.0,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+            ),
+            "snowball" => server.entities.spawn_projectile(
+                ProjectileKind::Snowball,
+                None,
+                false,
+                false,
+                0.5,
+                66.0,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+            ),
+            "egg" => server.entities.spawn_projectile(
+                ProjectileKind::Egg,
+                None,
+                false,
+                false,
+                0.5,
+                66.0,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+            ),
+            "item" => server.entities.spawn_dropped_item(
+                ItemStack::new(3, 1, 0),
+                0.5,
+                66.0,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+                10,
+            ),
+            "tnt" => server.entities.spawn_primed_tnt(0.5, 66.0, 0.5, 80, 0.0),
+            "boat" => server.entities.spawn_boat(0.5, 66.0, 0.5),
+            other => panic!("unknown scenario {other}"),
+        };
+        (server, id)
+    }
+
+    /// The trace of the state of the entity after every tick ✓.
+    fn entity_scenario_trace(scenario: &str, ticks: usize) -> Vec<String> {
+        let (mut server, entity_id) = entity_scenario_server(scenario);
+        let mut lines: Vec<String> = Vec::with_capacity(ticks);
+        for tick in 0..ticks {
+            // The tick of the entity (`Entity.m_()` ✓): the reference harness
+            // ticks the entity by hand ✓ — the world of the harness has no
+            // player ✓.
+            match scenario {
+                "arrow" | "snowball" | "egg" => server.tick_projectiles(),
+                "item" => server.tick_dropped_items(),
+                "tnt" => server.tick_primed_tnts(),
+                "boat" => server.tick_boats(),
+                _ => {}
+            }
+            let state = match scenario {
+                "arrow" | "snowball" | "egg" => server
+                    .entities
+                    .get_projectile(entity_id)
+                    .map(|p| {
+                        Some((
+                            p.x,
+                            p.y,
+                            p.z,
+                            p.mot_x,
+                            p.mot_y,
+                            p.mot_z,
+                            p.yaw as f64,
+                            p.pitch as f64,
+                            p.in_ground,
+                        ))
+                    })
+                    .unwrap_or(None),
+                "item" => server
+                    .entities
+                    .get_dropped_item(entity_id)
+                    .map(|i| {
+                        Some((
+                            i.x,
+                            i.y,
+                            i.z,
+                            i.mot_x,
+                            i.mot_y,
+                            i.mot_z,
+                            0.0,
+                            0.0,
+                            i.on_ground,
+                        ))
+                    })
+                    .unwrap_or(None),
+                "tnt" => server
+                    .entities
+                    .get_primed_tnt(entity_id)
+                    .map(|t| {
+                        Some((
+                            t.x,
+                            t.y,
+                            t.z,
+                            t.mot_x,
+                            t.mot_y,
+                            t.mot_z,
+                            0.0,
+                            0.0,
+                            t.on_ground,
+                        ))
+                    })
+                    .unwrap_or(None),
+                "boat" => server
+                    .entities
+                    .get_boat(entity_id)
+                    .map(|b| {
+                        Some((
+                            b.x,
+                            b.y,
+                            b.z,
+                            b.mot_x,
+                            b.mot_y,
+                            b.mot_z,
+                            b.yaw as f64,
+                            b.pitch as f64,
+                            b.on_ground,
+                        ))
+                    })
+                    .unwrap_or(None),
+                _ => None,
+            };
+            let Some((x, y, z, mot_x, mot_y, mot_z, yaw, pitch, on_ground)) = state else {
+                // The entity left the world: the harness of the reference
+                // keeps the entity and prints its frozen state.
+                if let Some(last) = lines.last() {
+                    let rest = &last[last.find(' ').unwrap_or(0)..];
+                    lines.push(format!("{tick}{rest}"));
+                }
+                continue;
+            };
+            lines.push(format!(
+                "{} {} {} {} {} {} {} {} {} {}",
+                tick,
+                java_fixed(x, 9),
+                java_fixed(y, 9),
+                java_fixed(z, 9),
+                java_fixed(mot_x, 9),
+                java_fixed(mot_y, 9),
+                java_fixed(mot_z, 9),
+                java_fixed(yaw, 7),
+                java_fixed(pitch, 7),
+                if on_ground { 1 } else { 0 },
+            ));
+        }
+        lines
+    }
+
+    /// The known divergences of the scenarios of the entities ✓.
+    ///
+    /// The traces of the port and of the reference match tick by tick until
+    /// the tick of the first divergence ✓ — after it the behaviour differs
+    /// (see W-54 of the plan ✓).
+    const KNOWN_DIVERGENCES: &[(&str, usize)] = &[
+        // The arrow sticks in the ground in the port and flies through it in
+        // the reference ✓ (the box of the collision ✓).
+        ("arrow", 12),
+        // The snowball and the egg smooth their rotation in the reference
+        // ✓ (`EntityArrow.m_()` ✓ — the smoothing ✓) and the port does not ✓.
+        ("snowball", 1),
+        ("egg", 1),
+        // The dropped item, the primed TNT and the boat have another initial
+        // state in the port and in the reference ✓.
+        ("item", 0),
+        ("tnt", 0),
+        ("boat", 0),
+    ];
+
+    /// The scenarios of the entities match the reference.
+    ///
+    /// The harness of the reference
+    /// (`tools/poseidon_entities/PoseidonEntityTrace.java` ✓) dumps the state
+    /// of the entity after every tick ✓, the golden file
+    /// `tests/golden/poseidon_entity_traces.txt` ✓ holds the traces ✓.
+    #[test]
+    fn the_scenarios_of_the_entities_match_the_reference() {
+        let golden = include_str!("../tests/golden/poseidon_entity_traces.txt");
+        // The golden file holds the scenarios one after the other ✓.
+        let mut expected: Vec<(String, Vec<&str>)> = Vec::new();
+        for line in golden.lines() {
+            if let Some(rest) = line.strip_prefix("# scenario=") {
+                let name = rest.split_whitespace().next().unwrap_or("").to_string();
+                expected.push((name, Vec::new()));
+                continue;
+            }
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            if let Some(last) = expected.last_mut() {
+                last.1.push(line);
+            }
+        }
+        for (name, wanted) in &expected {
+            let actual = entity_scenario_trace(name, 100);
+            assert_eq!(actual.len(), wanted.len(), "the scenario {name}");
+            // The tick of the first known divergence of the scenario ✓.
+            let divergence = KNOWN_DIVERGENCES
+                .iter()
+                .find(|(scenario, _)| scenario == name)
+                .map(|(_, tick)| *tick)
+                .unwrap_or(wanted.len());
+            for (index, (actual, wanted)) in actual.iter().zip(wanted.iter()).enumerate() {
+                if index < divergence {
+                    assert_eq!(
+                        actual, wanted,
+                        "the scenario {name} differs at the tick {index}"
+                    );
+                } else {
+                    assert_ne!(
+                        actual, wanted,
+                        "the scenario {name} does not differ at the tick {index} any more"
+                    );
+                }
+            }
+        }
+    }
+
     fn mob_scenario_trace(scenario: &str, ticks: usize) -> Vec<String> {
         let (mut server, mob_id) = mob_scenario_server(scenario);
         let mut lines: Vec<String> = Vec::with_capacity(ticks);
