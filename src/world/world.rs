@@ -1075,6 +1075,33 @@ impl World {
         blocks::material(id).is_solid_for_collision() && blocks::is_opaque_cube(id)
     }
 
+    /// Java `Entity.a(Material)`: the eye of the entity is under the surface
+    /// of the water.
+    ///
+    /// The block is taken at the rounded height of the eye
+    /// (`MathHelper.d(MathHelper.floor(d0))` — the nearest block ✓), the
+    /// surface of the water is the level of the liquid
+    /// (`BlockFluids.c(data)` — `(level + 1) / 9` ✓, the level is the data
+    /// of the block, and eight or more means a full block ✓) minus the
+    /// `0.11111111F` of the reference ✓.
+    pub fn eye_in_water(&self, x: f64, y: f64, z: f64, eye_height: f64) -> bool {
+        let d0 = y + eye_height;
+        let bx = x.floor() as i32;
+        // `MathHelper.d(float)`: the nearest block of the height of the eye.
+        let by = ((d0.floor() as f32) + 0.5).floor() as i32;
+        let bz = z.floor() as i32;
+        if !blocks::is_water(self.get_block(bx, by, bz)) {
+            return false;
+        }
+        let data = self.get_data(bx, by, bz);
+        let level = if data >= 8 { 0 } else { data };
+        // `BlockFluids.c(int)`: the height of the liquid.
+        let c = (level as f32 + 1.0) / 9.0;
+        let f = c - 0.111_111_11;
+        let f1 = (by + 1) as f32 - f;
+        d0 < f1 as f64
+    }
+
     pub fn get_data(&self, x: i32, y: i32, z: i32) -> u8 {
         if !(0..CHUNK_HEIGHT as i32).contains(&y) {
             return 0;
@@ -3935,6 +3962,48 @@ mod tests {
             world.safe_spawn_point(),
             (0, -1, 0),
             "there is no solid block in the column of the spawn"
+        );
+    }
+
+    /// The eye is in the water only under the surface of the water.
+    ///
+    /// Java `Entity.a(Material.WATER)`: the block is taken at the rounded
+    /// height of the eye (`MathHelper.d(MathHelper.floor(d0))` ✓), and the eye
+    /// must be below the surface of the water — the level of the liquid
+    /// (`BlockFluids.c(data)` ✓) minus `0.11111111F` ✓.
+    #[test]
+    fn the_eye_is_in_the_water_only_under_the_surface() {
+        let config = WorldConfig {
+            seed: 12345,
+            save_enabled: false,
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(config);
+        world.populate_chunk(ChunkPos::new(0, 0));
+        for y in 0..CHUNK_HEIGHT as i32 {
+            world.set_block(0, y, 0, blocks::AIR);
+        }
+        // A full block of water at 70: the surface of the water is the top of
+        // the block (71).
+        world.set_block(0, 70, 0, blocks::STATIONARY_WATER);
+        assert!(
+            world.eye_in_water(0.5, 70.0, 0.5, 0.12),
+            "the eye under the surface of the water is in the water"
+        );
+        assert!(
+            !world.eye_in_water(0.5, 71.0, 0.5, 0.12),
+            "the eye above the block of the water is not in the water"
+        );
+        // The flowing water (the data 1) has a lower surface: the top of the
+        // block minus `2 / 9 - 0.11111111`.
+        world.java_set_type_id_and_data(0, 70, 0, blocks::STATIONARY_WATER, 1);
+        assert!(
+            !world.eye_in_water(0.5, 70.95, 0.5, 0.12),
+            "the eye above the surface of the flowing water is not in the water"
+        );
+        assert!(
+            world.eye_in_water(0.5, 70.5, 0.5, 0.12),
+            "the eye under the surface of the flowing water is in the water"
         );
     }
 

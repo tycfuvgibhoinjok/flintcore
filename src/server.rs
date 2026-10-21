@@ -4229,33 +4229,30 @@ impl Server {
                 damages.push((pid, 4, "fell out of the world"));
             }
 
-            // 2. Head-level checks: in-wall suffocation (`EntityLiving.java:121-130`) & drowning (`EntityLiving.java:138-166`)
-            let head_x = px.floor() as i32;
-            let head_y = (py + 1.62).floor() as i32;
-            let head_z = pz.floor() as i32;
-            if (0..128).contains(&head_y) {
-                let head_block = self.world.get_block(head_x, head_y, head_z);
-                if !sleeping && blocks::is_opaque_cube(head_block) {
-                    damages.push((pid, 1, "suffocated in a wall"));
-                }
-                if blocks::is_water(head_block) {
-                    let drowned = if let Some(p) = self.entities.get_player_mut(pid) {
-                        p.air_ticks -= 1;
-                        if p.air_ticks <= -20 {
-                            p.air_ticks = 0;
-                            true
-                        } else {
-                            false
-                        }
+            // 2. Head-level checks: in-wall suffocation (`EntityLiving.java:121-130`) &
+            //    drowning (`EntityLiving.java:138-166`).
+            //    The height of the checks of the reference is `EntityHuman.t()`
+            //    (0.12), not the height of the eyes of the player (1.62).
+            if !sleeping && self.mob_suffocates(px, py + PLAYER_EYE_HEIGHT, pz, 0.6) {
+                damages.push((pid, 1, "suffocated in a wall"));
+            }
+            if self.world.eye_in_water(px, py, pz, PLAYER_EYE_HEIGHT) {
+                let drowned = if let Some(p) = self.entities.get_player_mut(pid) {
+                    p.air_ticks -= 1;
+                    if p.air_ticks <= -20 {
+                        p.air_ticks = 0;
+                        true
                     } else {
                         false
-                    };
-                    if drowned {
-                        damages.push((pid, 2, "drowned"));
                     }
-                } else if let Some(p) = self.entities.get_player_mut(pid) {
-                    p.air_ticks = 300;
+                } else {
+                    false
+                };
+                if drowned {
+                    damages.push((pid, 2, "drowned"));
                 }
+            } else if let Some(p) = self.entities.get_player_mut(pid) {
+                p.air_ticks = 300;
             }
 
             let min_x = (px - 0.36).floor() as i32;
@@ -6983,42 +6980,37 @@ impl Server {
         // runs out, the mob makes eight bubbles and takes two points of
         // damage.
         {
-            let head = self.entities.get_mob(mob_id).map(|m| {
-                (
-                    m.x.floor() as i32,
-                    (m.y + m.eye_height()).floor() as i32,
-                    m.z.floor() as i32,
-                    m.mob_type == MobType::Squid,
-                )
-            });
-            if let Some((hx, hy, hz, breathes)) = head {
-                if (0..128).contains(&hy) && !breathes {
-                    let head_block = self.world.get_block(hx, hy, hz);
-                    if blocks::is_water(head_block) {
-                        let mut drown = false;
-                        if let Some(mob) = self.entities.get_mob_mut(mob_id) {
-                            mob.air_ticks -= 1;
-                            if mob.air_ticks == -20 {
-                                mob.air_ticks = 0;
-                                drown = true;
+            let head = self
+                .entities
+                .get_mob(mob_id)
+                .map(|m| (m.x, m.y, m.z, m.eye_height(), m.mob_type == MobType::Squid));
+            if let Some((mx, my, mz, eye, breathes)) = head {
+                // `b_()`: the water animals (`EntityWaterAnimal`) do not
+                // drown — the squid is the only one of them in 1.7.3.
+                if !breathes && self.world.eye_in_water(mx, my, mz, eye) {
+                    let mut drown = false;
+                    if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                        mob.air_ticks -= 1;
+                        if mob.air_ticks == -20 {
+                            mob.air_ticks = 0;
+                            drown = true;
+                        }
+                    }
+                    if drown {
+                        // The bubbles of the drowning: eight times three
+                        // pairs of numbers.
+                        for _ in 0..8 {
+                            for _ in 0..3 {
+                                let _ = self.entity_random.next_f32();
+                                let _ = self.entity_random.next_f32();
                             }
                         }
-                        if drown {
-                            // The bubbles of the drowning: eight times three
-                            // pairs of numbers.
-                            for _ in 0..8 {
-                                for _ in 0..3 {
-                                    let _ = self.entity_random.next_f32();
-                                    let _ = self.entity_random.next_f32();
-                                }
-                            }
-                            self.damage_mob(mob_id, 2, None, false);
-                            if let Some(mob) = self.entities.get_mob_mut(mob_id) {
-                                mob.fire_ticks = 0;
-                            }
-                        }
-                    } else if let Some(mob) = self.entities.get_mob_mut(mob_id) {
-                        mob.air_ticks = 300;
+                        self.damage_mob(mob_id, 2, None, false);
+                    }
+                    // `EntityLiving.R()`: in the water the fire is out — every
+                    // tick, and not only on the tick of the damage.
+                    if let Some(mob) = self.entities.get_mob_mut(mob_id) {
+                        mob.fire_ticks = 0;
                     }
                 } else if let Some(mob) = self.entities.get_mob_mut(mob_id) {
                     mob.air_ticks = 300;
@@ -12162,9 +12154,13 @@ impl Server {
     }
 }
 
-/// The height of the eyes of a player (`EntityPlayer.t()`).
+/// Java `EntityPlayer.t()`: the height of the player used by the checks of
+/// the reference (the suffocation, the drowning, the lava, the line of sight,
+/// the aim of the mobs).
 ///
-/// The constant of the reference is a single precision one.
+/// It is the height of the eyes of the player ✓ — `EntityPlayer.t()` returns
+/// `1.62` ✓ (`EntityHuman.t()` returns `0.12` ✓, but the player overrides it
+/// ✓).  The constant of the reference is a single precision one ✓.
 const PLAYER_EYE_HEIGHT: f64 = 1.62f32 as f64;
 
 /// The offset of the randomised spawn of the reference.
@@ -12778,6 +12774,52 @@ mod tests {
         let mob = server.entities.get_mob(mob_id).expect("the mob is alive");
         // The pig has ten points of health, one of them is gone.
         assert_eq!(mob.health, 9);
+    }
+
+    /// The player suffocates by the eight probes of the reference.
+    ///
+    /// Java `Entity.K()`: the probes are around the head of the entity at the
+    /// height `t()` — the player is `1.62` (`EntityPlayer.t()` ✓), so the
+    /// probes are at the height of the eyes of the player ✓.
+    #[test]
+    fn the_player_suffocates_by_the_probes_of_the_reference() {
+        let mut config = Config::default();
+        config.world.seed = 12345;
+        config.world.save_enabled = false;
+        config.server.allow_nether = false;
+        let (_tx, rx) = mpsc::channel(8);
+        let mut server = Server::new(config, rx, Arc::new(AtomicBool::new(true)));
+        server.world.populate_chunk(ChunkPos::new(0, 0));
+        // An empty column with a stone at the height of the eyes of the
+        // player: the probes of the reference are there (`Entity.K()` ✓).
+        for y in 0..128 {
+            server.world.set_block(0, y, 0, blocks::AIR);
+        }
+        server.world.set_block(0, 65, 0, blocks::STONE);
+        let player_id = server
+            .entities
+            .insert_player(1, "Player".to_string(), 0.5, 64.0, 0.5);
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.spawn_protect_ticks = 0;
+        }
+        server.tick_player_environmental_damage();
+        let player = server
+            .entities
+            .get_player(player_id)
+            .expect("the player is alive");
+        assert_eq!(player.health, 19, "the player takes one point of damage");
+
+        // Without the block the player does not suffocate.
+        server.world.set_block(0, 65, 0, blocks::AIR);
+        if let Some(player) = server.entities.get_player_mut(player_id) {
+            player.health = 20;
+        }
+        server.tick_player_environmental_damage();
+        let player = server
+            .entities
+            .get_player(player_id)
+            .expect("the player is alive");
+        assert_eq!(player.health, 20, "the player does not suffocate");
     }
 
     /// A player of the tests with an item in his hand.
