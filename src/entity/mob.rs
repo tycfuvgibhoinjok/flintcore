@@ -2247,7 +2247,7 @@ mod tests {
         }
         if let Some(chunk) = world.get_chunk_mut(ChunkPos::new(5, 5)) {
             chunk.biomes = [Biome::Plains.id(); CHUNK_AREA];
-            chunk.init_lighting();
+            chunk.init_lighting(false);
         }
         while world.java_do_lighting() {}
         world

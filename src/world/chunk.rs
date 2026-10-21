@@ -291,8 +291,10 @@ impl Chunk {
         light
     }
 
-    pub fn init_lighting(&mut self) {
-        crate::world::lighting::init_chunk_lighting(self);
+    /// Java `Chunk.initLighting` (`Chunk.java:71-105`): the height map is
+    /// always computed ✓, the sky light — only outside of the Nether ✓.
+    pub fn init_lighting(&mut self, is_hell: bool) {
+        crate::world::lighting::init_chunk_lighting(self, is_hell);
     }
 
     pub fn set_subchunk_sky_light_fill(&mut self, sub_idx: usize, fill: u8) {
@@ -538,7 +540,7 @@ mod tests {
                 chunk.set_block(x, 64, z, blocks::GRASS);
             }
         }
-        chunk.init_lighting();
+        chunk.init_lighting(false);
         assert_eq!(chunk.get_height(0, 0), 65);
         assert_eq!(chunk.get_sky_light(0, 65, 0), 15);
         assert_eq!(chunk.get_sky_light(0, 63, 0), 0);

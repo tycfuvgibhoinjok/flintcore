@@ -62,7 +62,12 @@ impl ChunkLoader {
         }
     }
 
-    pub fn chunk_from_nbt(root: &NbtTag) -> Result<Chunk> {
+    /// Java `ChunkLoader.read`: the chunk of the NBT.
+    ///
+    /// The `is_hell` flag is the Nether of the world ✓ — in the Nether the
+    /// sky light is never computed ✓ (`Chunk.initLighting`, `Chunk.java:91-103`
+    /// ✓).
+    pub fn chunk_from_nbt(root: &NbtTag, is_hell: bool) -> Result<Chunk> {
         let level = root
             .get("Level")
             .ok_or(Error::Malformed("missing 'Level' compound in chunk NBT"))?;
@@ -172,10 +177,10 @@ impl ChunkLoader {
             if height_map.len() == 256 {
                 chunk.height_map.copy_from_slice(height_map);
             } else {
-                chunk.init_lighting();
+                chunk.init_lighting(is_hell);
             }
         } else {
-            chunk.init_lighting();
+            chunk.init_lighting(is_hell);
         }
 
         if let Some(tes) = level.get_list("TileEntities") {
@@ -211,7 +216,7 @@ mod tests {
         ));
 
         let nbt = ChunkLoader::chunk_to_nbt(&chunk, 1000, Vec::new());
-        let restored = ChunkLoader::chunk_from_nbt(&nbt).unwrap();
+        let restored = ChunkLoader::chunk_from_nbt(&nbt, false).unwrap();
 
         assert_eq!(restored.pos, ChunkPos::new(-5, 12));
         assert_eq!(restored.state, ChunkState::Populated);
@@ -220,5 +225,36 @@ mod tests {
         assert_eq!(restored.get_sky_light(3, 40, 7), 14);
         assert_eq!(restored.get_block_light(3, 40, 7), 10);
         assert_eq!(restored.tile_entities.len(), 1);
+    }
+
+    /// The chunk of the Nether has no sky light.
+    ///
+    /// Java `Chunk.initLighting` (`Chunk.java:91-103`): the pass of the sky
+    /// light is skipped in the Nether ✓ (`worldProvider.e` ✓); the height map
+    /// is computed anyway ✓.
+    #[test]
+    fn the_chunk_of_the_nether_has_no_sky_light() {
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0));
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk.set_block(x, 60, z, 1); // the stone
+            }
+        }
+        let mut nbt = ChunkLoader::chunk_to_nbt(&chunk, 0, Vec::new());
+        // The height map is missing: the chunk is initialised with
+        // `Chunk.initLighting` ✓.
+        if let NbtTag::Compound(root) = &mut nbt {
+            if let Some(NbtTag::Compound(level)) = root.get_mut("Level") {
+                level.shift_remove("HeightMap");
+            }
+        }
+
+        let overworld = ChunkLoader::chunk_from_nbt(&nbt, false).unwrap();
+        assert_eq!(overworld.get_height(0, 0), 61);
+        assert_eq!(overworld.get_sky_light(0, 62, 0), 15);
+
+        let nether = ChunkLoader::chunk_from_nbt(&nbt, true).unwrap();
+        assert_eq!(nether.get_height(0, 0), 61);
+        assert_eq!(nether.get_sky_light(0, 62, 0), 0);
     }
 }

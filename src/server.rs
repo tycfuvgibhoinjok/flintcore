@@ -12783,7 +12783,7 @@ mod tests {
         for cx in -2..=1 {
             for cz in -2..=1 {
                 if let Some(chunk) = server.world.get_chunk_mut(ChunkPos::new(cx, cz)) {
-                    chunk.init_lighting();
+                    chunk.init_lighting(false);
                 }
             }
         }
@@ -15651,7 +15651,7 @@ mod tests {
         for cx in 0..=6 {
             for cz in 0..=6 {
                 if let Some(chunk) = server.world.get_chunk_mut(ChunkPos::new(cx, cz)) {
-                    chunk.init_lighting();
+                    chunk.init_lighting(false);
                 }
             }
         }

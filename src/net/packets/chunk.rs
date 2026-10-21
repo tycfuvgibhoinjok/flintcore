@@ -170,7 +170,7 @@ mod tests {
         let mut chunk = Chunk::new(ChunkPos::new(2, -5));
         chunk.set_block(0, 0, 0, blocks::STONE);
         chunk.set_block(15, 127, 15, blocks::GRASS);
-        chunk.init_lighting();
+        chunk.init_lighting(false);
 
         let packet = MapChunk::from_chunk(&chunk).unwrap();
         let mut writer = Writer::new();

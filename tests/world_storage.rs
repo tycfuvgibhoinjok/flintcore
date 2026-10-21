@@ -186,7 +186,7 @@ fn test_chunk_file_and_tile_entity_round_trip() {
 
     // Read back
     let read_nbt = cache.read_chunk(pos.x, pos.z).unwrap().unwrap();
-    let loaded_chunk = ChunkLoader::chunk_from_nbt(&read_nbt).unwrap();
+    let loaded_chunk = ChunkLoader::chunk_from_nbt(&read_nbt, false).unwrap();
 
     assert_eq!(loaded_chunk.pos, pos);
     assert_eq!(loaded_chunk.state, ChunkState::Populated);

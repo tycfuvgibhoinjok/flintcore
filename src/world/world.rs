@@ -670,7 +670,7 @@ impl World {
         if !self.chunks.contains_key(&pos) {
             let loaded_chunk = if let Some(storage) = &self.storage {
                 match storage.borrow_mut().read_chunk(pos.x, pos.z) {
-                    Ok(Some(nbt)) => match ChunkLoader::chunk_from_nbt(&nbt) {
+                    Ok(Some(nbt)) => match ChunkLoader::chunk_from_nbt(&nbt, self.is_hell) {
                         Ok(c) => Some(c),
                         Err(err) => {
                             if self.config.regenerate_corrupt_chunks {
@@ -793,7 +793,7 @@ impl World {
         let storage = self.storage.as_ref()?;
         match storage.borrow_mut().read_chunk(pos.x, pos.z) {
             Ok(Some(nbt)) => {
-                let mut c = ChunkLoader::chunk_from_nbt(&nbt).ok()?;
+                let mut c = ChunkLoader::chunk_from_nbt(&nbt, self.is_hell).ok()?;
                 c.compact();
                 // Java `ChunkLoader.a(World, NBTTagCompound)`: the entities of
                 // the chunk are restored when the chunk is loaded.

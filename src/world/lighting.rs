@@ -26,7 +26,12 @@ const NEIGHBORS: [(i32, i32, i32); 6] = [
     (0, 0, -1),
 ];
 
-pub fn init_chunk_lighting(chunk: &mut Chunk) {
+/// Java `Chunk.initLighting` (`Chunk.java:71-105`).
+///
+/// The height map is always computed ✓; the sky light is computed only when
+/// the world is not the Nether ✓ (`worldProvider.e` ✓ — in the Nether the
+/// sky light is always zero ✓).
+pub fn init_chunk_lighting(chunk: &mut Chunk, is_hell: bool) {
     let mut max_height = 0usize;
     for x in 0..CHUNK_WIDTH {
         for z in 0..CHUNK_WIDTH {
@@ -41,6 +46,12 @@ pub fn init_chunk_lighting(chunk: &mut Chunk) {
                 max_height = height as usize;
             }
         }
+    }
+
+    if is_hell {
+        // Java `Chunk.initLighting` (`Chunk.java:91-103`): the pass of the sky
+        // light is skipped in the Nether ✓.
+        return;
     }
 
     // Any sub-chunk completely at or above `max_height` has uniform sky_light = 15.
@@ -254,7 +265,7 @@ mod tests {
             }
         }
 
-        init_chunk_lighting(&mut chunk);
+        init_chunk_lighting(&mut chunk, false);
 
         assert_eq!(chunk.get_height(0, 0), 61);
         assert_eq!(chunk.get_sky_light(0, 62, 0), 15);

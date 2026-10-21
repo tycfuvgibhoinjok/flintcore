@@ -441,7 +441,7 @@ impl Generator {
                 }
             }
         }
-        chunk.init_lighting();
+        chunk.init_lighting(false);
         chunk.state = crate::world::chunk::ChunkState::Generated;
         chunk
     }
