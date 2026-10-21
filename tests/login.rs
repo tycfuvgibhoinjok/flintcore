@@ -223,6 +223,14 @@ async fn skip_packet_payload(stream: &mut TcpStream, id: u8) -> bool {
         29 | 30 => {
             let _ = read_i32(stream).await;
         }
+        31 => {
+            let _ = read_i32(stream).await;
+            let _ = (
+                read_u8(stream).await,
+                read_u8(stream).await,
+                read_u8(stream).await,
+            );
+        }
         34 => {
             let _ = (
                 read_i32(stream).await,
