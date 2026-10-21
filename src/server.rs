@@ -10669,9 +10669,15 @@ impl Server {
             if login_dimension == 0 && s.world.live_is_active() && s.world.is_raining() {
                 s.send(id, Clientbound::Bed(Bed { reason: 1 }));
             }
+
+            // The second packet of the time (`NetLoginHandler`: the time of
+            // the player is sent after the position of the player).
+            let time = s.world.world_time();
+            s.send(id, Clientbound::UpdateTime(UpdateTime { time }));
         });
 
-        // Sync initial inventory to client
+        // Sync initial inventory to client (`EntityPlayer.syncInventory`):
+        // the items of the inventory and the item in hand.
         if let Some(player) = self.entities.get_player(entity_id) {
             let window_items = player.inventory.to_window_items();
             self.send(
@@ -10681,15 +10687,24 @@ impl Server {
                     items: window_items,
                 }),
             );
+            let held =
+                player
+                    .inventory
+                    .item_in_hand()
+                    .map(|item| crate::net::packets::window::SlotItem {
+                        item_id: item.id,
+                        count: item.count as i8,
+                        damage: item.damage,
+                    });
+            self.send(
+                id,
+                Clientbound::SetSlot(SetSlot {
+                    window_id: -1,
+                    slot: -1,
+                    item: held,
+                }),
+            );
         }
-
-        // Send UpdateHealth to the new player
-        let health = self
-            .entities
-            .get_player(entity_id)
-            .map(|p| p.health)
-            .unwrap_or(20);
-        self.send(id, Clientbound::UpdateHealth(UpdateHealth { health }));
 
         // Poseidon: PlayerJoinEvent -> broadcast join message to other players
         let join_msg = self.config.messages.join.replacen("%player%", name, 1);
@@ -13194,6 +13209,63 @@ mod tests {
             times > 0,
             "the packet of the time keeps the connection of the client alive"
         );
+    }
+
+    /// The sequence of the packets of the login is the sequence of the
+    /// reference.
+    ///
+    /// Java `NetLoginHandler` and `EntityPlayer.syncInventory()`: the
+    /// login, the spawn position, the time of the world, the position of
+    /// the player, the second packet of the time, the items of the
+    /// inventory and the item in hand (`SetSlot(-1, -1, held)`).  The
+    /// health is not sent at the login.
+    #[test]
+    fn the_sequence_of_the_packets_of_the_login_is_the_sequence_of_the_reference() {
+        let (mut server, _mob_id) = mob_scenario_server("flat");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        server.connections.insert(
+            7,
+            Connection {
+                sender: tx,
+                address: "127.0.0.1:25565".parse().expect("the address"),
+                state: ConnectionState::Playing,
+                username: Some("Tester".to_string()),
+                entity_id: 1,
+            },
+        );
+        server.handle_packet(
+            7,
+            Serverbound::Login(crate::net::packets::Login {
+                protocol: crate::net::protocol::PROTOCOL_VERSION,
+                username: "Tester".to_string(),
+                map_seed: 0,
+                dimension: 0,
+            }),
+        );
+        let mut ids: Vec<u8> = Vec::new();
+        let mut slots: Vec<(i8, i16)> = Vec::new();
+        let mut health = 0;
+        while let Ok(Outbound::Packet(packet)) = rx.try_recv() {
+            match packet {
+                Clientbound::UpdateHealth(_) => health += 1,
+                Clientbound::SetSlot(slot) => slots.push((slot.window_id, slot.slot)),
+                other => ids.push(other.id() as u8),
+            }
+        }
+        // The login, the spawn position and the time.
+        assert_eq!(ids[0], 1, "the login");
+        assert_eq!(ids[1], 6, "the spawn position");
+        assert_eq!(ids[2], 4, "the time of the world");
+        // The second packet of the time.
+        assert_eq!(
+            ids.iter().filter(|id| **id == 4).count(),
+            2,
+            "the time is sent twice"
+        );
+        // The items of the inventory and the item in hand.
+        assert!(ids.contains(&104), "the items of the inventory are sent");
+        assert_eq!(slots, vec![(-1, -1)], "the item in hand");
+        assert_eq!(health, 0, "the health is not sent at the login");
     }
 
     /// The mobs push each other away.
