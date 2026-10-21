@@ -390,7 +390,9 @@ impl TileEntity {
                 TileEntityKind::Dispenser { items }
             }
             "Music" => {
-                let note = tag.get_i8("note").unwrap_or(0) as u8;
+                // Java `TileEntityNote.a(NBTTagCompound)`: the note is clamped
+                // to 0..24.
+                let note = tag.get_i8("note").unwrap_or(0).clamp(0, 24) as u8;
                 TileEntityKind::Note { note }
             }
             "RecordPlayer" => {
@@ -401,5 +403,41 @@ impl TileEntity {
         };
 
         Some(Self { x, y, z, kind })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The note of the music box is clamped to 0..24 when it is read.
+    ///
+    /// Java `TileEntityNote.a(NBTTagCompound)`: the note that is less than
+    /// zero becomes zero, the note that is greater than 24 becomes 24.
+    #[test]
+    fn the_note_of_the_music_box_is_clamped() {
+        let mut tag = NbtTag::compound();
+        tag.insert("id", NbtTag::String("Music".into()));
+        tag.insert("x", NbtTag::Int(1));
+        tag.insert("y", NbtTag::Int(2));
+        tag.insert("z", NbtTag::Int(3));
+        tag.insert("note", NbtTag::Byte(30));
+        assert_eq!(
+            TileEntity::from_nbt(&tag).map(|t| t.kind),
+            Some(TileEntityKind::Note { note: 24 }),
+            "the note is clamped to 24"
+        );
+
+        let mut tag = NbtTag::compound();
+        tag.insert("id", NbtTag::String("Music".into()));
+        tag.insert("x", NbtTag::Int(1));
+        tag.insert("y", NbtTag::Int(2));
+        tag.insert("z", NbtTag::Int(3));
+        tag.insert("note", NbtTag::Byte(-5));
+        assert_eq!(
+            TileEntity::from_nbt(&tag).map(|t| t.kind),
+            Some(TileEntityKind::Note { note: 0 }),
+            "the note is clamped to zero"
+        );
     }
 }

@@ -132,6 +132,20 @@ impl BaseEntity {
             }
         }
 
+        // Java `Entity.e(NBTTagCompound)`: the speed of every axis longer than
+        // ten blocks is dropped, and the angles are normalised (`c(yaw, pitch)`
+        // — the angle that is not a number and the infinite angle become zero
+        // ✓, the rest is taken modulo 360 ✓).
+        let motion = (
+            if motion.0.abs() > 10.0 { 0.0 } else { motion.0 },
+            if motion.1.abs() > 10.0 { 0.0 } else { motion.1 },
+            if motion.2.abs() > 10.0 { 0.0 } else { motion.2 },
+        );
+        let rotation = (
+            crate::entity::player::normalise_angle(rotation.0),
+            crate::entity::player::normalise_angle(rotation.1),
+        );
+
         Some(Self {
             id,
             pos: (x, y, z),
@@ -179,6 +193,41 @@ mod tests {
         assert_eq!(restored.fall_distance, 1.5);
         assert_eq!(restored.fire_ticks, 7);
         assert!(restored.on_ground);
+    }
+
+    /// The speed longer than ten blocks is dropped and the angles are
+    /// normalised when the entity is read back.
+    ///
+    /// Java `Entity.e(NBTTagCompound)`: every axis of the speed longer than
+    /// ten blocks becomes zero, and the angles are normalised (`c(yaw, pitch)`
+    /// — the angle that is not a number and the infinite angle become zero ✓,
+    /// the rest is taken modulo 360 ✓).
+    #[test]
+    fn the_speed_and_the_angles_are_normalised_when_the_entity_is_read() {
+        let mut tag = NbtTag::compound();
+        tag.insert(
+            "Pos",
+            NbtTag::List(vec![
+                NbtTag::Double(1.0),
+                NbtTag::Double(2.0),
+                NbtTag::Double(3.0),
+            ]),
+        );
+        tag.insert(
+            "Motion",
+            NbtTag::List(vec![
+                NbtTag::Double(20.0),
+                NbtTag::Double(1.0),
+                NbtTag::Double(-30.0),
+            ]),
+        );
+        tag.insert(
+            "Rotation",
+            NbtTag::List(vec![NbtTag::Float(400.0), NbtTag::Float(f32::NAN)]),
+        );
+        let base = BaseEntity::read(&tag, "Item").unwrap();
+        assert_eq!(base.motion, (0.0, 1.0, 0.0), "the long speed is dropped");
+        assert_eq!(base.rotation, (40.0, 0.0), "the angles are normalised");
     }
 
     #[test]

@@ -17,7 +17,9 @@ pub struct DiggingState {
 /// Java `Entity.c(float, float)`: the angle is taken modulo 360, the `NaN`
 /// is replaced with zero.
 pub fn normalise_angle(angle: f32) -> f32 {
-    if angle.is_nan() {
+    // Java `Entity.c(float, float)`: the angle that is not a number and the
+    // infinite angle become zero, the rest is taken modulo 360.
+    if angle.is_nan() || angle.is_infinite() {
         0.0
     } else {
         angle % 360.0
