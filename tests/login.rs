@@ -28,9 +28,25 @@ impl Drop for Harness {
 }
 
 impl Harness {
+    /// The harness of the tests.
+    ///
+    /// The spawn of the player is not randomised, so the tests know the
+    /// position of the player.  The reference randomises the spawn
+    /// (`world-settings.randomize-spawn`) — the test of the randomisation
+    /// uses the harness with it.
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// The harness with the randomisation of the spawn of the reference.
+    async fn start_with_randomized_spawn() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(randomize_spawn: bool) -> Self {
         let mut config = Config::default();
         config.world.save_enabled = false;
+        config.world.randomize_spawn = randomize_spawn;
         let running = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(AtomicU64::new(1));
         let (inbound_tx, inbound_rx) = mpsc::channel::<NetEvent>(64);
@@ -79,6 +95,71 @@ fn login(protocol: i32, username: &str) -> Vec<u8> {
     writer.write_i64(0);
     writer.write_i8(0);
     writer.into_inner()
+}
+
+/// The spawn of the player is randomised by the reference.
+///
+/// Java `EntityPlayer.java:46-51`: the offset of the spawn is
+/// `random.nextInt(20) - 10` on the X and the Z — the position of the player
+/// is within ten blocks of the spawn of the world.  The option is enabled by
+/// default (`PoseidonConfig.java:152`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_spawn_of_the_player_is_randomised() {
+    let harness = Harness::start_with_randomized_spawn().await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        client.write_all(&handshake("Player")).await.unwrap();
+        client.write_all(&login(14, "Player")).await.unwrap();
+
+        let handshake_reply = read_u8(&mut client).await;
+        assert_eq!(handshake_reply, 2);
+        assert_eq!(read_string(&mut client).await, "-");
+
+        let login_reply = read_u8(&mut client).await;
+        assert_eq!(login_reply, 1);
+        let _entity_id = read_i32(&mut client).await;
+        let _username = read_string(&mut client).await;
+        let _seed = read_i64(&mut client).await;
+        let _dimension = read_u8(&mut client).await;
+
+        // The position of the spawn of the world: it is not randomised.
+        assert_eq!(read_u8(&mut client).await, 6);
+        let spawn_x = read_i32(&mut client).await;
+        let spawn_y = read_i32(&mut client).await;
+        let spawn_z = read_i32(&mut client).await;
+        assert_eq!((spawn_x, spawn_y, spawn_z), (0, 64, 0));
+
+        // The time of the world.
+        assert_eq!(read_u8(&mut client).await, 4);
+        let _ = read_i64(&mut client).await;
+
+        // The nine chunks of the spawn.
+        read_pre_chunks(&mut client).await;
+
+        // The position of the player: the offset of the reference is within
+        // ten blocks of the spawn.
+        let teleport_id = read_u8(&mut client).await;
+        assert_eq!(teleport_id, 13);
+        let x = read_f64(&mut client).await;
+        let _y = read_f64(&mut client).await;
+        let stance = read_f64(&mut client).await;
+        let z = read_f64(&mut client).await;
+        assert!(
+            (-9.5..=9.5).contains(&x),
+            "the X of the player is within ten blocks of the spawn, got {x}"
+        );
+        assert!(
+            (-9.5..=9.5).contains(&z),
+            "the Z of the player is within ten blocks of the spawn, got {z}"
+        );
+        assert!(
+            stance >= 64.0,
+            "the height of the player is the height of the column of the spawn, got {stance}"
+        );
+    };
+
+    timeout(Duration::from_secs(40), exchange).await.unwrap();
+    harness.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

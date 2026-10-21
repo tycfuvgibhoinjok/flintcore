@@ -10865,6 +10865,11 @@ impl Server {
         self.run_tracker_tick();
     }
 
+    /// The offset of the randomised spawn (see [`spawn_offset`]).
+    fn spawn_offset(&mut self) -> (i32, i32) {
+        spawn_offset(&self.config, &mut self.entity_random)
+    }
+
     fn handle_login(&mut self, id: ConnId, login: Login) {
         let protocol_allowed = if self.config.network.allowed_protocols.is_empty() {
             login.protocol == PROTOCOL_VERSION
@@ -10963,6 +10968,14 @@ impl Server {
             }
         }
 
+        // Java `EntityPlayer.java:46-51`: the spawn of the player is
+        // randomised by the shared random of the entities
+        // (`Entity.SHARED_RANDOM`).  The offset is drawn before the checks of
+        // the login — in the reference the player is created before them
+        // (`ServerConfigurationManager.java:198`), so a rejected player
+        // shifts the stream of the mobs exactly as in the reference.
+        let spawn_offset = self.spawn_offset();
+
         let lower_name = name.to_lowercase();
         let peer_ip = self
             .connections
@@ -11009,18 +11022,12 @@ impl Server {
         }
 
         let seed = self.world.seed();
-        let (mut spawn_x, mut spawn_y, mut spawn_z) = self.world.safe_spawn_point();
-        if self.config.world.randomize_spawn && self.config.world.randomize_spawn_radius > 0 {
-            let r = self.config.world.randomize_spawn_radius;
-            spawn_x += self.world.tick_random.next_i32_bound(r * 2) - r;
-            spawn_z += self.world.tick_random.next_i32_bound(r * 2) - r;
-            if self.config.world.teleport_to_highest_safe_block {
-                let g = self.world.top_solid_or_liquid_block(spawn_x, spawn_z);
-                if g > 0 {
-                    spawn_y = g;
-                }
-            }
-        }
+        // Java `EntityPlayer.java:44-52`: the height of the spawn is found
+        // *before* the offset (`k = world.f(i, j)` — the highest solid block
+        // of the column of the spawn plus one), so the height does not depend
+        // on the offset of the position.
+        let (spawn_x, spawn_y, spawn_z) = self.world.safe_spawn_point();
+        let (spawn_x, spawn_z) = (spawn_x + spawn_offset.0, spawn_z + spawn_offset.1);
         let player_x = spawn_x as f64 + 0.5;
         let player_y = spawn_y as f64;
         let player_z = spawn_z as f64 + 0.5;
@@ -11084,6 +11091,7 @@ impl Server {
             // The saved dimension is unavailable; fall back to the overworld
             // spawn instead of leaving the player at stored Nether coordinates.
             let (spawn_x, spawn_y, spawn_z) = self.world.safe_spawn_point();
+            let (spawn_x, spawn_z) = (spawn_x + spawn_offset.0, spawn_z + spawn_offset.1);
             let mut chunk_shift = None;
             if let Some(player) = self.entities.get_player_mut(entity_id) {
                 let old_chunk = player.chunk_pos();
@@ -12158,6 +12166,30 @@ impl Server {
 ///
 /// The constant of the reference is a single precision one.
 const PLAYER_EYE_HEIGHT: f64 = 1.62f32 as f64;
+
+/// The offset of the randomised spawn of the reference.
+///
+/// Java `EntityPlayer.java:46-51`:
+/// `i += this.random.nextInt(20) - 10; j += this.random.nextInt(20) - 10;`
+/// — the offset is applied to the X and the Z ✓, the random is the shared one
+/// of the entities (`Entity.SHARED_RANDOM`, `Entity.java:125`) ✓, so the
+/// offset shifts the stream of the mobs exactly as in the reference ✓.  The
+/// radius of the port (`randomize_spawn_radius`) is 10 by default — the value
+/// of the reference ✓.
+fn spawn_offset(config: &Config, random: &mut JavaRandom) -> (i32, i32) {
+    if !config.world.randomize_spawn {
+        return (0, 0);
+    }
+    let radius = config.world.randomize_spawn_radius.max(0);
+    // The bound of the reference is 20 (`nextInt(20) - 10`); the radius of
+    // the port may be another one, but the number of the draws stays one per
+    // axis (`Random.nextInt` rejects only when the bound is not a power of
+    // two, and even then it rejects with a negligible probability) ✓.
+    let bound = (radius * 2).max(1);
+    let dx = random.next_i32_bound(bound) - radius;
+    let dz = random.next_i32_bound(bound) - radius;
+    (dx, dz)
+}
 
 /// Java `EntityLiving.b(float, float, float)`: the turn of the mob with the
 /// limit of the turn.
@@ -15211,6 +15243,53 @@ mod tests {
             .entities
             .insert_player(1, "Tester".to_string(), 0.0, 64.0, 0.0);
         server
+    }
+
+    /// The spawn of a new player is randomised by the shared random of the
+    /// entities.
+    ///
+    /// Java `EntityPlayer.java:46-51`: `i += this.random.nextInt(20) - 10;
+    /// j += this.random.nextInt(20) - 10;` — the random is the shared one of
+    /// the entities (`Entity.SHARED_RANDOM`, `Entity.java:125`) ✓, so the
+    /// offset shifts the stream of the mobs exactly as in the reference ✓.
+    /// The option is enabled by default (`PoseidonConfig.java:152`) ✓.
+    #[test]
+    fn the_spawn_of_the_player_is_randomised_by_the_shared_random() {
+        let config = Config::default();
+        assert!(
+            config.world.randomize_spawn,
+            "the reference randomises the spawn by default"
+        );
+        let mut random = JavaRandom::new(12345);
+        let (dx, dz) = spawn_offset(&config, &mut random);
+        assert_eq!((dx, dz), (1, -10), "the offset of the reference");
+        assert_eq!(random.draws, 2, "the offset draws two numbers");
+
+        // The option is off: there is no draw and no offset.
+        let mut config = Config::default();
+        config.world.randomize_spawn = false;
+        let mut random = JavaRandom::new(12345);
+        assert_eq!(spawn_offset(&config, &mut random), (0, 0));
+        assert_eq!(random.draws, 0, "without the option there is no draw");
+    }
+
+    /// The offset of the spawn is drawn from the shared random of the
+    /// entities and not from the random of the world.
+    #[test]
+    fn the_offset_of_the_spawn_is_drawn_from_the_shared_random_of_the_entities() {
+        let mut server = spawn_test_server(Default::default());
+        let world_draws = server.world.tick_random.draws;
+        let entity_draws = server.entity_random.draws;
+        let _ = server.spawn_offset();
+        assert_eq!(
+            server.entity_random.draws,
+            entity_draws + 2,
+            "the shared random of the entities is used"
+        );
+        assert_eq!(
+            server.world.tick_random.draws, world_draws,
+            "the random of the world is not used"
+        );
     }
 
     /// The spawn of the mobs does not depend on the run of the server.

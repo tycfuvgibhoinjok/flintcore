@@ -356,7 +356,18 @@ pub struct WorldConfig {
     /// Force `spawn_x/y/z` from `config.toml` to overwrite the saved `level.dat` spawn even on existing worlds.
     pub override_saved_spawn: bool,
     /// `Poseidon: world-settings.randomize-spawn` — apply `±randomize_spawn_radius` X/Z offset on initial player spawn.
+    ///
+    /// Java `PoseidonConfig.java:152`: the option is enabled by default ✓.
+    /// Java `EntityPlayer.java:46-51`: the offset is drawn from the shared
+    /// random of the entities (`Entity.SHARED_RANDOM`) and is applied to the
+    /// X and the Z ✓.
     pub randomize_spawn: bool,
+    /// The radius of the offset of the randomised spawn.
+    ///
+    /// Java `EntityPlayer.java:47-48`: the offset is
+    /// `random.nextInt(20) - 10` — the radius of the reference is 10 ✓ (the
+    /// option of the port is an extension: the value 10 is the value of the
+    /// reference ✓).
     pub randomize_spawn_radius: i32,
     /// `Poseidon: world-settings.teleport-to-highest-safe-block` — elevate spawn/login above solid blocks.
     /// Set to `false` to spawn players inside underground rooms or indoor hubs at exact `spawn_y`.
@@ -385,7 +396,7 @@ impl Default for WorldConfig {
             spawn_radius: 16,
             auto_find_spawn: true,
             override_saved_spawn: false,
-            randomize_spawn: false,
+            randomize_spawn: true,
             randomize_spawn_radius: 10,
             teleport_to_highest_safe_block: true,
             keep_spawn_in_memory: true,
