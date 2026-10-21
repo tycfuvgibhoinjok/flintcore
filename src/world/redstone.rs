@@ -3874,7 +3874,7 @@ mod tests {
             spawn_x: 12,
             spawn_y: 65,
             spawn_z: -5,
-            teleport_to_highest_safe_block: false,
+            spawn_use_ground_height: false,
             ..Default::default()
         });
         for cx in -1..=1 {
@@ -3888,17 +3888,17 @@ mod tests {
         world.set_block(12, 66, -5, blocks::AIR);
         world.set_block(12, 70, -5, blocks::STONE);
 
-        // 1. With `teleport_to_highest_safe_block = false`, `safe_spawn_point` returns exact `(12, 65, -5)`
+        // 1. With `spawn_use_ground_height = false`, `safe_spawn_point` returns exact `(12, 65, -5)`
         assert_eq!(world.safe_spawn_point(), (12, 65, -5));
 
-        // 2. Even with `teleport_to_highest_safe_block = true`, custom `spawn_y = 65` stays at 65 if (12, 65..66, -5) is air!
+        // 2. Even with `spawn_use_ground_height = true`, custom `spawn_y = 65` stays at 65 if (12, 65..66, -5) is air!
         let mut world2 = World::new(WorldConfig {
             seed: 42,
             save_enabled: false,
             spawn_x: 12,
             spawn_y: 65,
             spawn_z: -5,
-            teleport_to_highest_safe_block: true,
+            spawn_use_ground_height: true,
             ..Default::default()
         });
         world2.ensure_chunk_base(ChunkPos::new(0, -1));

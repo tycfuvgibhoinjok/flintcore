@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use flintcore::config::Config;
+use flintcore::config::{Config, WorldConfig};
 use flintcore::net::{listener, packets::chat::MAX_CHAT_LENGTH, NetEvent};
 use flintcore::server::Server;
 use flintcore::util::bytes::Writer;
@@ -35,18 +35,20 @@ impl Harness {
     /// (`world-settings.randomize-spawn`) — the test of the randomisation
     /// uses the harness with it.
     async fn start() -> Self {
-        Self::start_with(false).await
+        Self::start_with_world(|_| {}).await
     }
 
     /// The harness with the randomisation of the spawn of the reference.
     async fn start_with_randomized_spawn() -> Self {
-        Self::start_with(true).await
+        Self::start_with_world(|world| world.randomize_spawn = true).await
     }
 
-    async fn start_with(randomize_spawn: bool) -> Self {
+    /// The harness with the given options of the world.
+    async fn start_with_world(configure: impl FnOnce(&mut WorldConfig)) -> Self {
         let mut config = Config::default();
         config.world.save_enabled = false;
-        config.world.randomize_spawn = randomize_spawn;
+        config.world.randomize_spawn = false;
+        configure(&mut config.world);
         let running = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(AtomicU64::new(1));
         let (inbound_tx, inbound_rx) = mpsc::channel::<NetEvent>(64);
@@ -412,7 +414,14 @@ async fn read_window_items(client: &mut TcpStream) {
     let _item_id = read_i16(client).await;
 }
 
-async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
+/// The login of the player; the position of the player (the packet of the
+/// teleport) is returned: `(x, the height of the eyes, the height of the feet,
+/// z)`.
+///
+/// The packet 13 of the reference is
+/// `Packet13PlayerLookMove(x, y + 1.62, y, z, ...)` ✓ — the second number is
+/// the height of the eyes and the third is the height of the feet ✓.
+async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) -> (f64, f64, f64, f64) {
     client.write_all(&handshake(username)).await.unwrap();
     client.write_all(&login(14, username)).await.unwrap();
 
@@ -430,6 +439,7 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
     let mut spawn = false;
     let mut items = false;
     let mut slot = false;
+    let mut position = (0.0, 0.0, 0.0, 0.0);
     while pre_chunks < 9 || chunk_data < 9 || times < 2 || !spawn || !items || !slot {
         let id = read_u8(client).await;
         match id {
@@ -451,7 +461,7 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
                 );
             }
             13 => {
-                let _ = (
+                position = (
                     read_f64(client).await,
                     read_f64(client).await,
                     read_f64(client).await,
@@ -512,6 +522,7 @@ async fn login_and_consume_spawn(client: &mut TcpStream, username: &str) {
             }
         }
     }
+    position
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -880,6 +891,114 @@ async fn respawn_double_packet_sequence() {
         }
     };
 
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+/// The player is raised out of the blocks at the join.
+///
+/// Java `ServerConfigurationManager.java:117-121`: while the world has
+/// entities in the box of the player, the player is raised by a block
+/// (`entityplayer.setPosition(locX, locY + 1.0D, locZ)`); the raise is done
+/// when the option `world-settings.teleport-to-highest-safe-block` is on ✓.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_player_is_raised_out_of_the_blocks_at_the_join() {
+    // The spawn is inside the ground: the option `spawn_use_ground_height` is
+    // off, so the spawn of the player is the configured `spawn_y` (30) ✓.
+    let harness = Harness::start_with_world(|world| {
+        world.spawn_use_ground_height = false;
+        world.spawn_y = 30;
+    })
+    .await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        let (_x, _eyes, feet, _z) = login_and_consume_spawn(&mut client, "Raised").await;
+        // The ground of the column (0, 0) is at 85: the player is raised to
+        // the first free block above it ✓.
+        assert_eq!(feet, 86.0);
+    };
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+/// The raise of the player at the join is done only when the option is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_raise_at_the_join_is_done_only_when_the_option_is_on() {
+    let harness = Harness::start_with_world(|world| {
+        world.spawn_use_ground_height = false;
+        world.spawn_y = 30;
+        world.push_player_up_at_join = false;
+    })
+    .await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        let (_x, _eyes, feet, _z) = login_and_consume_spawn(&mut client, "NotRaised").await;
+        // The player stays inside the ground: the option is off ✓.
+        assert_eq!(feet, 30.0);
+    };
+    timeout(Duration::from_secs(5), exchange).await.unwrap();
+    harness.stop().await;
+}
+
+/// The respawn uses the spawn of the world and the player is raised out of the
+/// blocks.
+///
+/// Java `ServerConfigurationManager.java:275-279`: the respawn is at the
+/// spawn of the world (not at the height of the column) ✓; `:297-299`: the
+/// player is raised by a block while its box is blocked ✓ — the raise of the
+/// respawn is done **always** ✓ (without any option ✓).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_respawn_uses_the_spawn_of_the_world() {
+    let harness = Harness::start_with_world(|world| {
+        world.spawn_use_ground_height = false;
+        world.spawn_y = 30;
+        // The raise at the join is off: the raise of the respawn is always
+        // done ✓.
+        world.push_player_up_at_join = false;
+    })
+    .await;
+    let exchange = async {
+        let mut client = TcpStream::connect(harness.address).await.unwrap();
+        let (_x, _eyes, feet, _z) = login_and_consume_spawn(&mut client, "Respawned").await;
+        // The join: the player is not raised ✓ (the option is off ✓).
+        assert_eq!(feet, 30.0);
+
+        // The respawn.
+        let mut respawn_writer = Writer::new();
+        respawn_writer.write_u8(9);
+        respawn_writer.write_i8(0);
+        client.write_all(respawn_writer.as_slice()).await.unwrap();
+
+        // The two packets of the respawn ✓.
+        assert_eq!(read_packet_id(&mut client, &[9]).await, 9);
+        assert_eq!(read_u8(&mut client).await as i8, -1);
+        assert_eq!(read_u8(&mut client).await, 9);
+        assert_eq!(read_u8(&mut client).await as i8, 0);
+
+        // The chunks of the spawn ✓.
+        read_pre_chunks(&mut client).await;
+
+        // The teleport: the player is raised out of the ground ✓.
+        assert_eq!(read_u8(&mut client).await, 13);
+        let _x = read_f64(&mut client).await;
+        let _eyes = read_f64(&mut client).await;
+        let feet = read_f64(&mut client).await;
+        let _z = read_f64(&mut client).await;
+        assert_eq!(feet, 86.0);
+
+        // The spawn position: the spawn of the world ✓ (not the height of the
+        // column ✓).
+        loop {
+            let id = read_u8(&mut client).await;
+            if id == 6 {
+                assert_eq!(read_i32(&mut client).await, 0);
+                assert_eq!(read_i32(&mut client).await, 30);
+                assert_eq!(read_i32(&mut client).await, 0);
+                break;
+            }
+            skip_packet_payload(&mut client, id).await;
+        }
+    };
     timeout(Duration::from_secs(5), exchange).await.unwrap();
     harness.stop().await;
 }

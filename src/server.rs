@@ -10615,6 +10615,74 @@ impl Server {
         }
     }
 
+    /// Java `ServerConfigurationManager.moveToWorld` (`:297-299`) и
+    /// `ServerConfigurationManager.c` (`:117-121`): игрок поднимается на блок,
+    /// пока его бокс не станет свободным.
+    ///
+    /// `worldserver.getEntities(player, player.boundingBox).size() != 0` ✓ —
+    /// список содержит и блоки ✓, и сущности ✓ (`World.getEntities`,
+    /// `World.java:943-982` ✓).
+    ///
+    /// Возвращает новую высоту (`locY`) игрока.
+    fn push_player_up_out_of_the_blocks(
+        &self,
+        world: &World,
+        player_id: i32,
+        dimension: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> f64 {
+        // The boxes of the entities of the world: the reference asks the world
+        // for the entities of the box (`World.getEntities`, `World.java:966-980` ✓).
+        let mut entity_boxes: Vec<Aabb> = Vec::new();
+        for mob in self.entities.iter_mobs() {
+            if mob.dead || self.entities.dimension_of(mob.entity_id) != dimension {
+                continue;
+            }
+            entity_boxes.push(mob.aabb());
+        }
+        for other in self.entities.iter_players() {
+            if other.entity_id == player_id || other.dimension != dimension {
+                continue;
+            }
+            entity_boxes.push(other.bounding_box());
+        }
+        let mut y = y;
+        for _ in 0..128 {
+            // The box of the player (`Entity.setPosition` ✓): the height of the
+            // player is zero ✓ (`EntityPlayer.s()` ✓), so the box is
+            // `[locY, locY + 1.8]` ✓.
+            let box_ = Aabb::for_entity(x, y, z, 0.6, 1.8, 0.0, 0.0);
+            let mut scratch = Vec::new();
+            crate::entity::physics::collect_collision_boxes(
+                world,
+                &box_,
+                &entity_boxes,
+                &mut scratch,
+            );
+            if scratch.is_empty() {
+                break;
+            }
+            y += 1.0;
+        }
+        y
+    }
+
+    /// The world of the dimension (`WorldServer` of the dimension ✓).
+    fn world_of_dimension(&self, dimension: i32) -> &World {
+        match self.nether {
+            None => &self.world,
+            Some(_) => {
+                if dimension == self.active_dimension {
+                    &self.world
+                } else {
+                    self.nether.as_ref().unwrap()
+                }
+            }
+        }
+    }
+
     fn find_safe_bed_respawn(&self, bx: i32, by: i32, bz: i32) -> Option<(i32, i32, i32)> {
         if self.world.get_block(bx, by, bz) != blocks::BED {
             return None;
@@ -10882,10 +10950,12 @@ impl Server {
                     pos
                 } else {
                     invalid_bed = true;
-                    s.world.safe_spawn_point()
+                    // Java `ServerConfigurationManager.java:275-279`: без
+                    // кровати игрок появляется на **исходном** спавне мира ✓.
+                    s.world.spawn_point()
                 }
             } else {
-                s.world.safe_spawn_point()
+                s.world.spawn_point()
             }
         });
 
@@ -10933,6 +11003,30 @@ impl Server {
             respawned_eid = Some(entity_id);
             self.entities
                 .update_player_chunk(entity_id, old_chunk, new_chunk);
+        }
+
+        // Java `ServerConfigurationManager.moveToWorld` (`:297-299`): the
+        // player is raised by a block while its box holds a block or an
+        // entity — always, without any option ✓.
+        {
+            let raised = self.entities.get_by_conn(id).map(|player| {
+                let entity_id = player.entity_id;
+                let (px, py, pz) = (player.x, player.y, player.z);
+                let world = self.world_of_dimension(0);
+                (
+                    entity_id,
+                    py,
+                    self.push_player_up_out_of_the_blocks(world, entity_id, 0, px, py, pz),
+                )
+            });
+            if let Some((entity_id, old_y, new_y)) = raised {
+                if new_y != old_y {
+                    if let Some(player) = self.entities.get_player_mut(entity_id) {
+                        player.stance += new_y - old_y;
+                        player.y = new_y;
+                    }
+                }
+            }
         }
 
         self.with_dimension(0, |s| s.stream_initial_chunks(id));
@@ -11227,6 +11321,32 @@ impl Server {
         }
         if let Some(player) = self.entities.get_player_mut(entity_id) {
             player.dimension = login_dimension;
+        }
+
+        // Java `ServerConfigurationManager.c` (`:117-121`): at the join the
+        // player is raised by a block while its box holds a block or an
+        // entity; the raise is done when the option
+        // `world-settings.teleport-to-highest-safe-block` is on ✓.
+        if self.config.world.push_player_up_at_join {
+            let raised = self.entities.get_by_conn(id).map(|player| {
+                let entity_id = player.entity_id;
+                let dimension = player.dimension;
+                let (px, py, pz) = (player.x, player.y, player.z);
+                let world = self.world_of_dimension(dimension);
+                (
+                    entity_id,
+                    py,
+                    self.push_player_up_out_of_the_blocks(world, entity_id, dimension, px, py, pz),
+                )
+            });
+            if let Some((entity_id, old_y, new_y)) = raised {
+                if new_y != old_y {
+                    if let Some(player) = self.entities.get_player_mut(entity_id) {
+                        player.stance += new_y - old_y;
+                        player.y = new_y;
+                    }
+                }
+            }
         }
 
         // The burst of the login: the packets of a low priority (the data of

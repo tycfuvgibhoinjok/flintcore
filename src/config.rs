@@ -43,11 +43,20 @@ impl Default for Config {
 /// The configuration is strict (`deny_unknown_fields`), so an old
 /// configuration with one of these keys does not load.  The error names the
 /// key and says why it is gone, so that it is clear what to delete.
-const REMOVED_KEYS: &[(&str, &str)] = &[(
-    "head_rotation_patch_enabled",
-    "the check of the pitch was removed: the reference has no such check \
-     (`Entity.c(float, float)` only rejects the `NaN` and the infinite angle)",
-)];
+const REMOVED_KEYS: &[(&str, &str)] = &[
+    (
+        "head_rotation_patch_enabled",
+        "the check of the pitch was removed: the reference has no such check \
+         (`Entity.c(float, float)` only rejects the `NaN` and the infinite angle)",
+    ),
+    (
+        "teleport_to_highest_safe_block",
+        "the key was renamed: `spawn_use_ground_height` raises the spawn to the \
+         height of the column (as the reference always does), and \
+         `push_player_up_at_join` raises the player at the join (as the option \
+         `world-settings.teleport-to-highest-safe-block` of the reference does)",
+    ),
+];
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -369,9 +378,20 @@ pub struct WorldConfig {
     /// option of the port is an extension: the value 10 is the value of the
     /// reference ✓).
     pub randomize_spawn_radius: i32,
-    /// `Poseidon: world-settings.teleport-to-highest-safe-block` — elevate spawn/login above solid blocks.
-    /// Set to `false` to spawn players inside underground rooms or indoor hubs at exact `spawn_y`.
-    pub teleport_to_highest_safe_block: bool,
+    /// Raise the spawn to the height of the highest solid block of the column.
+    ///
+    /// Java `EntityPlayer.java:45`: `k = world.f(i, j)` — the reference
+    /// **always** raises the spawn to the height of the column ✓; the option
+    /// of the port lets an operator keep the configured `spawn_y` instead
+    /// (an extension of the port ✓).
+    pub spawn_use_ground_height: bool,
+    /// `Poseidon: world-settings.teleport-to-highest-safe-block` — raise the
+    /// player at the join, while its box is blocked.
+    ///
+    /// Java `ServerConfigurationManager.java:117-121`: while the world has
+    /// entities in the box of the player, the player is raised by a block ✓
+    /// (`entityplayer.setPosition(locX, locY + 1.0D, locZ)` ✓).
+    pub push_player_up_at_join: bool,
     /// Keep the `±128` block spawn region permanently loaded in memory (`bukkit.yml: keep-spawn-loaded`).
     pub keep_spawn_in_memory: bool,
     /// `Poseidon: emergency.debug.regenerate-corrupt-chunks.enable`.
@@ -398,7 +418,8 @@ impl Default for WorldConfig {
             override_saved_spawn: false,
             randomize_spawn: true,
             randomize_spawn_radius: 10,
-            teleport_to_highest_safe_block: true,
+            spawn_use_ground_height: true,
+            push_player_up_at_join: true,
             keep_spawn_in_memory: true,
             regenerate_corrupt_chunks: false,
         }
@@ -1097,6 +1118,32 @@ mod tests {
         assert!(
             error.contains("was removed"),
             "the error says that the key was removed: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The old name of the option of the raise of the player at the join does
+    /// not load: the error names the key and the new names.
+    #[test]
+    fn the_old_name_of_the_option_of_the_raise_at_the_join_does_not_load() {
+        let dir = std::env::temp_dir().join("flintcore-config-test-removed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flintcore.toml");
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        let text = text.replace(
+            "[world]\n",
+            "[world]\nteleport_to_highest_safe_block = true\n",
+        );
+        std::fs::write(&path, &text).unwrap();
+
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("teleport_to_highest_safe_block"),
+            "the error names the key: {error}"
+        );
+        assert!(
+            error.contains("spawn_use_ground_height") && error.contains("push_player_up_at_join"),
+            "the error names the new keys: {error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

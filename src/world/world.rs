@@ -628,7 +628,7 @@ impl World {
         } else {
             self.populate_chunk(chunk_pos);
         }
-        if !self.config.teleport_to_highest_safe_block {
+        if !self.config.spawn_use_ground_height {
             return (x, default_y.clamp(1, 127), z);
         }
         if default_y != 64 {
