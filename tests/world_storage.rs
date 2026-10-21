@@ -6,9 +6,7 @@ use flintcore::entity::player::Player;
 use flintcore::gameplay::items::ItemStack;
 use flintcore::gameplay::tile::{TileEntity, TileEntityKind};
 use flintcore::world::chunk::{Chunk, ChunkPos, ChunkState};
-use flintcore::world::storage::{
-    ChunkLoader, LevelData, PlayerStore, RegionFileCache, SessionLock,
-};
+use flintcore::world::storage::{ChunkFileCache, ChunkLoader, LevelData, PlayerStore, SessionLock};
 use flintcore::world::world::World;
 
 fn create_temp_world_dir(prefix: &str) -> PathBuf {
@@ -116,9 +114,9 @@ fn test_player_store_persistence() {
 }
 
 #[test]
-fn test_mcregion_chunk_and_tile_entity_round_trip() {
-    let world_dir = create_temp_world_dir("mcregion_test");
-    let mut cache = RegionFileCache::new(&world_dir);
+fn test_chunk_file_and_tile_entity_round_trip() {
+    let world_dir = create_temp_world_dir("chunk_file_test");
+    let mut cache = ChunkFileCache::new(&world_dir);
 
     let pos = ChunkPos::new(3, -2);
     let mut chunk = Chunk::new(pos);
@@ -142,8 +140,10 @@ fn test_mcregion_chunk_and_tile_entity_round_trip() {
     cache.write_chunk(pos.x, pos.z, &nbt).unwrap();
     cache.flush_all().unwrap();
 
-    let region_file = world_dir.join("region").join("r.0.-1.mcr");
-    assert!(region_file.exists());
+    // Java `ChunkLoader`: the file of the chunk is
+    // `<world>/<x & 63>/<z & 63>/c.<x>.<z>.dat`.
+    let chunk_file = cache.chunk_path(pos.x, pos.z);
+    assert!(chunk_file.exists(), "the file of the chunk exists");
 
     // Read back
     let read_nbt = cache.read_chunk(pos.x, pos.z).unwrap().unwrap();
@@ -192,7 +192,7 @@ fn test_world_disk_save_and_reopen_lifecycle() {
     }
 
     assert!(world_dir.join("level.dat").exists());
-    assert!(world_dir.join("region").join("r.0.0.mcr").exists());
+    assert!(world_dir.join("0").join("0").join("c.0.0.dat").exists());
 
     // 2. Second server session: reopen world from disk
     {

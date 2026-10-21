@@ -16,7 +16,7 @@ use crate::world::decorate::GenWorld;
 use crate::world::generator::{Generator, HellGenerator};
 use crate::world::lighting::{LightType, LightingWorld};
 use crate::world::redstone::WorldEvent;
-use crate::world::storage::{ChunkLoader, LevelData, RegionFileCache, SessionLock};
+use crate::world::storage::{ChunkFileCache, ChunkLoader, LevelData, SessionLock};
 
 thread_local! {
     static GENERATOR: RefCell<Option<(i64, Generator)>> = const { RefCell::new(None) };
@@ -198,7 +198,7 @@ pub struct World {
     pub(crate) chunks: HashMap<ChunkPos, Chunk>,
     pub(crate) packet_cache: RefCell<HashMap<ChunkPos, (PreChunk, MapChunk)>>,
     chunk_mgr: RefCell<WorldChunkManager>,
-    storage: Option<RefCell<RegionFileCache>>,
+    storage: Option<RefCell<ChunkFileCache>>,
     pub(crate) level_data: RefCell<LevelData>,
     _session_lock: Option<SessionLock>,
     pub(crate) suppress_physics: bool,
@@ -472,7 +472,15 @@ impl World {
         };
 
         if config.save_enabled {
-            storage = Some(RefCell::new(RegionFileCache::new(&world_dir)));
+            let mut cache = ChunkFileCache::new(&world_dir);
+            // The worlds of the port that used the regions of Anvil are
+            // imported into the format of the reference.
+            if let Err(error) =
+                crate::world::storage::region_import::import_regions(&world_dir, &mut cache)
+            {
+                crate::util::log::warn(&format!("the import of the regions failed: {error}"));
+            }
+            storage = Some(RefCell::new(cache));
         }
 
         let chunk_mgr = RefCell::new(WorldChunkManager::new(config.seed));

@@ -1,2 +1,9 @@
 /target
 /.references
+# The chunks of the world in the format of the reference: the directories
+# are named by the coordinates of the chunk in the base thirty six.
+/world/*/
+# The data of the level is written by the server.
+/world/level.dat
+/world/level.dat_old
+/world/level.dat_new
