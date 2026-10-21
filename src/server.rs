@@ -517,10 +517,9 @@ impl Server {
         }
         self.stream_chunks();
 
-        // Tick entity tracking every 2 ticks (mirroring Poseidon EntityTracker)
-        if ticks % 2 == 0 {
-            self.run_tracker_tick();
-        }
+        // The tracker of the entities is updated every tick
+        // (`MinecraftServer.tick`: `tracker.updatePlayers()`).
+        self.run_tracker_tick();
 
         // Health synchronization
         let health_updates: Vec<(ConnId, i16)> = self
@@ -4764,6 +4763,7 @@ impl Server {
                 mob.mot_y = (mob.mot_y / 2.0 + 0.4).min(0.4);
                 mob.mot_z = mob.mot_z / 2.0 - (dz / dist) * 0.4;
                 mob.velocity_changed = true;
+                mob.air_borne = true;
 
                 if mob.mob_type == MobType::Wolf {
                     mob.wolf_sitting = false;
@@ -5421,6 +5421,7 @@ impl Server {
                                     mob.mot_z = dz / h * 0.5 * 0.800_000_011_920_929
                                         + mob.mot_z * 0.200_000_002_980_232_24;
                                     mob.mot_y = 0.400_000_005_960_464_5;
+                                    mob.air_borne = true;
                                 }
                             } else if has_los
                                 && mob.mob_type == MobType::Spider
@@ -6048,6 +6049,7 @@ impl Server {
                         // `EntityLiving.O()`: the constant of the reference
                         // is the single precision value.
                         mob.mot_y = 0.419_999_986_886_978_15;
+                        mob.air_borne = true;
                     }
                 }
 
@@ -6489,11 +6491,13 @@ impl Server {
             other.mot_x -= dx;
             other.mot_z -= dz;
             other.on_ground = false;
+            other.air_borne = true;
         }
         if let Some(mob) = self.entities.get_mob_mut(mob_id) {
             mob.mot_x += dx;
             mob.mot_z += dz;
             mob.on_ground = false;
+            mob.air_borne = true;
         }
     }
 

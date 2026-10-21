@@ -46,6 +46,9 @@ pub struct Player {
     pub prev_pitch: f32,
     pub stance: f64,
     pub on_ground: bool,
+    /// Java `Entity.airBorne`: the player was pushed, jumped or hurt, the
+    /// tracker sends the packet of the position at once.
+    pub air_borne: bool,
     pub mot_x: f64,
     pub mot_y: f64,
     pub mot_z: f64,
@@ -122,6 +125,7 @@ impl Player {
             prev_pitch: 0.0,
             stance: y,
             on_ground: false,
+            air_borne: false,
             mot_x: 0.0,
             mot_y: 0.0,
             mot_z: 0.0,

@@ -32,6 +32,11 @@ pub struct EntityTrackerEntry {
     pub teleport_ticks: u32,
     pub tracked_players: HashSet<i32>,
     pub tracking_range: f64,
+    /// Java `EntityTrackerEntry.c`: the interval of the update of the
+    /// position of the entity (in ticks).
+    pub update_interval: u32,
+    /// Java `EntityTrackerEntry.l`: the counter of the updates.
+    pub update_counter: u32,
 }
 
 impl EntityTrackerEntry {
@@ -51,6 +56,9 @@ impl EntityTrackerEntry {
             teleport_ticks: 0,
             tracked_players: HashSet::new(),
             tracking_range,
+            // The player is updated every two ticks.
+            update_interval: 2,
+            update_counter: 0,
         }
     }
 
@@ -70,6 +78,9 @@ impl EntityTrackerEntry {
             teleport_ticks: 0,
             tracked_players: HashSet::new(),
             tracking_range: 64.0,
+            // The item is updated every twenty ticks.
+            update_interval: 20,
+            update_counter: 0,
         }
     }
 
@@ -89,6 +100,9 @@ impl EntityTrackerEntry {
             teleport_ticks: 0,
             tracked_players: HashSet::new(),
             tracking_range: 160.0,
+            // The boat is updated every five ticks.
+            update_interval: 5,
+            update_counter: 0,
         }
     }
 
@@ -108,10 +122,20 @@ impl EntityTrackerEntry {
             teleport_ticks: 0,
             tracked_players: HashSet::new(),
             tracking_range: 160.0,
+            // The animals are updated every three ticks.
+            update_interval: 3,
+            update_counter: 0,
         }
     }
 
-    pub fn new_pos_entity(entity_id: i32, x: f64, y: f64, z: f64, range: f64) -> Self {
+    pub fn new_pos_entity(
+        entity_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        range: f64,
+        update_interval: u32,
+    ) -> Self {
         Self {
             entity_id,
             encoded_x: (x * 32.0).floor() as i32,
@@ -127,6 +151,8 @@ impl EntityTrackerEntry {
             teleport_ticks: 0,
             tracked_players: HashSet::new(),
             tracking_range: range,
+            update_interval,
+            update_counter: 0,
         }
     }
 
@@ -384,9 +410,17 @@ pub struct EntityTracker {
     tracking_range: f64,
 }
 
+/// Java `EntityTrackerEntry.b(EntityPlayer)`: the radius of the tracking is
+/// a square in XZ, the height of the entity is not taken into account.
+fn in_tracking_range(dx: f64, dz: f64, range: f64) -> bool {
+    dx.abs() <= range && dz.abs() <= range
+}
+
 impl EntityTracker {
     pub fn new(view_distance: i32) -> Self {
-        let tracking_range = ((view_distance * 16 - 16).max(32)) as f64;
+        // Java `ServerConfigurationManager.a()`: the radius of the tracking
+        // is limited by the distance of the view.
+        let tracking_range = (view_distance * 16 - 16).max(0) as f64;
         Self {
             entries: HashMap::new(),
             item_entries: HashMap::new(),
@@ -417,7 +451,8 @@ impl EntityTracker {
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
         let mut entry = EntityTrackerEntry::new_item(item);
-        let item_range_sq = 64.0 * 64.0;
+        // The radius of the entity is limited by the distance of the view.
+        let item_range = 64.0f64.min(self.tracking_range);
         let target_chunk = item.chunk_pos();
 
         for p in players {
@@ -425,11 +460,11 @@ impl EntityTracker {
                 continue;
             }
             let dx = p.x - item.x;
-            let dy = p.y - item.y;
             let dz = p.z - item.z;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
             let chunk_ready = p.sent_chunks.is_empty() || p.sent_chunks.contains(&target_chunk);
-            if dist_sq <= item_range_sq && chunk_ready && entry.tracked_players.insert(p.entity_id)
+            if in_tracking_range(dx, dz, item_range)
+                && chunk_ready
+                && entry.tracked_players.insert(p.entity_id)
             {
                 for packet in entry.make_item_spawn_packets(item) {
                     outbound.push(OutboundTrackingPacket {
@@ -455,7 +490,8 @@ impl EntityTracker {
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
         let mut entry = EntityTrackerEntry::new_boat(boat);
-        let boat_range_sq = 160.0 * 160.0;
+        // The radius of the entity is limited by the distance of the view.
+        let boat_range = 160.0f64.min(self.tracking_range);
         let target_chunk = boat.chunk_pos();
 
         for p in players {
@@ -463,11 +499,11 @@ impl EntityTracker {
                 continue;
             }
             let dx = p.x - boat.x;
-            let dy = p.y - boat.y;
             let dz = p.z - boat.z;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
             let chunk_ready = p.sent_chunks.is_empty() || p.sent_chunks.contains(&target_chunk);
-            if dist_sq <= boat_range_sq && chunk_ready && entry.tracked_players.insert(p.entity_id)
+            if in_tracking_range(dx, dz, boat_range)
+                && chunk_ready
+                && entry.tracked_players.insert(p.entity_id)
             {
                 for packet in entry.make_boat_spawn_packets(boat) {
                     outbound.push(OutboundTrackingPacket {
@@ -493,7 +529,8 @@ impl EntityTracker {
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
         let mut entry = EntityTrackerEntry::new_mob(mob);
-        let range_sq = 160.0 * 160.0;
+        // The radius of the entity is limited by the distance of the view.
+        let range = 160.0f64.min(self.tracking_range);
         let target_chunk = mob.chunk_pos();
 
         for p in players {
@@ -501,11 +538,12 @@ impl EntityTracker {
                 continue;
             }
             let dx = p.x - mob.x;
-            let dy = p.y - mob.y;
             let dz = p.z - mob.z;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
             let chunk_ready = p.sent_chunks.is_empty() || p.sent_chunks.contains(&target_chunk);
-            if dist_sq <= range_sq && chunk_ready && entry.tracked_players.insert(p.entity_id) {
+            if in_tracking_range(dx, dz, range)
+                && chunk_ready
+                && entry.tracked_players.insert(p.entity_id)
+            {
                 for packet in entry.make_mob_spawn_packets(mob) {
                     outbound.push(OutboundTrackingPacket {
                         recipient_id: p.entity_id,
@@ -529,9 +567,23 @@ impl EntityTracker {
         players: &[Player],
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
-        let mut entry =
-            EntityTrackerEntry::new_pos_entity(proj.entity_id, proj.x, proj.y, proj.z, 64.0);
-        let range_sq = 64.0 * 64.0;
+        // Java `EntityTracker.track`: the arrow is updated every twenty
+        // ticks, the fireball, the snowball and the egg every ten.
+        let interval = match proj.kind {
+            crate::entity::projectile::ProjectileKind::Arrow
+            | crate::entity::projectile::ProjectileKind::FishingHook => 20,
+            _ => 10,
+        };
+        let mut entry = EntityTrackerEntry::new_pos_entity(
+            proj.entity_id,
+            proj.x,
+            proj.y,
+            proj.z,
+            64.0,
+            interval,
+        );
+        // The radius of the entity is limited by the distance of the view.
+        let range = 64.0f64.min(self.tracking_range);
         let target_chunk = proj.chunk_pos();
 
         for p in players {
@@ -539,11 +591,12 @@ impl EntityTracker {
                 continue;
             }
             let dx = p.x - proj.x;
-            let dy = p.y - proj.y;
             let dz = p.z - proj.z;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
             let chunk_ready = p.sent_chunks.is_empty() || p.sent_chunks.contains(&target_chunk);
-            if dist_sq <= range_sq && chunk_ready && entry.tracked_players.insert(p.entity_id) {
+            if in_tracking_range(dx, dz, range)
+                && chunk_ready
+                && entry.tracked_players.insert(p.entity_id)
+            {
                 for packet in entry.make_projectile_spawn_packets(proj) {
                     outbound.push(OutboundTrackingPacket {
                         recipient_id: p.entity_id,
@@ -568,8 +621,10 @@ impl EntityTracker {
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
         let mut entry =
-            EntityTrackerEntry::new_pos_entity(tnt.entity_id, tnt.x, tnt.y, tnt.z, 160.0);
-        let range_sq = 160.0 * 160.0;
+            // The primed TNT is updated every ten ticks.
+            EntityTrackerEntry::new_pos_entity(tnt.entity_id, tnt.x, tnt.y, tnt.z, 160.0, 10);
+        // The radius of the entity is limited by the distance of the view.
+        let range = 160.0f64.min(self.tracking_range);
         let target_chunk = tnt.chunk_pos();
 
         for p in players {
@@ -577,11 +632,12 @@ impl EntityTracker {
                 continue;
             }
             let dx = p.x - tnt.x;
-            let dy = p.y - tnt.y;
             let dz = p.z - tnt.z;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
             let chunk_ready = p.sent_chunks.is_empty() || p.sent_chunks.contains(&target_chunk);
-            if dist_sq <= range_sq && chunk_ready && entry.tracked_players.insert(p.entity_id) {
+            if in_tracking_range(dx, dz, range)
+                && chunk_ready
+                && entry.tracked_players.insert(p.entity_id)
+            {
                 for packet in entry.make_tnt_spawn_packets(tnt) {
                     outbound.push(OutboundTrackingPacket {
                         recipient_id: p.entity_id,
@@ -606,8 +662,10 @@ impl EntityTracker {
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
         let mut entry =
-            EntityTrackerEntry::new_pos_entity(cart.entity_id, cart.x, cart.y, cart.z, 160.0);
-        let range_sq = 160.0 * 160.0;
+            // The minecart is updated every five ticks.
+            EntityTrackerEntry::new_pos_entity(cart.entity_id, cart.x, cart.y, cart.z, 160.0, 5);
+        // The radius of the entity is limited by the distance of the view.
+        let range = 160.0f64.min(self.tracking_range);
         let target_chunk = cart.chunk_pos();
 
         for p in players {
@@ -615,11 +673,12 @@ impl EntityTracker {
                 continue;
             }
             let dx = p.x - cart.x;
-            let dy = p.y - cart.y;
             let dz = p.z - cart.z;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
             let chunk_ready = p.sent_chunks.is_empty() || p.sent_chunks.contains(&target_chunk);
-            if dist_sq <= range_sq && chunk_ready && entry.tracked_players.insert(p.entity_id) {
+            if in_tracking_range(dx, dz, range)
+                && chunk_ready
+                && entry.tracked_players.insert(p.entity_id)
+            {
                 for packet in entry.make_minecart_spawn_packets(cart) {
                     outbound.push(OutboundTrackingPacket {
                         recipient_id: p.entity_id,
@@ -643,14 +702,18 @@ impl EntityTracker {
         players: &[Player],
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
+        // Java `EntityTracker.track`: the painting is never updated, its
+        // interval is `Integer.MAX_VALUE`.
         let mut entry = EntityTrackerEntry::new_pos_entity(
             painting.entity_id,
             painting.x as f64,
             painting.y as f64,
             painting.z as f64,
             160.0,
+            u32::MAX,
         );
-        let range_sq = 160.0 * 160.0;
+        // The radius of the entity is limited by the distance of the view.
+        let range = 160.0f64.min(self.tracking_range);
         let target_chunk = painting.chunk_pos();
 
         for p in players {
@@ -658,11 +721,12 @@ impl EntityTracker {
                 continue;
             }
             let dx = p.x - painting.x as f64;
-            let dy = p.y - painting.y as f64;
             let dz = p.z - painting.z as f64;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
             let chunk_ready = p.sent_chunks.is_empty() || p.sent_chunks.contains(&target_chunk);
-            if dist_sq <= range_sq && chunk_ready && entry.tracked_players.insert(p.entity_id) {
+            if in_tracking_range(dx, dz, range)
+                && chunk_ready
+                && entry.tracked_players.insert(p.entity_id)
+            {
                 for packet in entry.make_painting_spawn_packets(painting) {
                     outbound.push(OutboundTrackingPacket {
                         recipient_id: p.entity_id,
@@ -803,7 +867,7 @@ impl EntityTracker {
         paintings: &[Painting],
     ) -> Vec<OutboundTrackingPacket> {
         let mut outbound = Vec::new();
-        let range_sq = self.tracking_range * self.tracking_range;
+        let range = self.tracking_range;
 
         let observers: Vec<(
             i32,
@@ -822,17 +886,19 @@ impl EntityTracker {
             let entity_id = player.entity_id;
             let target_chunk = player.chunk_pos();
             if let Some(entry) = self.entries.get_mut(&entity_id) {
-                for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
+                for &(other_id, ox, _oy, oz, other_dead, other_sent) in &observers {
                     if other_id == entity_id {
                         continue;
                     }
                     let dx = ox - player.x;
-                    let dy = oy - player.y;
                     let dz = oz - player.z;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     let chunk_ready = other_sent.is_empty() || other_sent.contains(&target_chunk);
 
-                    if !player.dead && !other_dead && dist_sq <= range_sq && chunk_ready {
+                    if !player.dead
+                        && !other_dead
+                        && in_tracking_range(dx, dz, range)
+                        && chunk_ready
+                    {
                         if entry.tracked_players.insert(other_id) {
                             for packet in entry.make_spawn_packets(player) {
                                 outbound.push(OutboundTrackingPacket {
@@ -855,16 +921,19 @@ impl EntityTracker {
         for item in items.iter() {
             let entity_id = item.entity_id;
             let target_chunk = item.chunk_pos();
-            let item_range_sq = 64.0 * 64.0;
+            // The radius of the entity is limited by the distance of the view.
+            let item_range = 64.0f64.min(self.tracking_range);
             if let Some(entry) = self.item_entries.get_mut(&entity_id) {
-                for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
+                for &(other_id, ox, _oy, oz, other_dead, other_sent) in &observers {
                     let dx = ox - item.x;
-                    let dy = oy - item.y;
                     let dz = oz - item.z;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     let chunk_ready = other_sent.is_empty() || other_sent.contains(&target_chunk);
 
-                    if !item.dead && !other_dead && dist_sq <= item_range_sq && chunk_ready {
+                    if !item.dead
+                        && !other_dead
+                        && in_tracking_range(dx, dz, item_range)
+                        && chunk_ready
+                    {
                         if entry.tracked_players.insert(other_id) {
                             for packet in entry.make_item_spawn_packets(item) {
                                 outbound.push(OutboundTrackingPacket {
@@ -887,16 +956,19 @@ impl EntityTracker {
         for boat in boats.iter() {
             let entity_id = boat.entity_id;
             let target_chunk = boat.chunk_pos();
-            let boat_range_sq = 160.0 * 160.0;
+            // The radius of the entity is limited by the distance of the view.
+            let boat_range = 160.0f64.min(self.tracking_range);
             if let Some(entry) = self.boat_entries.get_mut(&entity_id) {
-                for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
+                for &(other_id, ox, _oy, oz, other_dead, other_sent) in &observers {
                     let dx = ox - boat.x;
-                    let dy = oy - boat.y;
                     let dz = oz - boat.z;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     let chunk_ready = other_sent.is_empty() || other_sent.contains(&target_chunk);
 
-                    if !boat.dead && !other_dead && dist_sq <= boat_range_sq && chunk_ready {
+                    if !boat.dead
+                        && !other_dead
+                        && in_tracking_range(dx, dz, boat_range)
+                        && chunk_ready
+                    {
                         if entry.tracked_players.insert(other_id) {
                             for packet in entry.make_boat_spawn_packets(boat) {
                                 outbound.push(OutboundTrackingPacket {
@@ -919,16 +991,19 @@ impl EntityTracker {
         for mob in mobs.iter() {
             let entity_id = mob.entity_id;
             let target_chunk = mob.chunk_pos();
-            let mob_range_sq = 160.0 * 160.0;
+            // The radius of the entity is limited by the distance of the view.
+            let mob_range = 160.0f64.min(self.tracking_range);
             if let Some(entry) = self.mob_entries.get_mut(&entity_id) {
-                for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
+                for &(other_id, ox, _oy, oz, other_dead, other_sent) in &observers {
                     let dx = ox - mob.x;
-                    let dy = oy - mob.y;
                     let dz = oz - mob.z;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     let chunk_ready = other_sent.is_empty() || other_sent.contains(&target_chunk);
 
-                    if !mob.dead && !other_dead && dist_sq <= mob_range_sq && chunk_ready {
+                    if !mob.dead
+                        && !other_dead
+                        && in_tracking_range(dx, dz, mob_range)
+                        && chunk_ready
+                    {
                         if entry.tracked_players.insert(other_id) {
                             for packet in entry.make_mob_spawn_packets(mob) {
                                 outbound.push(OutboundTrackingPacket {
@@ -951,15 +1026,15 @@ impl EntityTracker {
         for proj in projectiles.iter() {
             let entity_id = proj.entity_id;
             let target_chunk = proj.chunk_pos();
-            let r_sq = 64.0 * 64.0;
+            // The radius of the entity is limited by the distance of the view.
+            let range = 64.0f64.min(self.tracking_range);
             if let Some(entry) = self.projectile_entries.get_mut(&entity_id) {
-                for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
+                for &(other_id, ox, _oy, oz, other_dead, other_sent) in &observers {
                     let dx = ox - proj.x;
-                    let dy = oy - proj.y;
                     let dz = oz - proj.z;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     let chunk_ready = other_sent.is_empty() || other_sent.contains(&target_chunk);
-                    if !proj.dead && !other_dead && dist_sq <= r_sq && chunk_ready {
+                    if !proj.dead && !other_dead && in_tracking_range(dx, dz, range) && chunk_ready
+                    {
                         if entry.tracked_players.insert(other_id) {
                             for packet in entry.make_projectile_spawn_packets(proj) {
                                 outbound.push(OutboundTrackingPacket {
@@ -981,15 +1056,14 @@ impl EntityTracker {
         for tnt in tnts.iter() {
             let entity_id = tnt.entity_id;
             let target_chunk = tnt.chunk_pos();
-            let r_sq = 160.0 * 160.0;
+            // The radius of the entity is limited by the distance of the view.
+            let range = 160.0f64.min(self.tracking_range);
             if let Some(entry) = self.tnt_entries.get_mut(&entity_id) {
-                for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
+                for &(other_id, ox, _oy, oz, other_dead, other_sent) in &observers {
                     let dx = ox - tnt.x;
-                    let dy = oy - tnt.y;
                     let dz = oz - tnt.z;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     let chunk_ready = other_sent.is_empty() || other_sent.contains(&target_chunk);
-                    if !tnt.dead && !other_dead && dist_sq <= r_sq && chunk_ready {
+                    if !tnt.dead && !other_dead && in_tracking_range(dx, dz, range) && chunk_ready {
                         if entry.tracked_players.insert(other_id) {
                             for packet in entry.make_tnt_spawn_packets(tnt) {
                                 outbound.push(OutboundTrackingPacket {
@@ -1011,15 +1085,15 @@ impl EntityTracker {
         for cart in minecarts.iter() {
             let entity_id = cart.entity_id;
             let target_chunk = cart.chunk_pos();
-            let r_sq = 160.0 * 160.0;
+            // The radius of the entity is limited by the distance of the view.
+            let range = 160.0f64.min(self.tracking_range);
             if let Some(entry) = self.minecart_entries.get_mut(&entity_id) {
-                for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
+                for &(other_id, ox, _oy, oz, other_dead, other_sent) in &observers {
                     let dx = ox - cart.x;
-                    let dy = oy - cart.y;
                     let dz = oz - cart.z;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     let chunk_ready = other_sent.is_empty() || other_sent.contains(&target_chunk);
-                    if !cart.dead && !other_dead && dist_sq <= r_sq && chunk_ready {
+                    if !cart.dead && !other_dead && in_tracking_range(dx, dz, range) && chunk_ready
+                    {
                         if entry.tracked_players.insert(other_id) {
                             for packet in entry.make_minecart_spawn_packets(cart) {
                                 outbound.push(OutboundTrackingPacket {
@@ -1041,15 +1115,18 @@ impl EntityTracker {
         for painting in paintings.iter() {
             let entity_id = painting.entity_id;
             let target_chunk = painting.chunk_pos();
-            let r_sq = 160.0 * 160.0;
+            // The radius of the entity is limited by the distance of the view.
+            let range = 160.0f64.min(self.tracking_range);
             if let Some(entry) = self.painting_entries.get_mut(&entity_id) {
-                for &(other_id, ox, oy, oz, other_dead, other_sent) in &observers {
+                for &(other_id, ox, _oy, oz, other_dead, other_sent) in &observers {
                     let dx = ox - painting.x as f64;
-                    let dy = oy - painting.y as f64;
                     let dz = oz - painting.z as f64;
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
                     let chunk_ready = other_sent.is_empty() || other_sent.contains(&target_chunk);
-                    if !painting.dead && !other_dead && dist_sq <= r_sq && chunk_ready {
+                    if !painting.dead
+                        && !other_dead
+                        && in_tracking_range(dx, dz, range)
+                        && chunk_ready
+                    {
                         if entry.tracked_players.insert(other_id) {
                             for packet in entry.make_painting_spawn_packets(painting) {
                                 outbound.push(OutboundTrackingPacket {
@@ -1149,6 +1226,7 @@ impl EntityTracker {
                     player.z,
                     player.yaw,
                     player.pitch,
+                    player.air_borne,
                     &mut outbound,
                 );
             }
@@ -1158,7 +1236,15 @@ impl EntityTracker {
         for item in items.iter_mut() {
             let entity_id = item.entity_id;
             if let Some(entry) = self.item_entries.get_mut(&entity_id) {
-                Self::emit_pos_only_update(entry, entity_id, item.x, item.y, item.z, &mut outbound);
+                Self::emit_pos_only_update(
+                    entry,
+                    entity_id,
+                    item.x,
+                    item.y,
+                    item.z,
+                    !item.on_ground,
+                    &mut outbound,
+                );
             }
         }
 
@@ -1177,6 +1263,7 @@ impl EntityTracker {
                     boat.mot_x,
                     boat.mot_y,
                     boat.mot_z,
+                    !boat.on_ground,
                     &mut outbound,
                 );
             }
@@ -1225,8 +1312,12 @@ impl EntityTracker {
                     mob.z,
                     mob.yaw,
                     mob.pitch,
+                    mob.air_borne,
                     &mut outbound,
                 );
+                // Java `EntityTrackerEntry.update()`: the flag of the air is
+                // cleared after the packet of the position.
+                mob.air_borne = false;
             }
         }
 
@@ -1239,6 +1330,7 @@ impl EntityTracker {
                     proj.x,
                     proj.y,
                     proj.z,
+                    !proj.in_ground,
                     &mut outbound,
                 );
             }
@@ -1251,6 +1343,7 @@ impl EntityTracker {
                     tnt.x,
                     tnt.y,
                     tnt.z,
+                    !tnt.on_ground,
                     &mut outbound,
                 );
             }
@@ -1268,6 +1361,7 @@ impl EntityTracker {
                     cart.mot_x,
                     cart.mot_y,
                     cart.mot_z,
+                    !cart.on_ground,
                     &mut outbound,
                 );
             }
@@ -1285,8 +1379,14 @@ impl EntityTracker {
         z: f64,
         yaw: f32,
         pitch: f32,
+        airborne: bool,
         outbound: &mut Vec<OutboundTrackingPacket>,
     ) {
+        // Java `EntityTrackerEntry.update()`: the packet is sent every
+        // `update_interval` ticks and always when the entity is in the air.
+        if !Self::update_due(entry, airborne) {
+            return;
+        }
         entry.teleport_ticks += 1;
         let new_x = (x * 32.0).floor() as i32;
         let new_y = (y * 32.0).floor() as i32;
@@ -1298,19 +1398,16 @@ impl EntityTracker {
         let dy = new_y - entry.encoded_y;
         let dz = new_z - entry.encoded_z;
 
-        // The difference of the angles is a byte (the packet carries a
-        // byte), but the absolute value is taken on an `i32`: Java promotes
-        // the byte of the difference to an `int` before `Math.abs`, so the
-        // value `-128` has an absolute value of `128` and not an overflow.
-        let dyaw = i32::from((new_yaw.wrapping_sub(entry.encoded_yaw)) as i8);
-        let dpitch = i32::from((new_pitch.wrapping_sub(entry.encoded_pitch)) as i8);
+        // The difference of the angles is not wrapped: the reference keeps
+        // the angles as integers and takes the absolute value of their
+        // difference (`EntityTrackerEntry.update()`).
+        let dyaw = i32::from(new_yaw) - i32::from(entry.encoded_yaw);
+        let dpitch = i32::from(new_pitch) - i32::from(entry.encoded_pitch);
 
+        // The thresholds of the reference are one: any change of the
+        // position or of the rotation is sent.
         let pos_changed = dx != 0 || dy != 0 || dz != 0;
-        let rot_changed = if pos_changed {
-            new_yaw != entry.encoded_yaw || new_pitch != entry.encoded_pitch
-        } else {
-            dyaw.abs() >= 4 || dpitch.abs() >= 4
-        };
+        let rot_changed = dyaw.abs() >= 1 || dpitch.abs() >= 1;
 
         if pos_changed || rot_changed {
             let move_packet = if (-128..=127).contains(&dx)
@@ -1368,14 +1465,28 @@ impl EntityTracker {
         }
     }
 
+    /// Java `EntityTrackerEntry.update()`: `++this.l % this.c == 0` — the
+    /// packet of the movement is sent every `update_interval` ticks; the
+    /// entity in the air is always sent.
+    fn update_due(entry: &mut EntityTrackerEntry, airborne: bool) -> bool {
+        entry.update_counter = entry.update_counter.wrapping_add(1);
+        airborne || entry.update_counter % entry.update_interval == 0
+    }
+
     fn emit_pos_only_update(
         entry: &mut EntityTrackerEntry,
         entity_id: i32,
         x: f64,
         y: f64,
         z: f64,
+        airborne: bool,
         outbound: &mut Vec<OutboundTrackingPacket>,
     ) {
+        // Java `EntityTrackerEntry.update()`: the packet is sent every
+        // `update_interval` ticks and always when the entity is in the air.
+        if !Self::update_due(entry, airborne) {
+            return;
+        }
         entry.teleport_ticks += 1;
         let new_x = (x * 32.0).floor() as i32;
         let new_y = (y * 32.0).floor() as i32;
@@ -1420,6 +1531,7 @@ impl EntityTracker {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn emit_vel_and_move_update(
         entry: &mut EntityTrackerEntry,
         entity_id: i32,
@@ -1431,8 +1543,14 @@ impl EntityTracker {
         mot_x: f64,
         mot_y: f64,
         mot_z: f64,
+        airborne: bool,
         outbound: &mut Vec<OutboundTrackingPacket>,
     ) {
+        // Java `EntityTrackerEntry.update()`: the packet is sent every
+        // `update_interval` ticks and always when the entity is in the air.
+        if !Self::update_due(entry, airborne) {
+            return;
+        }
         entry.teleport_ticks += 1;
         let new_x = (x * 32.0).floor() as i32;
         let new_y = (y * 32.0).floor() as i32;
@@ -1529,6 +1647,123 @@ impl EntityTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The radius of the tracking is a square in XZ.
+    ///
+    /// Java `EntityTrackerEntry.b(EntityPlayer)`: the height of the entity
+    /// is not taken into account, only the difference of the coordinates X
+    /// and Z.
+    #[test]
+    fn the_radius_of_the_tracking_is_a_square_in_xz() {
+        let mut tracker = EntityTracker::new(10);
+        let player = Player::new(1, 1, "Player1".to_string(), 0.0, 64.0, 0.0);
+        // A mob far above the player, but not far in XZ.
+        let mut rng = crate::util::rng::JavaRandom::new(1);
+        let mob = Mob::new(
+            2,
+            crate::entity::mob::MobType::Pig,
+            0.0,
+            200.0,
+            0.0,
+            &mut rng,
+        );
+        tracker.track_player(&player);
+        let players = vec![player];
+        let packets = tracker.track_mob_and_scan(&mob, &players);
+        assert!(
+            !packets.is_empty(),
+            "the mob is tracked: the height is not taken into account"
+        );
+    }
+
+    /// The radius of the tracking is limited by the distance of the view.
+    ///
+    /// Java `EntityTracker.a(Entity, int, int, boolean)`: the radius of the
+    /// entity is limited by `viewDistance * 16 - 16`.
+    #[test]
+    fn the_radius_of_the_tracking_is_limited_by_the_view_distance() {
+        // The view distance of two chunks: the radius is 16 blocks.
+        let tracker = EntityTracker::new(2);
+        assert_eq!(tracker.tracking_range, 16.0);
+        // The view distance of ten chunks: the radius is 144 blocks.
+        let tracker = EntityTracker::new(10);
+        assert_eq!(tracker.tracking_range, 144.0);
+    }
+
+    /// The packet of the position is sent every `update_interval` ticks.
+    ///
+    /// Java `EntityTrackerEntry.update()`: `++this.l % this.c == 0` — the
+    /// animals are updated every three ticks, the players every two, the
+    /// items every twenty.
+    #[test]
+    fn the_packet_of_the_position_is_sent_every_interval() {
+        let mut tracker = EntityTracker::new(10);
+        let player1 = Player::new(1, 1, "Player1".to_string(), 0.0, 64.0, 0.0);
+        let player2 = Player::new(2, 2, "Player2".to_string(), 10.0, 64.0, 0.0);
+        tracker.track_player(&player1);
+        tracker.track_player(&player2);
+        let mut players = vec![player1, player2];
+        // The first tick: the players see each other.
+        tracker.tick(&mut players);
+        // The player that walks is not pushed, the packet of its position is
+        // sent every two ticks.
+        let mut sent = 0;
+        for tick in 0..6 {
+            players[0].x += 0.5;
+            let packets = tracker.tick(&mut players);
+            let updates = packets
+                .iter()
+                .filter(|p| {
+                    p.recipient_id == 2
+                        && matches!(
+                            p.packet,
+                            Clientbound::RelEntityMove(_)
+                                | Clientbound::RelEntityMoveLook(_)
+                                | Clientbound::EntityTeleport(_)
+                        )
+                })
+                .count();
+            if updates > 0 {
+                sent += 1;
+            }
+            // The counter of the tracker was raised once before the loop, so
+            // the first packet of the loop is sent at its first tick.
+            assert_eq!(
+                sent,
+                tick / 2 + 1,
+                "the packet of the position is sent every two ticks"
+            );
+        }
+    }
+
+    /// The rotation is sent when it changes by one.
+    ///
+    /// Java `EntityTrackerEntry.update()`: the threshold of the rotation is
+    /// one.
+    #[test]
+    fn the_rotation_is_sent_when_it_changes_by_one() {
+        let mut tracker = EntityTracker::new(10);
+        let player1 = Player::new(1, 1, "Player1".to_string(), 0.0, 64.0, 0.0);
+        let player2 = Player::new(2, 2, "Player2".to_string(), 10.0, 64.0, 0.0);
+        tracker.track_player(&player1);
+        tracker.track_player(&player2);
+        let mut players = vec![player1, player2];
+        // The first tick: the players see each other.
+        tracker.tick(&mut players);
+        // A rotation of one unit (of the 256 of a circle).
+        players[0].yaw = 360.0 / 256.0;
+        let packets = tracker.tick(&mut players);
+        assert!(
+            packets.iter().any(|p| {
+                p.recipient_id == 2
+                    && matches!(
+                        p.packet,
+                        Clientbound::EntityLook(_) | Clientbound::RelEntityMoveLook(_)
+                    )
+            }),
+            "the rotation of one unit is sent"
+        );
+    }
 
     #[test]
     fn tracker_spawns_and_tracks_in_range() {

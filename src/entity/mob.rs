@@ -296,6 +296,9 @@ pub struct Mob {
     /// Java `Entity.bf`: the mob is in a web, the movement of the next
     /// tick is damped (`Entity.move()`).
     pub web: bool,
+    /// Java `Entity.airBorne`: the mob was pushed, jumped or hurt, the
+    /// tracker sends the packet of the position at once.
+    pub air_borne: bool,
     /// Java `Entity.bm`: the distance the mob walked, the sound of the step
     /// is played when the distance passes the counter of the steps.
     pub walk_accum: f32,
@@ -471,6 +474,7 @@ impl Mob {
             in_water: false,
             in_lava: false,
             web: false,
+            air_borne: false,
             walk_accum: 0.0,
             step_counter: 0,
             position_changed: false,
