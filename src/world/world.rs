@@ -250,6 +250,10 @@ pub(crate) fn with_generator<R>(seed: i64, f: impl FnOnce(&mut Generator) -> R) 
     })
 }
 
+/// The hit of a ray (`MovingObjectPosition` ✓): the block of the hit ✓, the
+/// face of the block ✓ and the point of the hit ✓.
+pub type RayHit = (i32, i32, i32, u8, (f64, f64, f64));
+
 pub struct World {
     config: WorldConfig,
     /// Java `WorldProvider.dimension`: 0 = overworld, -1 = Nether.
@@ -3690,6 +3694,21 @@ impl World {
         end: (f64, f64, f64),
         hit_liquids: bool,
     ) -> Option<(i32, i32, i32, u8)> {
+        self.ray_trace_full(start, end, hit_liquids)
+            .map(|(bx, by, bz, face, _)| (bx, by, bz, face))
+    }
+
+    /// Java `World.rayTrace(Vec3D, Vec3D, boolean)` with the point of the hit.
+    ///
+    /// The reference returns the `MovingObjectPosition` ✓ — the block of the
+    /// hit ✓, the face ✓ and the point of the hit ✓ (`MovingObjectPosition.f` ✓
+    /// — the intersection of the ray with the shape of the block ✓).
+    pub fn ray_trace_full(
+        &self,
+        start: (f64, f64, f64),
+        end: (f64, f64, f64),
+        hit_liquids: bool,
+    ) -> Option<RayHit> {
         let (mut x0, mut y0, mut z0) = start;
         let (x1, y1, z1) = end;
         if x0.is_nan() || y0.is_nan() || z0.is_nan() || x1.is_nan() || y1.is_nan() || z1.is_nan() {
@@ -3706,7 +3725,7 @@ impl World {
         let init_id = self.get_block(cur_x, cur_y, cur_z);
         let init_meta = self.get_data(cur_x, cur_y, cur_z);
         if Self::is_ray_hittable(init_id, init_meta, hit_liquids) {
-            return Some((cur_x, cur_y, cur_z, 1));
+            return Some((cur_x, cur_y, cur_z, 1, (x0, y0, z0)));
         }
 
         for _ in 0..200 {
@@ -3789,7 +3808,7 @@ impl World {
             let id = self.get_block(cur_x, cur_y, cur_z);
             let meta = self.get_data(cur_x, cur_y, cur_z);
             if Self::is_ray_hittable(id, meta, hit_liquids) {
-                return Some((cur_x, cur_y, cur_z, face));
+                return Some((cur_x, cur_y, cur_z, face, (x0, y0, z0)));
             }
         }
 

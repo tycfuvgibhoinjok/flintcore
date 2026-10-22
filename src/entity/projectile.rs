@@ -49,6 +49,9 @@ pub struct Projectile {
     pub last_yaw: f32,
     pub last_pitch: f32,
     pub in_ground: bool,
+    /// Java `Entity.onGround` ✓ — the flag of the ground of the entity ✓ (the
+    /// arrow has its own `inGround` ✓).
+    pub on_ground: bool,
     /// Java `EntityArrow.shake`: the arrow that hit a block shakes for seven
     /// ticks, it can only be picked up when the counter is zero.
     pub shake: i32,
@@ -92,7 +95,7 @@ impl Projectile {
             fall_distance: 0.0,
             fire_ticks: 0,
             air_ticks: 300,
-            on_ground: self.in_ground,
+            on_ground: self.on_ground,
         };
         let mut tag = NbtTag::compound();
         base.write(&mut tag, world_uuid, entity_uuid);
@@ -135,7 +138,8 @@ impl Projectile {
             accel_z: 0.0,
             yaw: base.rotation.0,
             pitch: base.rotation.1,
-            in_ground: base.on_ground,
+            in_ground: tag.get_bool("inGround").unwrap_or(false),
+            on_ground: base.on_ground,
             shake: tag.get_i8("shake").unwrap_or(0) as i32,
             x_tile: tag.get_i16("xTile").unwrap_or(0) as i32,
             y_tile: tag.get_i16("yTile").unwrap_or(0) as i32,

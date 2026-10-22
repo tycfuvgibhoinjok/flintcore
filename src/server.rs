@@ -706,7 +706,7 @@ impl Server {
         let mut projectiles: Vec<_> = self
             .entities
             .iter_projectiles()
-            .filter(|e| self.entities.dimension_of(e.entity_id) == active_dimension)
+            .filter(|e| !e.dead && self.entities.dimension_of(e.entity_id) == active_dimension)
             .cloned()
             .collect();
         let mut tnts: Vec<_> = self
@@ -3985,7 +3985,10 @@ impl Server {
                 && ((blocks::is_solid(below_id) && !blocks::is_water(below_id))
                     || self.boat_aabb_collides_solid(boat_snap.x, next_y, boat_snap.z))
             {
-                boat_snap.y = (below_y + 1) as f64 + 0.3;
+                // Java `Entity.move()` (`Entity.java:520-528` ✓): the boat
+                // rests on the block ✓ — the height of the boat is the float
+                // `0.3F` ✓ (`width / 2` ✓).
+                boat_snap.y = (below_y + 1) as f64 + 0.300_000_011_920_928_96;
                 boat_snap.mot_y = 0.0;
                 boat_snap.on_ground = true;
             } else {
@@ -7674,9 +7677,12 @@ impl Server {
             }
 
             if proj_snapshot.in_ground {
-                let gbx = proj_snapshot.x.floor() as i32;
-                let gby = proj_snapshot.y.floor() as i32;
-                let gbz = proj_snapshot.z.floor() as i32;
+                // Java `EntityArrow.m_()` (`EntityArrow.java:106-114`): the
+                // block of the arrow is the block of the hit ✓ (`d`, `e`, `f` ✓)
+                // — the arrow stays in it while the block is the same ✓.
+                let gbx = proj_snapshot.x_tile;
+                let gby = proj_snapshot.y_tile;
+                let gbz = proj_snapshot.z_tile;
                 if (0..128).contains(&gby) && !blocks::is_solid(self.world.get_block(gbx, gby, gbz))
                 {
                     if let Some(p) = self.entities.get_projectile_mut(pid) {
@@ -7734,9 +7740,13 @@ impl Server {
                 }
             }
 
-            let next_x = proj_snapshot.x + proj_snapshot.mot_x;
-            let next_y = proj_snapshot.y + proj_snapshot.mot_y;
-            let next_z = proj_snapshot.z + proj_snapshot.mot_z;
+            let mut next_x = proj_snapshot.x + proj_snapshot.mot_x;
+            let mut next_y = proj_snapshot.y + proj_snapshot.mot_y;
+            let mut next_z = proj_snapshot.z + proj_snapshot.mot_z;
+            // The projectile died at the hit of a block: the world removes
+            // the dead entities at the end of their tick ✓, so the entity
+            // keeps its state until the next tick ✓.
+            let mut died_at_block = false;
 
             // Java `EntityArrow.m_()`: the hit is checked along the segment
             // of the movement — the ray from the current position to the
@@ -7812,7 +7822,10 @@ impl Server {
                     proj_snapshot.shooter_is_skeleton,
                 ));
                 if proj_snapshot.kind == ProjectileKind::Egg {
-                    egg_hatches.push((next_x, next_y, next_z));
+                    // Java `EntityEgg.m_()` (`EntityEgg.java:196-262` ✓): the
+                    // chickens hatch at the position of the egg before its
+                    // movement ✓ — the egg dies before the movement ✓.
+                    egg_hatches.push((proj_snapshot.x, proj_snapshot.y, proj_snapshot.z));
                 } else if proj_snapshot.kind == ProjectileKind::Fireball {
                     fireball_explosions.push((next_x, next_y, next_z));
                 }
@@ -7882,7 +7895,11 @@ impl Server {
                     };
                     player_hits.push((player_id, dmg, proj_snapshot.x, proj_snapshot.z));
                     if proj_snapshot.kind == ProjectileKind::Egg {
-                        egg_hatches.push((next_x, next_y, next_z));
+                        // Java `EntityEgg.m_()` (`EntityEgg.java:196-262` ✓):
+                        // the chickens hatch at the position of the egg
+                        // before its movement ✓ — the egg dies before the
+                        // movement ✓.
+                        egg_hatches.push((proj_snapshot.x, proj_snapshot.y, proj_snapshot.z));
                     } else if proj_snapshot.kind == ProjectileKind::Fireball {
                         fireball_explosions.push((next_x, next_y, next_z));
                     }
@@ -7897,36 +7914,89 @@ impl Server {
                 }
             }
 
-            // Check block collision
+            // Check block collision.
+            //
+            // Java `EntityArrow.m_()` (`EntityArrow.java:127`): the ray from
+            // the position of the entity to the position with the motion finds
+            // the block of the hit ✓ — the point of the hit is the
+            // intersection of the ray with the shape of the block ✓.
             let bx = next_x.floor() as i32;
             let by = next_y.floor() as i32;
             let bz = next_z.floor() as i32;
-            let hit_block =
-                !(0..128).contains(&by) || blocks::is_solid(self.world.get_block(bx, by, bz));
+            let hit = self.world.ray_trace_full(
+                (proj_snapshot.x, proj_snapshot.y, proj_snapshot.z),
+                (next_x, next_y, next_z),
+                true,
+            );
+            let hit_block = hit.is_some()
+                || !(0..128).contains(&by)
+                || blocks::is_solid(self.world.get_block(bx, by, bz));
 
             if hit_block {
                 match proj_snapshot.kind {
                     ProjectileKind::Arrow => {
-                        if let Some(p) = self.entities.get_projectile_mut(pid) {
-                            p.x = next_x;
-                            p.y = next_y;
-                            p.z = next_z;
-                            p.mot_x = 0.0;
-                            p.mot_y = 0.0;
-                            p.mot_z = 0.0;
-                            p.in_ground = true;
-                            // Java `EntityArrow.m_()`: the arrow shakes for
-                            // seven ticks, it can only be picked up when
-                            // the counter is zero.
-                            p.shake = 7;
+                        // Java `EntityArrow.m_()`
+                        // (`EntityArrow.java:208-224`): the motion becomes the
+                        // vector to the point of the hit ✓ and the position is
+                        // pulled back by five percent of it ✓ — the arrow
+                        // sticks in the block ✓.  The movement and the drag
+                        // follow ✓ (`EntityArrow.java:227-268` ✓).
+                        if let Some((hbx, hby, hbz, _face, (hx, hy, hz))) = hit {
+                            // The motion becomes the vector to the point of the
+                            // hit ✓ (as a float ✓) and the position is pulled
+                            // back by five percent of it ✓.
+                            let mot_x = ((hx - proj_snapshot.x) as f32) as f64;
+                            let mot_y = ((hy - proj_snapshot.y) as f32) as f64;
+                            let mot_z = ((hz - proj_snapshot.z) as f32) as f64;
+                            // Java `MathHelper.a(double)` ✓ — the square root
+                            // as a float ✓.
+                            let length = ((mot_x * mot_x + mot_y * mot_y + mot_z * mot_z).sqrt()
+                                as f32) as f64;
+                            let mut pos_x = proj_snapshot.x;
+                            let mut pos_y = proj_snapshot.y;
+                            let mut pos_z = proj_snapshot.z;
+                            if length > 0.0 {
+                                // The constant of the reference is the float
+                                // `0.05F` ✓ (`0.05000000074505806` ✓).
+                                pos_x -= mot_x / length * 0.050_000_000_745_058_06;
+                                pos_y -= mot_y / length * 0.050_000_000_745_058_06;
+                                pos_z -= mot_z / length * 0.050_000_000_745_058_06;
+                            }
+                            if let Some(p) = self.entities.get_projectile_mut(pid) {
+                                p.x_tile = hbx;
+                                p.y_tile = hby;
+                                p.z_tile = hbz;
+                                p.mot_x = mot_x;
+                                p.mot_y = mot_y;
+                                p.mot_z = mot_z;
+                                p.in_ground = true;
+                                // Java `EntityArrow.m_()`: the arrow shakes for
+                                // seven ticks, it can only be picked up when
+                                // the counter is zero.
+                                p.shake = 7;
+                            }
+                            // The arrow moves by the rest of the motion ✓
+                            // (`EntityArrow.java:227-229` ✓).
+                            next_x = pos_x + mot_x;
+                            next_y = pos_y + mot_y;
+                            next_z = pos_z + mot_z;
                         }
                     }
                     ProjectileKind::Egg => {
+                        // Java `EntityEgg.m_()` (`EntityEgg.java:196-320` ✓):
+                        // the egg dies at the hit of a block ✓ — the movement
+                        // and the drag of the motion follow ✓ — the entity is
+                        // not ticked any more ✓ (its state is frozen ✓).
                         egg_hatches.push((proj_snapshot.x, proj_snapshot.y, proj_snapshot.z));
-                        to_remove.push(pid);
+                        died_at_block = true;
                     }
                     ProjectileKind::Snowball => {
-                        to_remove.push(pid);
+                        // Java `EntitySnowball.m_()`
+                        // (`EntitySnowball.java:214-232` ✓): the snowball
+                        // dies at the hit of a block ✓ — the movement and the
+                        // drag of the motion follow ✓ — the entity is not
+                        // ticked any more ✓ (its state is frozen ✓).
+                        died_at_block = true;
                     }
                     ProjectileKind::Fireball => {
                         fireball_explosions.push((
@@ -7935,6 +8005,7 @@ impl Server {
                             proj_snapshot.z,
                         ));
                         to_remove.push(pid);
+                        continue;
                     }
                     ProjectileKind::FishingHook => {
                         if let Some(p) = self.entities.get_projectile_mut(pid) {
@@ -7943,9 +8014,9 @@ impl Server {
                             p.mot_z = 0.0;
                             p.in_ground = true;
                         }
+                        continue;
                     }
                 }
-                continue;
             }
 
             if let Some(p) = self.entities.get_projectile_mut(pid) {
@@ -8019,6 +8090,19 @@ impl Server {
                     }
                 }
             }
+
+            if died_at_block {
+                // Java `World.cleanUp()` (`World.java:1074-1082` ✓): the
+                // world removes the dead entities at the end of the tick of
+                // the entity ✓ — the entity keeps its state (frozen ✓) until
+                // the next tick ✓.
+                if let Some(p) = self.entities.get_projectile_mut(pid) {
+                    p.dead = true;
+                }
+                for out in self.tracker.untrack_projectile(pid) {
+                    self.send_tracked(out.recipient_id, out.packet);
+                }
+            }
         }
 
         for (pid, peid, pconn) in arrow_pickups {
@@ -8067,10 +8151,16 @@ impl Server {
         }
 
         for (ex, ey, ez) in egg_hatches {
-            // EntityEgg.java:39-51 — 1/8 chance to hatch 1 chicken (1/32 for 4 chickens)
+            // EntityEgg.java:196-200 — the egg always takes two values of
+            // the shared random ✓ (`nextInt(8)` ✓ then `nextInt(32)` ✓) —
+            // the chicken hatches when the first value is zero ✓ and four
+            // of them when the second one is zero ✓.
             let mut rng = std::mem::replace(&mut self.entity_random, JavaRandom::new(0));
-            let count = if rng.next_i32_bound(8) == 0 {
-                if rng.next_i32_bound(32) == 0 {
+            let hatching = rng.next_i32_bound(8) == 0;
+            let four = rng.next_i32_bound(32) == 0;
+            self.entity_random = rng;
+            let count = if hatching {
+                if four {
                     4
                 } else {
                     1
@@ -8078,7 +8168,6 @@ impl Server {
             } else {
                 0
             };
-            self.entity_random = rng;
             for _ in 0..count {
                 self.spawn_mob_at(MobType::Chicken, ex, ey, ez);
             }
@@ -13181,7 +13270,18 @@ mod tests {
                 10,
             ),
             "tnt" => server.entities.spawn_primed_tnt(0.5, 66.0, 0.5, 80, 0.0),
-            "boat" => server.entities.spawn_boat(0.5, 66.0, 0.5),
+            "boat" => {
+                let id = server.entities.spawn_boat(0.5, 66.0, 0.5);
+                // Java `Entity.setLocation(double, double, double, float, float)`
+                // (`Entity.java:772-791` ✓): the position of the entity is set
+                // without the height of the boat ✓ — the constructor of the
+                // reference puts the boat at `y + 0.3` ✓.
+                if let Some(b) = server.entities.get_boat_mut(id) {
+                    b.y = 66.0;
+                    b.prev_y = 66.0;
+                }
+                id
+            }
             other => panic!("unknown scenario {other}"),
         };
         (server, id)
@@ -13216,7 +13316,7 @@ mod tests {
                             p.mot_z,
                             p.yaw as f64,
                             p.pitch as f64,
-                            p.in_ground,
+                            p.on_ground,
                         ))
                     })
                     .unwrap_or(None),
@@ -13303,17 +13403,9 @@ mod tests {
     ///
     /// The traces of the port and of the reference match tick by tick until
     /// the tick of the first divergence ✓ — after it the behaviour differs
-    /// (see W-54 of the plan ✓).
-    const KNOWN_DIVERGENCES: &[(&str, usize)] = &[
-        // The projectiles stick in the ground in the port and fly through it
-        // in the reference ✓ (the box of the collision ✓).
-        ("arrow", 12),
-        ("snowball", 12),
-        ("egg", 12),
-        // The boat has another initial state in the port and in the
-        // reference ✓ (`EntityBoat` ✓).
-        ("boat", 0),
-    ];
+    /// (see W-54 of the plan ✓).  A scenario that is not in the table
+    /// matches the reference for the whole trace ✓.
+    const KNOWN_DIVERGENCES: &[(&str, usize)] = &[];
 
     /// The scenarios of the entities match the reference.
     ///
@@ -15285,6 +15377,67 @@ mod tests {
         server.tick(1);
         let arrow = server.entities.get_projectile(pid).expect("the arrow");
         assert_eq!(arrow.shake, 6, "the counter of the shake is decreased");
+    }
+
+    /// The snowball that hit a block keeps its state.
+    ///
+    /// Java `EntitySnowball.m_()` (`EntitySnowball.java:214-232` ✓): the
+    /// snowball dies at the hit of a block ✓ — the movement and the drag of
+    /// the motion follow the death ✓ — the world removes the dead entity at
+    /// the end of the tick of the entity ✓ (`World.cleanUp()` ✓), so the
+    /// state of the entity is frozen until the next tick ✓.
+    #[test]
+    fn the_snowball_that_hit_a_block_keeps_its_state() {
+        let (mut server, pid) = entity_scenario_server("snowball");
+        // The snowball falls on the ground: it dies at the thirteenth tick.
+        for _ in 0..13 {
+            server.tick_projectiles();
+        }
+        let snowball = server.entities.get_projectile(pid).expect("the snowball");
+        assert!(snowball.dead, "the snowball died at the hit of the ground");
+        assert_eq!(
+            java_fixed(snowball.y, 9),
+            "63.743693073",
+            "the snowball moved before it died"
+        );
+        assert_eq!(
+            java_fixed(snowball.mot_y, 9),
+            "-0.367436944",
+            "the drag of the motion followed the movement"
+        );
+        // The next tick: the world removes the dead entity.
+        server.tick_projectiles();
+        assert!(
+            server.entities.get_projectile(pid).is_none(),
+            "the snowball left the world"
+        );
+    }
+
+    /// The egg takes two values of the shared random.
+    ///
+    /// Java `EntityEgg.m_()` (`EntityEgg.java:196-200` ✓): the egg always
+    /// takes the value of `nextInt(8)` ✓ and the value of `nextInt(32)` ✓ —
+    /// a chicken hatches when the first value is zero ✓ and four of them
+    /// when the second one is zero ✓.
+    #[test]
+    fn the_egg_takes_two_values_of_the_shared_random() {
+        let (mut server, pid) = entity_scenario_server("egg");
+        let mut expected = server.entity_random.clone();
+        expected.next_i32_bound(8);
+        expected.next_i32_bound(32);
+        // The egg falls on the ground: it dies at the thirteenth tick.
+        for _ in 0..13 {
+            server.tick_projectiles();
+        }
+        assert!(
+            server.entities.get_projectile(pid).is_some(),
+            "the egg is still in the world"
+        );
+        assert_eq!(
+            server.entity_random.state(),
+            expected.state(),
+            "the egg took two values of the shared random"
+        );
     }
 
     /// The arrow hits the mob it flies through.

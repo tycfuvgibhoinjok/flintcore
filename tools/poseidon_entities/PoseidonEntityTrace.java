@@ -74,7 +74,12 @@ public class PoseidonEntityTrace {
             for (int t = 0; t < ticks; t++) {
                 // The tick of the entity (`Entity.m_()` ✓): the world of the
                 // harness has no player, so the entities are ticked by hand ✓.
-                entity.m_();
+                // The world removes the dead entities at the end of its tick
+                // (`World.tickEntities`), so a dead entity is not ticked any
+                // more ✓ — its state is frozen ✓.
+                if (!entity.dead) {
+                    entity.m_();
+                }
                 dump(out, t, entity);
             }
         }

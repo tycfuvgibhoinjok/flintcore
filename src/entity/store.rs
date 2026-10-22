@@ -778,6 +778,7 @@ impl EntityStore {
             last_yaw: 0.0,
             last_pitch: 0.0,
             in_ground: false,
+            on_ground: false,
             shake: 0,
             x_tile: 0,
             y_tile: 0,

@@ -204,7 +204,11 @@ Entity movement parity harness (the entities that are not mobs):
   `src/server.rs` compares the traces tick by tick.  The table
   `KNOWN_DIVERGENCES` lists the tick of the first known divergence of every
   scenario (see W-54 of the plan) — the test asserts that the traces are
-  equal before it and different at it, so a new divergence is caught.
+  equal before it and different at it, so a new divergence is caught.  The
+  table is empty: the four reproducible scenarios (the arrow, the snowball,
+  the egg and the boat) match the reference for the whole trace.  The dropped
+  item and the primed TNT are not comparable — the reference takes their
+  initial spread from `Math.random()`, so their traces are not reproducible.
 
 Block behavior parity harness:
 
