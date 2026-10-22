@@ -1,8 +1,6 @@
 //! 1:1 port of Minecraft Beta 1.7.3 Redstone, Pistons, Dispensers, Rails, and Random Block Ticks
 //! from `.references/Project-Poseidon`.
 
-use std::collections::BTreeSet;
-
 use crate::gameplay::blocks;
 use crate::gameplay::items::{self, ItemStack};
 use crate::gameplay::tile::TileEntityKind;
@@ -307,7 +305,7 @@ impl World {
     /// ✓.
     pub fn update_redstone_wire(&mut self, x: i32, y: i32, z: i32) {
         self.calculate_wire_changes(x, y, z, x, y, z);
-        let to_notify: Vec<(i32, i32, i32)> = self.redstone_wire_notify.iter().copied().collect();
+        let to_notify = self.redstone_wire_notify.iteration_order();
         self.redstone_wire_notify.clear();
         for (nx, ny, nz) in to_notify {
             self.java_apply_physics(nx, ny, nz, blocks::REDSTONE_WIRE as i32);
@@ -391,14 +389,24 @@ impl World {
 
             if old_power == 0 || new_power == 0 {
                 // Java `BlockRedstoneWire.b`: the shared set of the singleton
-                // ✓ (`BlockRedstoneWire.java:175-181` ✓).
-                self.redstone_wire_notify.insert((x, y, z));
-                self.redstone_wire_notify.insert((x - 1, y, z));
-                self.redstone_wire_notify.insert((x + 1, y, z));
-                self.redstone_wire_notify.insert((x, y - 1, z));
-                self.redstone_wire_notify.insert((x, y + 1, z));
-                self.redstone_wire_notify.insert((x, y, z - 1));
-                self.redstone_wire_notify.insert((x, y, z + 1));
+                // ✓ (`BlockRedstoneWire.java:175-181` ✓) — the hash of the
+                // position is the hash of the reference ✓
+                // (`ChunkPosition.hashCode()` ✓).
+                use crate::util::java_hash::chunk_position_hash;
+                self.redstone_wire_notify
+                    .insert(chunk_position_hash(x, y, z), (x, y, z));
+                self.redstone_wire_notify
+                    .insert(chunk_position_hash(x - 1, y, z), (x - 1, y, z));
+                self.redstone_wire_notify
+                    .insert(chunk_position_hash(x + 1, y, z), (x + 1, y, z));
+                self.redstone_wire_notify
+                    .insert(chunk_position_hash(x, y - 1, z), (x, y - 1, z));
+                self.redstone_wire_notify
+                    .insert(chunk_position_hash(x, y + 1, z), (x, y + 1, z));
+                self.redstone_wire_notify
+                    .insert(chunk_position_hash(x, y, z - 1), (x, y, z - 1));
+                self.redstone_wire_notify
+                    .insert(chunk_position_hash(x, y, z + 1), (x, y, z + 1));
             }
         }
     }
@@ -2910,10 +2918,12 @@ impl World {
             return;
         }
 
-        // The set is sorted: the order of the chunks decides the draws of
-        // the random of the world, and the order of a hash table of Rust is
-        // random for every process.
-        let mut active_chunks = BTreeSet::new();
+        // The set of the chunks of the reference ✓ (`World.j()` ✓ — the set
+        // of the `ChunkCoordIntPair` ✓): the order of its iteration is the
+        // order of the table of hashes of Java ✓ ⇒ the order of the chunks
+        // decides the draws of the random of the world ✓
+        // (`src/util/java_hash.rs` ✓).
+        let mut active_chunks = crate::util::java_hash::JavaHashSet::new();
         for &(px, _py, pz) in player_positions {
             let cx = (px.floor() as i32) >> 4;
             let cz = (pz.floor() as i32) >> 4;
@@ -2921,11 +2931,13 @@ impl World {
                 for dz in -9..=9 {
                     let pos = ChunkPos::new(cx + dx, cz + dz);
                     if self.chunks.contains_key(&pos) {
-                        active_chunks.insert(pos);
+                        active_chunks
+                            .insert(crate::util::java_hash::chunk_coord_hash(pos.x, pos.z), pos);
                     }
                 }
             }
         }
+        let active_chunks = active_chunks.iteration_order();
 
         let mut lcg = self.random_tick_lcg;
         let mut rng = std::mem::replace(&mut self.world_random, JavaRandom::new(0));

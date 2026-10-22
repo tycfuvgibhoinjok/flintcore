@@ -233,6 +233,23 @@ Block behavior parity harness:
   reference into `/tmp/pos_patch` and runs the scenarios). Never hand-edit a
   golden trace.
 
+Java hash table order harness:
+
+- The reference iterates its sets in the order of the table of hashes
+  (`java.util.HashSet`): the positions to notify of the redstone wire
+  (`BlockRedstoneWire.b`) and the chunks of the random ticks (`World.j()`).
+  The order of the chunks decides which blocks get the random tick, so the
+  order has to be reproduced byte by byte.
+- `src/util/java_hash.rs` emulates the table of the JDK 8 (`HashMap.putVal`,
+  `resize`, `treeifyBin`, `TreeNode.treeify`, `TreeNode.putTreeVal`,
+  `TreeNode.balanceInsertion`, `TreeNode.split` and
+  `TreeNode.moveRootToFront`).
+- The probe `tools/poseidon_hash/PoseidonHashOrder.java` prints the order of
+  the reference; the golden file `tests/golden/poseidon_hash_order.txt` holds
+  it (regenerate with `sh tools/poseidon_hash/regenerate_golden.sh`) and the
+  test `the_order_of_the_sets_of_the_reference_matches` in
+  `src/util/java_hash.rs` compares the port with it.
+
 Mob movement parity harness:
 
 - Ground truth: `tools/poseidon_mobs/PoseidonMobTrace.java` runs a single mob

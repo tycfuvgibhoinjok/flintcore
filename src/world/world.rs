@@ -312,7 +312,11 @@ pub struct World {
     /// `BlockRedstoneWire` singleton: the nested update fills the same set and
     /// the outer update copies it and clears it (`BlockRedstoneWire.java:12,
     /// 40-51`).
-    pub(crate) redstone_wire_notify: HashSet<(i32, i32, i32)>,
+    ///
+    /// The set of the reference is a `java.util.HashSet` ✓ ⇒ the order of its
+    /// iteration is the order of the table of hashes ✓ (`src/util/java_hash.rs`
+    /// ✓ — see W-53 of the plan ✓).
+    pub(crate) redstone_wire_notify: crate::util::java_hash::JavaHashSet<(i32, i32, i32)>,
     /// Live/server choreography state (spawn search, populate triggers,
     /// player framing, unloads) — see `world::live`.
     pub(crate) live: crate::world::live::LiveState,
@@ -641,7 +645,7 @@ impl World {
             rain_intensity: std::cell::Cell::new(0.0),
             thunder_intensity: std::cell::Cell::new(0.0),
             fluid_sides: [[false; 4]; 2],
-            redstone_wire_notify: HashSet::new(),
+            redstone_wire_notify: crate::util::java_hash::JavaHashSet::new(),
             live,
             fresh_world,
             live_time: initial_time,

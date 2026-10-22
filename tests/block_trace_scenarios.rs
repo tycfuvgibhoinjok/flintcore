@@ -142,6 +142,7 @@ const SCENARIOS: &[&str] = &[
     "lava_spread",
     "fire_spread",
     "piston_push",
+    "redstone_torch",
 ];
 
 /// The scenarios with a known divergence ✓.
@@ -151,7 +152,7 @@ const SCENARIOS: &[&str] = &[
 /// (`BlockRedstoneWire.b` ✓ — the hash of `ChunkPosition` ✓), the port
 /// iterates its own set ✓ ⇒ the same events in a different order ✓ (see
 /// W-53 of the plan ✓).
-const KNOWN_DIVERGENCES: &[&str] = &["redstone_torch"];
+const KNOWN_DIVERGENCES: &[&str] = &[];
 
 #[test]
 fn the_scenarios_of_the_blocks_match_the_reference() {

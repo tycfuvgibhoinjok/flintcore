@@ -2,6 +2,7 @@ pub mod bytes;
 pub mod compress;
 pub mod fdlibm;
 pub mod hash;
+pub mod java_hash;
 pub mod log;
 pub mod math;
 pub mod noise;
